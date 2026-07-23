@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forecast-os"
+version = "0.1.0"
+description = "An open-source forecasting engine: statistical, ML, and financial models behind one unified API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Miles C.", email = "cubanmiles0@gmail.com" }]
+keywords = [
+    "forecasting",
+    "time-series",
+    "arima",
+    "exponential-smoothing",
+    "garch",
+    "monte-carlo",
+    "backtesting",
+    "quantitative-finance",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4", "build"]
+nixtla = ["statsforecast>=1.7"]
+neural = ["neuralforecast>=1.7"]
+
+[project.urls]
+Homepage = "https://github.com/milesc-bot/forecast-os"
+Issues = "https://github.com/milesc-bot/forecast-os/issues"
+
+[project.scripts]
+forecast-os = "forecast_os.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["B905"]
