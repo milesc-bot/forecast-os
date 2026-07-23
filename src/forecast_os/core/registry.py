@@ -48,7 +48,8 @@ def register(name: str, family: str = "statistical", description: str | None = N
             raise ValueError(
                 f"model name {name!r} already registered by {existing.cls.__qualname__}"
             )
-        desc = description or (cls.__doc__ or "").strip().splitlines()[0].strip() or name
+        doc_lines = (cls.__doc__ or "").strip().splitlines()
+        desc = description or (doc_lines[0].strip() if doc_lines else "") or name
         _REGISTRY[name] = ModelSpec(name=name, cls=cls, family=family, description=desc)
         cls.registry_name = name
         return cls

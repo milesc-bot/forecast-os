@@ -1,0 +1,203 @@
+# forecast-os
+
+[![CI](https://github.com/milesc-bot/forecast-os/actions/workflows/ci.yml/badge.svg)](https://github.com/milesc-bot/forecast-os/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
+**An open-source forecasting engine: statistical, ML, and financial models behind one
+unified API.** One data contract, one model interface, one evaluation harness — from
+`naive` to ARIMA, Kalman filters, GARCH volatility, Monte Carlo simulation, and Markov
+regime switching.
+
+```
+┌───────────────────────────────────────────────┐
+│ Interface: ForecastEngine SDK · forecast-os CLI│
+├───────────────────────────────────────────────┤
+│ Model Registry (@register · get_model · list) │
+├──────────────┬───────────────┬────────────────┤
+│ Statistical  │ ML / Meta     │ Quant Finance  │
+│ ETS · Theta  │ RidgeLag      │ GARCH(1,1)     │
+│ ARIMA · SES  │ Ensemble      │ Monte Carlo    │
+│ Kalman · ... │ AutoSelect    │ Regime-Switch  │
+├──────────────┴───────────────┴────────────────┤
+│ Uncertainty: native variance · conformal      │
+├───────────────────────────────────────────────┤
+│ Preprocessing: impute · scale · calendar · FFT│
+├───────────────────────────────────────────────┤
+│ Evaluation: walk-forward CV · MASE/RMSSE ·    │
+│ Sharpe · max drawdown · leaderboards          │
+└───────────────────────────────────────────────┘
+```
+
+## Why
+
+The best open-source forecasting tools each own one slice: Nixtla's libraries own speed,
+sktime owns the unified interface, qlib owns quant finance. **forecast-os** is a small,
+dependency-light engine (numpy / pandas / scipy — no torch, no compiled extras) that puts
+the three slices behind one contract, so you can go from raw series to a
+cross-validated, probabilistic, finance-aware forecast in a few lines — and swap any
+model for any other without changing a line of surrounding code.
+
+- **One data contract** — every model consumes the long panel `(unique_id, ds, y)`
+  (the Nixtla convention), datetime or integer time index, any number of series.
+- **Probabilistic first** — every model emits prediction intervals: exact variance
+  recursions where the theory provides them (ARIMA ψ-weights, Kalman covariance
+  propagation, ETS), plus distribution-free split-conformal calibration for any model.
+- **Evaluation built in** — walk-forward cross-validation and a leaderboard in two
+  calls; scaled metrics (MASE, RMSSE) done correctly.
+- **Finance is first-class** — GARCH volatility forecasts, GBM scenario simulation,
+  bull/bear regime detection, and a strategy backtester that scores any forecaster with
+  Sharpe / Sortino / max drawdown / hit rate.
+- **An OS, not a monolith** — models plug in through a registry; a third-party package
+  can `@register` its own forecaster and every engine feature (CV, ensembles,
+  AutoSelect, conformal, CLI) works with it instantly.
+
+## Install
+
+```bash
+pip install git+https://github.com/milesc-bot/forecast-os
+# optional heavy backends:
+pip install "forecast-os[nixtla] @ git+https://github.com/milesc-bot/forecast-os"
+```
+
+Development install:
+
+```bash
+git clone https://github.com/milesc-bot/forecast-os && cd forecast-os
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]" && pytest
+```
+
+## Quickstart
+
+```python
+import forecast_os as fos
+
+# Any long-format DataFrame with columns unique_id, ds, y
+df = fos.load_air_passengers()
+
+# 1. Forecast with prediction intervals
+model = fos.get_model("auto_ets", season_length=12)
+model.fit(df)
+model.predict(h=12, level=[80, 95])
+#      unique_id         ds        yhat       lo-80  ...
+# 0  AirPassengers 1961-01-01  444.5  ...
+
+# 2. Compare models with walk-forward cross-validation
+engine = fos.ForecastEngine(models=["seasonal_naive", "theta", "auto_ets", "auto_arima"])
+leaderboard = engine.compare(df, h=12, n_windows=3, metrics=["mase", "smape"], seasonality=12)
+print(leaderboard)          # models ranked by MASE
+
+# 3. Calibrated intervals for ANY model via conformal prediction
+conf = fos.ConformalForecaster(model=fos.get_model("theta", season_length=12))
+conf.fit(df)
+conf.predict(h=12, level=[90])
+```
+
+### Finance in five lines
+
+```python
+from forecast_os.finance import GARCH11, MonteCarloSimulator, MarkovRegimeSwitching
+import numpy as np
+
+returns = np.diff(np.log(prices))          # your daily log returns
+vol = GARCH11().fit(returns)               # volatility model
+vol.forecast_volatility(h=10)              # next-10-day conditional vol
+
+mc = MonteCarloSimulator.from_returns(returns)
+mc.summary(s0=prices[-1], h=252)           # 1-year price quantile fan
+
+regimes = MarkovRegimeSwitching().fit(returns)
+regimes.smoothed_probs_                    # bull/bear probabilities per day
+```
+
+### Backtest a forecast as a trading strategy
+
+```python
+from forecast_os.finance import StrategyBacktester
+
+bt = StrategyBacktester(fos.get_model("ridge_lag", lags=10), cost_bps=1.0)
+result = bt.run(returns_panel, test_size=250)   # walk-forward, refit each step
+print(result.summary)                            # sharpe, sortino, max_drawdown, hit_rate...
+```
+
+## CLI
+
+```bash
+forecast-os models                                  # list every installed model
+forecast-os forecast data.csv --h 12 --model auto_ets --level 90 -o forecast.csv
+forecast-os compare data.csv --h 12 --models naive,theta,auto_arima --metrics mase,smape
+forecast-os simulate --s0 100 --mu 0.0004 --sigma 0.012 --h 252 --paths 5000
+```
+
+## Model zoo
+
+| Name | Family | What it is |
+|---|---|---|
+| `naive`, `seasonal_naive`, `drift`, `window_average` | baseline | The benchmarks every real model must beat |
+| `ses`, `holt`, `holt_winters` | statistical | Exponential smoothing (level / trend / seasonality), SSE-optimized |
+| `auto_ets` | statistical | Picks the best ETS variant by AICc |
+| `theta` | statistical | The M3-winning Theta method with deseasonalization |
+| `arima`, `auto_arima` | statistical | ARIMA(p,d,q) via CSS; auto orders by AICc, ψ-weight intervals |
+| `kalman` | statistical | Local level / local linear trend state space, MLE, exact interval growth |
+| `ridge_lag` | ml | Ridge autoregression on lags + Fourier terms, recursive multi-step |
+| `ensemble` | ensemble | Mean / median / weighted combination of any members |
+| `auto_select` | ensemble | Cross-validates candidates, picks the best model per series |
+| `conformal` | ensemble | Split-conformal calibrated intervals around any model |
+| `garch` | financial | GARCH(1,1) conditional volatility forecasting |
+
+Plus non-registry finance tools: `GARCH11`, `MonteCarloSimulator`,
+`MarkovRegimeSwitching`, `StrategyBacktester`, and metrics
+(`sharpe_ratio`, `sortino_ratio`, `max_drawdown`, `value_at_risk`,
+`conditional_var`, `calmar_ratio`, `hit_rate`, ...).
+
+## Extending the OS
+
+```python
+import numpy as np
+from forecast_os import PerSeriesForecaster, register
+
+@register("last_median", family="baseline")
+class LastMedian(PerSeriesForecaster):
+    """Median of the trailing window."""
+    def __init__(self, window: int = 5):
+        self.window = window
+    def _fit_series(self, y):
+        return {"m": float(np.median(y[-self.window:]))}
+    def _predict_series(self, state, h):
+        return np.full(h, state["m"])
+```
+
+That's the whole integration: it now appears in `list_models()`, works in
+`ForecastEngine.compare`, ensembles, AutoSelect, conformal wrapping, and the CLI.
+
+## Design notes
+
+- **Contract-tested**: `tests/test_contract.py` parametrizes over the registry, so every
+  model — including yours — is automatically checked for panel round-tripping, interval
+  ordering, clone/refit equivalence, and predict-before-fit errors.
+- **Deterministic**: all stochastic components take a `seed`.
+- **Honest uncertainty**: interval methods are documented per model; when a model has no
+  variance theory, it falls back to in-sample residual std — or wrap it in `conformal`
+  for distribution-free calibration.
+
+## Roadmap
+
+- Foundation-model adapter (TimeGPT-style zero-shot baselines)
+- Hierarchical reconciliation (regional → national coherence)
+- Exogenous regressors for ARIMA / RidgeLag
+- REST serving layer
+
+## Acknowledgments
+
+The architecture follows the conventions proven by the open-source forecasting
+community: the [Nixtla](https://github.com/Nixtla) panel data contract and
+cross-validation output format, the [sktime](https://github.com/sktime/sktime) unified
+estimator interface, and the financial-modeling scope of
+[qlib](https://github.com/microsoft/qlib) and
+[OxiDiviner](https://github.com/rustic-ml/OxiDiviner). None of these are dependencies —
+they're prior art this engine gratefully builds on.
+
+## License
+
+MIT

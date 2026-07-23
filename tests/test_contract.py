@@ -11,7 +11,7 @@ import pytest
 import forecast_os  # noqa: F401  (imports register all built-in models)
 from forecast_os.core.base import BaseForecaster
 from forecast_os.core.registry import _REGISTRY, get_model
-from forecast_os.core.types import ID_COL, TARGET_COL, TIME_COL
+from forecast_os.core.types import ID_COL, TIME_COL
 from forecast_os.datasets.synthetic import generate_series
 
 H = 8

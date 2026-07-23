@@ -65,12 +65,12 @@ class BaseForecaster(ABC):
             params[pname] = getattr(self, pname)
         return params
 
-    def clone(self) -> "BaseForecaster":
+    def clone(self) -> BaseForecaster:
         """A new unfitted instance with the same constructor parameters."""
         return type(self)(**self.get_params())
 
     @abstractmethod
-    def fit(self, df: pd.DataFrame) -> "BaseForecaster":
+    def fit(self, df: pd.DataFrame) -> BaseForecaster:
         """Fit the model on a (unique_id, ds, y) panel."""
 
     @abstractmethod
@@ -110,7 +110,7 @@ class PerSeriesForecaster(BaseForecaster):
     #: Minimum observations per series required by the model.
     min_train_size: int = 1
 
-    def fit(self, df: pd.DataFrame) -> "PerSeriesForecaster":
+    def fit(self, df: pd.DataFrame) -> PerSeriesForecaster:
         df = validate_panel(df)
         self._series_state: dict[Any, dict] = {}
         for uid, g in df.groupby(ID_COL, sort=True):
