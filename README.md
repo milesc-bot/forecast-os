@@ -52,6 +52,52 @@ model for any other without changing a line of surrounding code.
   can `@register` its own forecaster and every engine feature (CV, ensembles,
   AutoSelect, conformal, CLI) works with it instantly.
 
+## In action
+
+Every figure below is produced by the engine itself on **seeded simulated data** —
+regenerate them all with `python scripts/generate_figures.py`.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/forecast-dark.png">
+  <img alt="Line chart of a trending, weekly-seasonal daily series with an auto_ets 28-day forecast and nested 80/95% prediction interval bands" src="docs/assets/forecast-light.png">
+</picture>
+
+<table>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/leaderboard-dark.png">
+        <img alt="Horizontal bar chart ranking 10 models by cross-validated MASE; RidgeLag leads at 0.41" src="docs/assets/leaderboard-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/garch-dark.png">
+        <img alt="Two-panel chart of simulated daily returns and GARCH(1,1) conditional volatility with a dashed 30-day volatility forecast" src="docs/assets/garch-light.png">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/montecarlo-dark.png">
+        <img alt="Monte Carlo fan chart: 1-year GBM price scenarios with P05-P95 quantile bands, median path, and sample paths" src="docs/assets/montecarlo-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/regimes-dark.png">
+        <img alt="Two-panel regime chart: portfolio value with shaded bear-regime spans, and the smoothed bear-market probability that produced them" src="docs/assets/regimes-light.png">
+      </picture>
+    </td>
+  </tr>
+</table>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/backtest-dark.png">
+  <img alt="Backtest chart: strategy equity (+37.1%) vs buy-and-hold (+20.6%) with a strategy drawdown panel reaching -7%" src="docs/assets/backtest-light.png">
+</picture>
+
 ## Install
 
 ```bash

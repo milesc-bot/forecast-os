@@ -51,6 +51,17 @@ Ground rules:
 - Statistical models should include a test that recovers known parameters
   from synthetic data, not just smoke tests.
 
+## README figures
+
+The gallery images in `docs/assets/` are generated — never hand-edited:
+
+```bash
+python scripts/generate_figures.py
+```
+
+The script is deterministic (seeded simulated data) and writes a light and a
+dark variant per figure; the README serves the matching one via `<picture>`.
+
 ## Pull requests
 
 - One logical change per PR.
