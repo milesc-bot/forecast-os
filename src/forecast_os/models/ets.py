@@ -1,9 +1,11 @@
 """Exponential smoothing models: SES, Holt, Holt-Winters, and AutoETS.
 
 Smoothing parameters left as ``None`` are optimized per series by minimizing
-the one-step in-sample SSE (bounded to [0.01, 0.99]); optimized values live in
-the per-series state (``alpha_`` etc.), never on ``self``, so a fitted model
-holds independent parameters for every series in the panel.
+the one-step in-sample SSE (bounded to [0.01, 0.99], except the trend
+smoothing ``beta`` which is bounded to [0.01, 0.3] — see :class:`Holt`);
+optimized values live in the per-series state (``alpha_`` etc.), never on
+``self``, so a fitted model holds independent parameters for every series in
+the panel.
 """
 
 from __future__ import annotations
@@ -18,6 +20,12 @@ from ..core.registry import register
 __all__ = ["SES", "Holt", "HoltWinters", "AutoETS"]
 
 _BOUNDS = (0.01, 0.99)
+# Search bound for an *optimized* trend beta (Holt and Holt-Winters). The
+# unguarded SSE optimum on seasonal/noisy data is often the corner beta ~= 1,
+# which makes the trend equal the last first-difference, so the forecast
+# extrapolates a seasonal swing linearly (runaway trend). Explicit user-passed
+# beta values are used as-is and remain unrestricted.
+_TREND_BETA_BOUNDS = (0.01, 0.3)
 
 
 def _ses_path(y: np.ndarray, alpha: float) -> tuple[np.ndarray, float]:
@@ -65,7 +73,16 @@ class SES(PerSeriesForecaster):
 
 @register("holt", family="statistical")
 class Holt(PerSeriesForecaster):
-    """Holt's linear trend method (double exponential smoothing)."""
+    """Holt's linear trend method (double exponential smoothing).
+
+    When ``beta`` is left as ``None`` its SSE search is bounded to
+    [0.01, 0.3] instead of [0.01, 0.99]. The unguarded SSE-optimal beta is
+    often the corner solution beta ~= 1, which makes the trend equal the last
+    first-difference of the series — on seasonal data the optimizer latches
+    the trend onto seasonal swings and extrapolates one swing linearly,
+    producing runaway forecasts. Explicitly passed ``beta`` values are used
+    as-is and remain unrestricted.
+    """
 
     min_train_size = 3
 
@@ -95,8 +112,12 @@ class Holt(PerSeriesForecaster):
                 fitted, _, _ = self._path(y, p["alpha"], p["beta"])
                 return float(np.nansum((y - fitted) ** 2))
 
+            bound_for = {"alpha": _BOUNDS, "beta": _TREND_BETA_BOUNDS}
             res = minimize(
-                sse, x0=[x0[n] for n in free], bounds=[_BOUNDS] * len(free), method="L-BFGS-B"
+                sse,
+                x0=[x0[n] for n in free],
+                bounds=[bound_for[n] for n in free],
+                method="L-BFGS-B",
             )
             params.update({n: float(v) for n, v in zip(free, res.x)})
         fitted, level, trend = self._path(y, params["alpha"], params["beta"])
@@ -110,6 +131,13 @@ class Holt(PerSeriesForecaster):
 
     def _predict_series(self, state: dict, h: int) -> np.ndarray:
         return state["level_"] + np.arange(1, h + 1) * state["trend_"]
+
+    def _predict_sigma(self, state: dict, h: int) -> np.ndarray:
+        # State-space innovation coefficients c_j = alpha * (1 + j * beta), so
+        # sigma_k = sigma * sqrt(1 + sum_{j=1}^{k-1} c_j^2) grows with horizon.
+        j = np.arange(1, h)
+        c = state["alpha_"] * (1 + j * state["beta_"])
+        return state["_sigma"] * np.sqrt(np.concatenate([[1.0], 1.0 + np.cumsum(c**2)]))
 
 
 @register("holt_winters", family="statistical")
@@ -183,8 +211,14 @@ class HoltWinters(PerSeriesForecaster):
                 fitted, *_ = self._path(y, p["alpha"], p["beta"], p["gamma"])
                 return float(np.nansum((y - fitted) ** 2))
 
+            # Same optimized-beta cap as Holt (see Holt docstring): an
+            # unguarded trend beta can latch onto seasonal swings.
+            bound_for = {"alpha": _BOUNDS, "beta": _TREND_BETA_BOUNDS, "gamma": _BOUNDS}
             res = minimize(
-                sse, x0=[x0[n] for n in free], bounds=[_BOUNDS] * len(free), method="L-BFGS-B"
+                sse,
+                x0=[x0[n] for n in free],
+                bounds=[bound_for[n] for n in free],
+                method="L-BFGS-B",
             )
             params.update({n: float(v) for n, v in zip(free, res.x)})
         fitted, level, trend, seasons = self._path(
@@ -206,10 +240,31 @@ class HoltWinters(PerSeriesForecaster):
         s = state["season_"][(k - 1) % self.season_length]
         return base * s if self.seasonal == "mul" else base + s
 
+    def _predict_sigma(self, state: dict, h: int) -> np.ndarray:
+        if self.seasonal == "mul":
+            # No closed form for the multiplicative state space; keep the
+            # constant in-sample residual fallback.
+            return super()._predict_sigma(state, h)
+        # Additive state-space innovation coefficients. This code's seasonal
+        # update is new_season = gamma*(y_t - new_level) + (1-gamma)*s, so the
+        # seasonal innovation coefficient is gamma*(1 - alpha), NOT gamma, and
+        # it enters only at whole-season lags (j % m == 0).
+        m = self.season_length
+        j = np.arange(1, h)
+        c = state["alpha_"] * (1 + j * state["beta_"])
+        c = c + state["gamma_"] * (1 - state["alpha_"]) * (j % m == 0)
+        return state["_sigma"] * np.sqrt(np.concatenate([[1.0], 1.0 + np.cumsum(c**2)]))
+
 
 @register("auto_ets", family="statistical")
 class AutoETS(PerSeriesForecaster):
-    """Automatic ETS selection (SES / Holt / Holt-Winters) by per-series AICc."""
+    """Automatic ETS selection (SES / Holt / Holt-Winters) by per-series AICc.
+
+    Pass ``season_length`` for seasonal data: without it only SES and Holt
+    compete, so no seasonal candidate can win and seasonal structure ends up
+    in the residuals (and in the trend estimate) instead of a Holt-Winters
+    seasonal component.
+    """
 
     min_train_size = 3
 

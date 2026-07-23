@@ -75,7 +75,11 @@ class BaseForecaster(ABC):
 
     @abstractmethod
     def predict(self, h: int, level: list[int] | None = None) -> pd.DataFrame:
-        """Forecast ``h`` steps ahead for every fitted series."""
+        """Forecast ``h`` steps ahead for every fitted series.
+
+        Returned rows must be sorted ascending by ``ds`` within each
+        ``unique_id``; downstream consumers align predictions positionally.
+        """
 
     def fitted_values(self) -> pd.DataFrame:
         """In-sample fitted values as (unique_id, ds, y, fitted)."""
@@ -130,10 +134,13 @@ class PerSeriesForecaster(BaseForecaster):
                 fitted = np.concatenate([[np.nan], y[:-1]])
             fitted = np.asarray(fitted, dtype=float)
             resid = (y - fitted)[~np.isnan(y - fitted)]
+            # Uncentered rms with an n-1 denominator: systematic forecast bias
+            # widens the intervals instead of being hidden by mean-centering.
             if resid.size >= 2:
-                sigma = float(np.std(resid, ddof=1))
+                sigma = float(np.sqrt(np.sum(resid**2) / (resid.size - 1)))
             elif len(y) >= 3:
-                sigma = float(np.std(np.diff(y), ddof=1))
+                d = np.diff(y)
+                sigma = float(np.sqrt(np.sum(d**2) / (d.size - 1)))
             else:
                 sigma = 1.0
             state["fitted"] = fitted

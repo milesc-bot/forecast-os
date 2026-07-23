@@ -253,6 +253,36 @@ def test_simulate_from_returns(mc, tmp_path, capsys):
     assert "q50" in capsys.readouterr().out
 
 
+def test_short_output_alias_o(mc, tmp_path, panel_csv):
+    """-o is a documented short alias for --output on forecast, compare, simulate."""
+    fc_path = tmp_path / "fc.csv"
+    rc = main(
+        ["forecast", str(panel_csv), "--h", "3",
+         "--model", "_test_cli_naive", "-o", str(fc_path)]
+    )
+    assert rc == 0
+    fc = pd.read_csv(fc_path)
+    assert len(fc) == 2 * 3
+    assert "_test_cli_naive" in fc.columns
+
+    board_path = tmp_path / "board.csv"
+    rc = main(
+        ["compare", str(panel_csv), "--h", "4",
+         "--models", "_test_cli_naive,_test_cli_mean", "-o", str(board_path)]
+    )
+    assert rc == 0
+    board = pd.read_csv(board_path)
+    assert sorted(board["model"]) == ["_test_cli_mean", "_test_cli_naive"]
+
+    sim_path = tmp_path / "sim.csv"
+    rc = main(
+        ["simulate", "--s0", "100", "--h", "5", "--paths", "30",
+         "--seed", "1", "-o", str(sim_path)]
+    )
+    assert rc == 0
+    assert len(pd.read_csv(sim_path)) == 5
+
+
 def test_simulate_writes_csv(mc, tmp_path):
     out_path = tmp_path / "sim.csv"
     rc = main(

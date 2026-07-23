@@ -47,6 +47,25 @@ def test_theta_halves_the_trend_on_a_clean_line():
     assert np.allclose(pred["yhat"], expected, atol=1.0)
 
 
+def test_theta_interval_width_strictly_increases(trend_panel):
+    # sigma_k = sigma * sqrt(1 + (k-1) * (alpha * (1/theta))^2): the SES
+    # component accumulates variance while the trend line is deterministic.
+    pred = Theta().fit(trend_panel).predict(12, level=[90])
+    for _, g in pred.groupby("unique_id"):
+        width = (g["hi-90"] - g["lo-90"]).to_numpy()
+        assert (np.diff(width) > 0).all()
+
+
+def test_theta_sigma_scales_ses_growth_by_component_weight(trend_panel):
+    model = Theta().fit(trend_panel)
+    for state in model._series_state.values():
+        sigma = model._predict_sigma(state, 8)
+        k = np.arange(1, 9)
+        w = 1.0 / model.theta
+        expected = state["_sigma"] * np.sqrt(1 + (k - 1) * (state["alpha_"] * w) ** 2)
+        assert np.allclose(sigma, expected)
+
+
 def test_theta_default_params_full_contract(panel):
     pred = Theta().fit(panel).predict(8, level=[80])
     assert (pred.groupby("unique_id").size() == 8).all()

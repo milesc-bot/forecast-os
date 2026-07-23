@@ -6,6 +6,10 @@ pre-sample values, and minimizes the SSE (conditioning on the first
 ``max(p, q)`` terms) with L-BFGS-B. Forecast standard errors come from the
 psi-weight expansion of the d-times-integrated ARMA process. ``AutoARIMA``
 picks ``d`` with a variance heuristic and ``(p, q)`` by AICc grid search.
+
+The constant ``c`` (``include_mean``) is estimated only when ``d == 0``; for
+differenced models (``d > 0``) ``include_mean`` is silently ignored, mirroring
+R's ``arima`` ``include.mean`` semantics — there is no drift term.
 """
 
 from __future__ import annotations
@@ -121,7 +125,15 @@ def _psi_sigma(state: dict, h: int) -> np.ndarray:
 
 @register("arima", family="statistical")
 class ARIMA(PerSeriesForecaster):
-    """ARIMA(p, d, q) forecaster estimated by conditional sum of squares."""
+    """ARIMA(p, d, q) forecaster estimated by conditional sum of squares.
+
+    ``include_mean`` applies only when ``d == 0``: for differenced models
+    (``d > 0``) it is silently ignored, mirroring R's ``arima``
+    ``include.mean`` semantics, so e.g. ARIMA(0, 1, 0) forecasts are flat at
+    the last observation with no drift term. :class:`AutoARIMA` can still
+    capture drift-like behavior through AR structure on the differenced
+    series.
+    """
 
     def __init__(self, order: tuple[int, int, int] = (1, 1, 1), include_mean: bool = True):
         try:

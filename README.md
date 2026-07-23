@@ -80,8 +80,9 @@ df = fos.load_air_passengers()
 model = fos.get_model("auto_ets", season_length=12)
 model.fit(df)
 model.predict(h=12, level=[80, 95])
-#      unique_id         ds        yhat       lo-80  ...
-# 0  AirPassengers 1961-01-01  444.5  ...
+#     unique_id         ds   yhat  lo-80  hi-80  lo-95  hi-95
+# AirPassengers 1961-01-01  447.2  432.7  461.7  425.1  469.4
+# ...
 
 # 2. Compare models with walk-forward cross-validation
 engine = fos.ForecastEngine(models=["seasonal_naive", "theta", "auto_ets", "auto_arima"])

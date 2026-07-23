@@ -73,6 +73,38 @@ class TestGARCH11:
         with pytest.raises(NotFittedError):
             GARCH11().forecast_variance(5)
 
+    def test_fitted_params_beat_every_optimizer_start(self, garch_r, fitted):
+        """Dead-optimizer guard: the fitted parameters must achieve an internal
+        NLL no worse than every hard-coded optimizer start, i.e. the optimizer
+        actually moved. Mirrors garch.py's z-scoring, var0, starts, and _nll
+        (including the persistence penalty) by formula.
+        """
+        r = garch_r - np.mean(garch_r)
+        scale = float(np.std(r))
+        z2 = (r / scale) ** 2
+        var0 = float(np.mean(z2))
+
+        def nll(omega: float, alpha: float, beta: float) -> float:
+            sigma2 = np.empty(z2.size)
+            sigma2[0] = var0
+            for t in range(1, z2.size):
+                sigma2[t] = omega + alpha * z2[t - 1] + beta * sigma2[t - 1]
+            sigma2 = np.maximum(sigma2, 1e-12)
+            val = 0.5 * float(np.sum(np.log(sigma2) + z2 / sigma2))
+            persistence = alpha + beta
+            if persistence > 0.999:
+                val += 1e6 * (persistence - 0.999)
+            return val
+
+        # fitted omega_ is reported on the original scale; map back to z-scale
+        fitted_nll = nll(fitted.omega_ / scale**2, fitted.alpha_, fitted.beta_)
+        starts = ((0.05, 0.05, 0.90), (0.10, 0.10, 0.80), (0.30, 0.02, 0.95))
+        for x0 in starts:
+            assert fitted_nll <= nll(*x0) + 1e-9, (
+                f"fitted NLL {fitted_nll:.2f} is worse than start {x0} "
+                f"NLL {nll(*x0):.2f}: optimizer did not improve on its start"
+            )
+
     def test_bad_inputs_raise(self):
         with pytest.raises(ValueError):
             GARCH11().fit(np.array([]))

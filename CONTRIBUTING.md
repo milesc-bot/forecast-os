@@ -22,6 +22,8 @@ Every model in the engine satisfies one contract. Subclass
 automatically:
 
 ```python
+import numpy as np
+
 from forecast_os import PerSeriesForecaster, register
 
 @register("my_model", family="statistical")

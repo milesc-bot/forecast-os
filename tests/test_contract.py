@@ -71,3 +71,36 @@ def test_registered_model_predict_before_fit_raises(name):
     model = get_model(name)
     with pytest.raises(ForecastOSError):
         model.predict(3)
+
+
+# -- negative predict-argument tests -------------------------------------------
+# Fitted models are cached per module run so each registered model is fitted
+# once and reused across all parametrized violations (keeps runtime low).
+
+_FITTED_CACHE: dict[str, BaseForecaster] = {}
+
+
+def _fitted_model(name: str) -> BaseForecaster:
+    if name not in _FITTED_CACHE:
+        panel = generate_series(
+            n_series=1, length=40, freq="D", trend=0.2, seasonality=7,
+            season_amp=3.0, noise=0.5, seed=7,
+        )
+        _FITTED_CACHE[name] = get_model(name).fit(panel)
+    return _FITTED_CACHE[name]
+
+
+@pytest.mark.parametrize("bad_h", [0, -1])
+@pytest.mark.parametrize("name", _all_model_names())
+def test_registered_model_predict_rejects_nonpositive_h(name, bad_h):
+    model = _fitted_model(name)
+    with pytest.raises(ValueError):
+        model.predict(bad_h)
+
+
+@pytest.mark.parametrize("bad_level", [[0], [150]])
+@pytest.mark.parametrize("name", _all_model_names())
+def test_registered_model_predict_rejects_bad_level(name, bad_level):
+    model = _fitted_model(name)
+    with pytest.raises(ValueError):
+        model.predict(3, level=bad_level)

@@ -107,7 +107,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_fc.add_argument("--h", type=int, required=True, help="forecast horizon")
     p_fc.add_argument("--model", default="auto_ets", help="registered model name")
     p_fc.add_argument("--level", type=int, default=None, help="confidence level (e.g. 80)")
-    p_fc.add_argument("--output", default=None, help="output CSV path (default: print)")
+    p_fc.add_argument(
+        "-o", "--output", default=None, help="output CSV path (default: print)"
+    )
     p_fc.set_defaults(func=_cmd_forecast)
 
     p_cmp = sub.add_parser("compare", help="cross-validate models and print a leaderboard")
@@ -118,7 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument(
         "--metrics", default="mae,rmse,smape", help="comma-separated metric names"
     )
-    p_cmp.add_argument("--output", default=None, help="output CSV path (default: print)")
+    p_cmp.add_argument(
+        "-o", "--output", default=None, help="output CSV path (default: print)"
+    )
     p_cmp.set_defaults(func=_cmd_compare)
 
     p_sim = sub.add_parser("simulate", help="Monte Carlo (GBM) price simulation summary")
@@ -132,7 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--from-returns", default=None,
         help="CSV of historical returns to calibrate mu/sigma (overrides --mu/--sigma)",
     )
-    p_sim.add_argument("--output", default=None, help="output CSV path (default: print)")
+    p_sim.add_argument(
+        "-o", "--output", default=None, help="output CSV path (default: print)"
+    )
     p_sim.set_defaults(func=_cmd_simulate)
 
     return parser

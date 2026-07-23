@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from forecast_os.core.base import PerSeriesForecaster
-from forecast_os.core.types import ID_COL
+from forecast_os.core.types import ID_COL, to_panel
 from forecast_os.datasets.synthetic import generate_returns
 from forecast_os.finance.backtest import BacktestResult, StrategyBacktester
 
@@ -97,6 +97,59 @@ def test_multi_series_summary_one_row_per_uid():
     assert set(res.summary[ID_COL]) == {"asset-0", "asset-1"}
     assert len(res.frame) == 80
     assert (res.frame.groupby(ID_COL).size() == 40).all()
+
+
+class ParityFlipForecaster(PerSeriesForecaster):
+    """h=1 forecast alternates sign with training length: +0.01 if even, -0.01 if odd."""
+
+    def _fit_series(self, y):
+        return {"sign": 1.0 if len(y) % 2 == 0 else -1.0}
+
+    def _predict_series(self, state, h):
+        return np.full(h, 0.01 * state["sign"])
+
+
+def test_position_flips_hand_computed_costs_trades_exposure():
+    """Hand-computed flip sequence: cost is debited on every entry AND exit.
+
+    n=12 returns, test_size=6, step_size=1: the walk-forward training lengths
+    for the 6 test periods are 6,7,8,9,10,11, so the parity forecaster goes
+    long, flat, long, flat, long, flat. Every period is a position change
+    (|dpos|=1, starting flat), so each period is charged cost_bps/1e4 = 0.01.
+    """
+    y = np.array(
+        [0.010, -0.020, 0.015, 0.005, -0.010, 0.020,  # train-only head
+         0.030, -0.040, 0.050, -0.060, 0.070, -0.080]  # walk-forward test tail
+    )
+    df = to_panel(y, unique_id="asset-0")
+    res = StrategyBacktester(ParityFlipForecaster(), cost_bps=100.0).run(
+        df, test_size=6, step_size=1
+    )
+
+    frame = res.frame
+    assert len(frame) == 6
+    np.testing.assert_allclose(
+        frame["yhat"].to_numpy(), [0.01, -0.01, 0.01, -0.01, 0.01, -0.01]
+    )
+    np.testing.assert_allclose(
+        frame["position"].to_numpy(), [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+    )
+    # long periods earn y_t minus the 0.01 entry cost; flat periods pay the
+    # 0.01 exit cost and earn nothing
+    expected_strat_ret = np.array([0.020, -0.010, 0.040, -0.010, 0.060, -0.010])
+    np.testing.assert_allclose(
+        frame["strategy_return"].to_numpy(), expected_strat_ret, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        frame["equity"].to_numpy(), np.cumprod(1.0 + expected_strat_ret), atol=1e-12
+    )
+
+    row = res.summary.iloc[0]
+    assert row["n_trades"] == 6  # one position change every period
+    assert row["exposure"] == 0.5  # long half of the periods
+    assert np.isclose(
+        row["total_return"], float(np.prod(1.0 + expected_strat_ret) - 1.0)
+    )
 
 
 def test_params_stored_as_attributes():

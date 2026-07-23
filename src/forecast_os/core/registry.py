@@ -44,7 +44,7 @@ def register(name: str, family: str = "statistical", description: str | None = N
         if not (isinstance(cls, type) and issubclass(cls, BaseForecaster)):
             raise TypeError(f"{cls!r} must be a BaseForecaster subclass")
         existing = _REGISTRY.get(name)
-        if existing is not None and existing.cls.__qualname__ != cls.__qualname__:
+        if existing is not None and existing.cls is not cls:
             raise ValueError(
                 f"model name {name!r} already registered by {existing.cls.__qualname__}"
             )

@@ -159,3 +159,63 @@ def test_invalid_window_args_raise(kwargs):
     kwargs = {"n_windows": 2, **kwargs}
     with pytest.raises(ValueError):
         cross_validation(_panel(), [_probe_cls()()], **kwargs)
+
+
+def test_shuffled_predict_output_raises():
+    """A model returning out-of-order ds must fail loudly, not merge silently."""
+
+    class Shuffled(PerSeriesForecaster):
+        """Returns its prediction rows in reversed ds order."""
+
+        def _fit_series(self, y):
+            return {}
+
+        def _predict_series(self, state, h):
+            return np.zeros(h)
+
+        def predict(self, h, level=None):
+            out = super().predict(h, level=level)
+            return out.iloc[::-1].reset_index(drop=True)
+
+    with pytest.raises(DataContractError, match="strictly increasing"):
+        cross_validation(_panel(), [Shuffled()], h=3, n_windows=2)
+
+
+# -- PerSeriesForecaster fallback sigma (core.base, used by every CV model) ----
+
+
+def test_fallback_sigma_is_uncentered_rms_of_residuals():
+    """Systematic forecast bias must widen intervals, not vanish by centering."""
+
+    class Biased(PerSeriesForecaster):
+        """Fitted values are y - 2: constant residual of +2, zero variance."""
+
+        def _fit_series(self, y):
+            return {"fitted": y - 2.0}
+
+        def _predict_series(self, state, h):
+            return np.full(h, float(state["_y"][-1]))
+
+    df = pd.DataFrame({"unique_id": "a", "ds": range(10), "y": np.arange(10.0)})
+    m = Biased().fit(df)
+    resid = np.full(10, 2.0)
+    expected = np.sqrt(np.sum(resid**2) / (resid.size - 1))
+    assert m._series_state["a"]["_sigma"] == pytest.approx(expected)
+    assert m._series_state["a"]["_sigma"] > 1.0  # centered std would be ~0
+
+
+def test_fallback_sigma_diff_path_is_uncentered_too():
+    class NoFits(PerSeriesForecaster):
+        """No usable fitted values -> diff-based sigma fallback."""
+
+        def _fit_series(self, y):
+            return {"fitted": np.full(len(y), np.nan)}
+
+        def _predict_series(self, state, h):
+            return np.full(h, float(state["_y"][-1]))
+
+    df = pd.DataFrame({"unique_id": "a", "ds": range(10), "y": np.arange(10.0)})
+    m = NoFits().fit(df)
+    d = np.diff(np.arange(10.0))  # all ones; centered std would be 0
+    expected = np.sqrt(np.sum(d**2) / (d.size - 1))
+    assert m._series_state["a"]["_sigma"] == pytest.approx(expected)

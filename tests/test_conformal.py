@@ -55,15 +55,26 @@ def test_bounds_ordering(panel):
     assert (pred["hi-80"] <= pred["hi-95"]).all()
 
 
-def test_width_equals_calibration_quantile():
+def test_width_equals_corrected_calibration_quantile():
     rng = np.random.default_rng(3)
     y = rng.normal(0.0, 2.0, size=40)  # n_cal = max(8, 40 // 4) = 10
     cf = ConformalForecaster(model=_Zero()).fit(to_panel(y))
     pred = cf.predict(5, level=[80])
-    expected = np.quantile(np.abs(y[-10:]), 0.8)
+    # finite-sample-corrected order statistic: min(1, (n+1)*0.8/n) = 0.88
+    expected = np.quantile(np.abs(y[-10:]), 0.88, method="higher")
     assert np.allclose(pred["yhat"], 0.0)
     assert np.allclose(pred["hi-80"] - pred["yhat"], expected)
     assert np.allclose(pred["yhat"] - pred["lo-80"], expected)
+
+
+def test_nominal_90_coverage_on_iid_gaussian_is_at_least_085():
+    rng = np.random.default_rng(21)
+    y = 5.0 + rng.normal(0.0, 1.0, size=400)
+    train, test = y[:300], y[300:]
+    cf = ConformalForecaster(model=_Mean()).fit(to_panel(train))
+    pred = cf.predict(100, level=[90])
+    inside = (test >= pred["lo-90"].to_numpy()) & (test <= pred["hi-90"].to_numpy())
+    assert inside.mean() >= 0.85
 
 
 def test_per_series_widths_reflect_noise():
@@ -104,6 +115,20 @@ def test_series_too_short_for_calibration_raises():
 def test_predict_before_fit_raises():
     with pytest.raises(NotFittedError):
         ConformalForecaster(model=_Mean()).predict(3)
+
+
+@pytest.mark.parametrize("h", [0, -1, 2.5, "3"])
+def test_predict_invalid_h_raises(panel, h):
+    cf = ConformalForecaster(model=_Mean()).fit(panel)
+    with pytest.raises(ValueError, match="h must be"):
+        cf.predict(h)
+
+
+@pytest.mark.parametrize("level", [[150], [0], [100], [-5]])
+def test_predict_invalid_level_raises(panel, level):
+    cf = ConformalForecaster(model=_Mean()).fit(panel)
+    with pytest.raises(ValueError, match="confidence levels"):
+        cf.predict(3, level=level)
 
 
 def test_clone_deep_clones_member_instance():

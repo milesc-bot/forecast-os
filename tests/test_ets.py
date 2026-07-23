@@ -82,6 +82,56 @@ def test_holt_min_train_size():
         Holt().fit(to_panel([1.0, 2.0]))
 
 
+def test_holt_no_runaway_trend_on_seasonal_data():
+    # Regression: with beta searched over [0.01, 0.99] the SSE optimizer hit
+    # the corner beta ~= 1, making the trend equal the last first-difference
+    # (a seasonal swing); h=14 forecasts collapsed to ~19-83 vs truth ~146-190.
+    df = generate_series(n_series=5, length=300, seasonality=7, trend=0.3, seed=42)
+    model = Holt().fit(df)
+    pred = model.predict(14)
+    last = df.groupby("unique_id")["y"].last()
+    for uid, g in pred.groupby("unique_id"):
+        assert np.abs(g["yhat"].to_numpy() - last[uid]).max() < 30.0
+    for state in model._series_state.values():
+        assert 0.01 <= state["beta_"] <= 0.3  # optimized beta stays capped
+
+
+def test_holt_explicit_beta_is_unrestricted():
+    # Only the *optimized* beta search is capped at 0.3.
+    t = np.arange(30, dtype=float)
+    model = Holt(alpha=0.5, beta=0.8).fit(to_panel(1.0 + 2.0 * t))
+    for state in model._series_state.values():
+        assert state["beta_"] == 0.8
+
+
+def test_holt_interval_width_strictly_increases(trend_panel):
+    pred = Holt().fit(trend_panel).predict(12, level=[95])
+    for _, g in pred.groupby("unique_id"):
+        width = (g["hi-95"] - g["lo-95"]).to_numpy()
+        assert (np.diff(width) > 0).all()
+
+
+def test_holt_90_coverage_on_local_trend_data():
+    # Empirical sanity: 90% intervals on simulated local-linear-trend data
+    # should cover roughly 90% of future observations (was ~69% with the old
+    # constant-width fallback at 95%).
+    rng = np.random.default_rng(0)
+    h, hits, total = 10, 0, 0
+    for _ in range(30):
+        n = 120
+        level, trend = 100.0, 0.5
+        y = np.empty(n + h)
+        for t in range(n + h):
+            level += trend + 0.5 * rng.standard_normal()
+            trend += 0.05 * rng.standard_normal()
+            y[t] = level + rng.standard_normal()
+        pred = Holt().fit(to_panel(y[:n])).predict(h, level=[90])
+        inside = (y[n:] >= pred["lo-90"].to_numpy()) & (y[n:] <= pred["hi-90"].to_numpy())
+        hits += int(inside.sum())
+        total += h
+    assert 0.75 <= hits / total <= 0.99
+
+
 # -- HoltWinters --------------------------------------------------------------
 
 
@@ -110,6 +160,21 @@ def test_holt_winters_min_train_size_is_two_seasons():
         HoltWinters(season_length=7).fit(to_panel(rng.standard_normal(13)))
 
 
+def test_holt_winters_add_interval_width_strictly_increases(panel):
+    pred = HoltWinters(season_length=7, seasonal="add").fit(panel).predict(15, level=[95])
+    for _, g in pred.groupby("unique_id"):
+        width = (g["hi-95"] - g["lo-95"]).to_numpy()
+        assert (np.diff(width) > 0).all()
+
+
+def test_holt_winters_mul_keeps_constant_sigma_fallback(panel):
+    # No closed-form sigma for the multiplicative state space.
+    model = HoltWinters(season_length=7, seasonal="mul").fit(panel)
+    for state in model._series_state.values():
+        sigma = model._predict_sigma(state, 10)
+        assert np.allclose(sigma, state["_sigma"])
+
+
 # -- AutoETS ------------------------------------------------------------------
 
 
@@ -134,6 +199,17 @@ def test_autoets_prefers_trend_model_on_trending_data(trend_panel):
     model = AutoETS().fit(trend_panel)
     for state in model._series_state.values():
         assert state["winner_name"] == "Holt"
+
+
+def test_autoets_sigma_delegation_uses_winner_formula(trend_panel):
+    # AutoETS delegates _predict_sigma to the winner, so a Holt winner must
+    # produce horizon-growing (not constant) interval widths.
+    model = AutoETS().fit(trend_panel)
+    assert all(s["winner_name"] == "Holt" for s in model._series_state.values())
+    pred = model.predict(10, level=[90])
+    for _, g in pred.groupby("unique_id"):
+        width = (g["hi-90"] - g["lo-90"]).to_numpy()
+        assert (np.diff(width) > 0).all()
 
 
 # -- shared -------------------------------------------------------------------

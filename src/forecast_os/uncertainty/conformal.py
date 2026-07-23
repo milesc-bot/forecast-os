@@ -4,8 +4,9 @@ Per series, the last calibration block is held out; the member model (an
 instance or a registry-name string resolved lazily inside :meth:`fit`) is
 fitted on the head and its absolute holdout residuals become the
 calibration scores. The member is then refitted on the full series, and
-intervals at level ``l`` are its point forecast plus/minus the empirical
-``l``-quantile of that series' scores — distribution-free calibration.
+intervals at level ``l`` are its point forecast plus/minus the
+finite-sample-corrected order statistic of that series' scores
+(the ``ceil((n + 1) * l/100)``-th smallest score).
 """
 
 from __future__ import annotations
@@ -23,7 +24,13 @@ __all__ = ["ConformalForecaster"]
 
 @register("conformal", family="ensemble")
 class ConformalForecaster(BaseForecaster):
-    """Wrap a member model with split-conformal prediction intervals."""
+    """Wrap a member model with split-conformal prediction intervals.
+
+    Calibration scores are pooled across forecast horizons, so the intervals
+    target *marginal* (horizon-averaged) coverage and assume the calibration
+    residuals are exchangeable with future residuals; per-step conditional
+    coverage is not guaranteed.
+    """
 
     def __init__(
         self,
@@ -87,10 +94,18 @@ class ConformalForecaster(BaseForecaster):
 
     def predict(self, h: int, level: list[int] | None = None) -> pd.DataFrame:
         self._check_is_fitted()
+        if not isinstance(h, (int, np.integer)) or h < 1:
+            raise ValueError(f"h must be a positive integer, got {h!r}")
         levels = _check_level(level)
-        out = self._model_.predict(h)[[ID_COL, TIME_COL, "yhat"]].copy()
+        out = self._model_.predict(int(h))[[ID_COL, TIME_COL, "yhat"]].copy()
         for lvl in levels:
-            q = {uid: float(np.quantile(r, lvl / 100)) for uid, r in self._abs_resid_.items()}
+            q = {}
+            for uid, scores in self._abs_resid_.items():
+                # Finite-sample-corrected order statistic: without the
+                # (n + 1)/n inflation the plain empirical quantile undercovers.
+                n = scores.size
+                q_level = min(1.0, (n + 1) * (lvl / 100) / n)
+                q[uid] = float(np.quantile(scores, q_level, method="higher"))
             width = out[ID_COL].map(q).to_numpy(dtype=float)
             out[f"lo-{lvl}"] = out["yhat"] - width
             out[f"hi-{lvl}"] = out["yhat"] + width

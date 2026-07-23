@@ -23,7 +23,12 @@ seasonal data isn't earning its complexity.
 - `auto_ets` — fits the applicable candidates and picks by AICc.
 
 Fast, robust, interpretable — the default first real model for business series.
-Smoothing parameters are optimized per series, never shared.
+Smoothing parameters are optimized per series, never shared. When optimizing β,
+`holt` caps the search at β ≤ 0.3: unguarded SSE optimization on seasonal data
+is minimized near β ≈ 1, where the trend collapses to the last first-difference
+and the forecast extrapolates a seasonal swing as a runaway linear trend. On
+seasonal data, pass `season_length` to `auto_ets` (and to `auto_select`
+candidates) so the seasonal candidates can compete.
 
 ## Theta
 
@@ -38,6 +43,10 @@ the differencing, and intervals use the ψ-weight (MA(∞)) representation, so u
 grows correctly with horizon. `auto_arima` picks `d` by a variance-minimization
 heuristic and (p,q) by AICc grid search. Use for autocorrelation-driven series without
 strong seasonality (seasonal ARIMA is on the roadmap).
+
+Note: like R's `arima`, `include_mean` applies only when `d == 0` — a differenced
+model has no drift constant (its forecast is trend-free by construction);
+`auto_arima` can still capture drift-like behavior through AR structure.
 
 ## Kalman filter
 
@@ -66,7 +75,7 @@ extensions.
 
 - `garch` / `GARCH11` — GARCH(1,1): tomorrow's variance = ω + α·(today's shock)² +
   β·(today's variance). Captures volatility clustering; forecasts mean-revert to the
-  long-run vol ω/(1−α−β).
+  long-run variance ω/(1−α−β).
 - `MonteCarloSimulator` — geometric Brownian motion scenario fans, calibrated from
   observed returns (`from_returns`).
 - `MarkovRegimeSwitching` — 2-state Gaussian hidden Markov model fitted by EM;

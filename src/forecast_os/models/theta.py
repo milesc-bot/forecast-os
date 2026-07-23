@@ -84,3 +84,12 @@ class Theta(PerSeriesForecaster):
             s = state["index_"][(n - 1 + k) % len(state["index_"])]
             forecast = forecast * s if mode == "mul" else forecast + s
         return forecast
+
+    def _predict_sigma(self, state: dict, h: int) -> np.ndarray:
+        # The theta=0 trend line is deterministic, so only the SES component
+        # (combination weight w = 1/theta) accumulates forecast-error
+        # variance. Approximate by scaling the SES horizon-growth term by w,
+        # using the SES alpha fitted on the theta line.
+        w = 1.0 / self.theta
+        k = np.arange(1, h + 1)
+        return state["_sigma"] * np.sqrt(1 + (k - 1) * (state["alpha_"] * w) ** 2)

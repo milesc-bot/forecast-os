@@ -60,6 +60,14 @@ def test_duplicate_name_different_class_raises():
         register("_test_dup", family="baseline")(_make_dummy("DupTwo"))
 
 
+def test_duplicate_name_same_qualname_different_class_raises():
+    # A DIFFERENT class that merely shares the qualname must NOT silently
+    # replace the registered one; only identity (existing.cls is cls) may pass.
+    register("_test_dup_qn", family="baseline")(_make_dummy("TwinDummy"))
+    with pytest.raises(ValueError, match="already registered"):
+        register("_test_dup_qn", family="baseline")(_make_dummy("TwinDummy"))
+
+
 def test_same_class_re_register_is_noop():
     cls = _make_dummy("ReRegDummy")
     register("_test_rereg", family="baseline")(cls)

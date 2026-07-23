@@ -83,6 +83,14 @@ class TestARIMA:
         pred = model.predict(6)
         assert np.allclose(pred["yhat"], y[-1])
 
+    def test_include_mean_silently_ignored_when_differenced(self):
+        # Documented semantics (mirrors R's arima include.mean): the constant
+        # is estimated only when d == 0; with d > 0 it is silently dropped.
+        rng = np.random.default_rng(8)
+        y = 50.0 + np.cumsum(rng.standard_normal(120))
+        model = ARIMA(order=(1, 1, 0), include_mean=True).fit(to_panel(y))
+        assert model._series_state["series-0"]["c"] == 0.0
+
     def test_010_sigma_grows_like_sqrt_k(self):
         # psi weights of (0,1,0) cumsum to all-ones: sigma_k = resid_std * sqrt(k)
         rng = np.random.default_rng(4)

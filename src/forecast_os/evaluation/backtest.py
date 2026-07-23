@@ -21,6 +21,22 @@ from ..core.types import ID_COL, TARGET_COL, TIME_COL, validate_panel
 __all__ = ["cross_validation"]
 
 
+def _check_pred_sorted(pred: pd.DataFrame, model_name: str) -> None:
+    """Raise unless every series' ``ds`` is strictly increasing.
+
+    Predictions are aligned to test rows by per-series row position, so an
+    out-of-order predict() output would silently scramble the merge.
+    """
+    for uid, g in pred.groupby(ID_COL, sort=False):
+        ds = g[TIME_COL]
+        if not ds.is_monotonic_increasing or ds.duplicated().any():
+            raise DataContractError(
+                f"{model_name}.predict() returned rows whose 'ds' is not "
+                f"strictly increasing within series {uid!r}; cross_validation "
+                f"aligns predictions by row position and requires sorted output"
+            )
+
+
 def _resolve_models(models: Sequence[BaseForecaster | str]) -> list[BaseForecaster]:
     resolved: list[BaseForecaster] = []
     for m in models:
@@ -84,6 +100,7 @@ def cross_validation(
         for model in resolved:
             fitted = model.clone().fit(train)
             pred = fitted.predict(h, level=level)
+            _check_pred_sorted(pred, model.name)
             pred = pred.drop(columns=[TIME_COL])
             pred["_step"] = pred.groupby(ID_COL).cumcount()
             rename = {"yhat": model.name}

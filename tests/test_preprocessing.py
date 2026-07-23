@@ -115,6 +115,51 @@ def test_scaler_forecast_frame_inverse():
     assert (inv["cutoff"] == 4).all()
 
 
+def test_scaler_cv_frame_inverse_restores_renamed_point_columns():
+    """CV frames rename the point column after the model; the inverse must
+    restore ALL numeric value columns, not only y/yhat/interval patterns."""
+    df = make_panel()
+    sc = StandardScaler().fit(df)
+    ya = df[df["unique_id"] == "a"]["y"].to_numpy()
+    mu, sd = ya.mean(), ya.std()
+    fc = pd.DataFrame(
+        {
+            "unique_id": ["a", "a"],
+            "ds": [5, 6],
+            "cutoff": [4, 4],
+            "y": [0.5, -0.5],
+            "SES": [0.0, 1.0],
+            "SES-lo-80": [-1.0, 0.0],
+            "SES-hi-80": [1.0, 2.0],
+        }
+    )
+    inv = sc.inverse_transform(fc)
+    np.testing.assert_allclose(inv["y"].to_numpy(), [mu + 0.5 * sd, mu - 0.5 * sd])
+    np.testing.assert_allclose(inv["SES"].to_numpy(), [mu, mu + sd])
+    np.testing.assert_allclose(inv["SES-lo-80"].to_numpy(), [mu - sd, mu])
+    np.testing.assert_allclose(inv["SES-hi-80"].to_numpy(), [mu + sd, mu + 2 * sd])
+    # identifier columns untouched even though cutoff/ds are numeric
+    assert (inv["cutoff"] == 4).all()
+    assert list(inv["ds"]) == [5, 6]
+
+
+def test_inverse_leaves_non_numeric_extra_columns_untouched():
+    sc = StandardScaler().fit(make_panel())
+    fc = pd.DataFrame(
+        {"unique_id": ["a"], "ds": [5], "yhat": [0.0], "note": ["keep-me"]}
+    )
+    inv = sc.inverse_transform(fc)
+    assert inv["note"].iloc[0] == "keep-me"
+
+
+def test_forward_transform_ignores_renamed_point_columns():
+    # the widened column selection is inverse-only; forward must not touch
+    # arbitrary passthrough columns
+    df = make_panel().assign(SES=1.0)
+    z = StandardScaler().fit(make_panel()).transform(df)
+    assert (z["SES"] == 1.0).all()
+
+
 def test_scaler_unseen_uid_inverse_raises():
     sc = StandardScaler().fit(make_panel())
     fc = pd.DataFrame({"unique_id": ["zzz"], "ds": [5], "yhat": [0.0]})
@@ -153,6 +198,14 @@ def test_log_numeric_offset_and_forecast_frame():
     fc = pd.DataFrame({"unique_id": ["a"], "ds": [5], "yhat": [np.log(12.0)]})
     inv = lt.inverse_transform(fc)
     assert inv["yhat"].iloc[0] == pytest.approx(11.0)
+
+
+def test_log_inverse_restores_renamed_point_column():
+    df = make_panel()
+    lt = LogTransform(offset=1.0).fit(df)
+    fc = pd.DataFrame({"unique_id": ["a"], "ds": [5], "SES": [np.log(12.0)]})
+    inv = lt.inverse_transform(fc)
+    assert inv["SES"].iloc[0] == pytest.approx(11.0)
 
 
 def test_log_nonpositive_with_zero_offset_raises():
@@ -207,6 +260,36 @@ def test_differencer_continuation_inverse_datetime_ds():
     )
     inv = diff.inverse_transform(fc)
     np.testing.assert_allclose(inv["yhat"].to_numpy(), [16.0, 22.0])
+
+
+def test_differencer_continuation_inverse_renamed_columns():
+    df = make_panel()
+    diff = Differencer(d=1).fit(df)
+    fc = pd.DataFrame(
+        {"unique_id": ["a", "a"], "ds": [5, 6], "cutoff": [4, 4], "SES": [5.0, 6.0]}
+    )
+    inv = diff.inverse_transform(fc)
+    np.testing.assert_allclose(inv["SES"].to_numpy(), [16.0, 22.0])
+    assert (inv["cutoff"] == 4).all()
+
+
+def test_differencer_partial_in_range_slice_raises():
+    df = make_panel()
+    diff = Differencer(d=1)
+    z = diff.fit_transform(df)
+    partial = z.iloc[1:].copy()  # drop the first transformed row of series a
+    with pytest.raises(ForecastOSError, match="not invertible"):
+        diff.inverse_transform(partial)
+
+
+def test_differencer_shifted_in_range_slice_raises():
+    df = make_panel()
+    diff = Differencer(d=1).fit(df)
+    # correct length (n - d = 4) but starting at the training start, not the
+    # first transformed ds -> silently-wrong values before, now an error
+    fc = pd.DataFrame({"unique_id": ["a"] * 4, "ds": [0, 1, 2, 3], "yhat": [1.0] * 4})
+    with pytest.raises(ForecastOSError, match="not invertible"):
+        diff.inverse_transform(fc)
 
 
 def test_differencer_too_short_series_raises():

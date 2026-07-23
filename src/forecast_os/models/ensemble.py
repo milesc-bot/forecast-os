@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from ..core.base import BaseForecaster
+from ..core.base import BaseForecaster, _check_level
 from ..core.registry import get_model, register
 from ..core.types import ID_COL, TIME_COL, validate_panel
 
@@ -67,6 +67,9 @@ class Ensemble(BaseForecaster):
 
     def predict(self, h: int, level: list[int] | None = None) -> pd.DataFrame:
         self._check_is_fitted()
+        if not isinstance(h, (int, np.integer)) or h < 1:
+            raise ValueError(f"h must be a positive integer, got {h!r}")
+        _check_level(level)
         preds = [
             m.predict(h, level=level)
             .sort_values([ID_COL, TIME_COL], kind="stable")
