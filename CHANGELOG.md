@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.0 (2026-07-24)
+
+Roadmap complete: snapshot history, driver-based ARIMA, foundation-model
+adapter, HTTP serving, and a fully interactive terminal.
+
+- **Snapshot store** (`forecast_os.snapshots`, extra `[snapshots]`): capture
+  point-in-time panels and forecasts tagged by `as_of` date, then analyze
+  week-over-week — how a target period's number moved across snapshots
+  (`snapshot_evolution`), and each committed forecast vs the eventual actual
+  (`forecast_vs_actual`), the governance audit trail finally persisted.
+- **Exogenous ARIMA**: `arima`/`auto_arima` are now driver-aware
+  (regression with ARIMA errors) — pass covariate columns and known-future
+  `X_df`, same contract as `ridge_lag`.
+- **Foundation-model adapter** (extra `[timegpt]`): `TimeGPTAdapter` wraps
+  Nixtla's TimeGPT for zero-shot baselines behind the registry, import-guarded
+  so the core stays dependency-light.
+- **REST serving layer** (`forecast-os-serve`, extra `[serve]`): a FastAPI
+  app exposing `/forecast`, `/compare`, `/quota`, `/models`, `/mappings`
+  over JSON, reusing the same tool functions as the MCP server.
+- **Terminal**: source add/edit and alert-management modals (persisted to the
+  workspace) and Enter-to-drill-down from the dashboard into a series
+  forecast — the console is now interactive, not read-only.
+
 ## 0.5.0 (2026-07-24)
 
 The terminal: an always-on console scaffold.

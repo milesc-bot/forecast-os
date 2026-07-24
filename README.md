@@ -198,9 +198,28 @@ attainment_probability(fc, quota={"total": 3_400_000}, level=80)
 Plus funnel primitives (`stage_panel`, `conversion_rates`, `propagate`),
 cohort retention forecasting (`retention_sbg`), driver-based forecasting
 (pass covariate columns — e.g. marketing spend — to exog-aware models like
-`ridge_lag`, with known future values via `predict(h, X_df=...)`), fiscal
-calendars (`FiscalCalendar(start_month=2, scheme="4-4-5")`), and signed
+`ridge_lag` and `arima`, with known future values via `predict(h, X_df=...)`),
+fiscal calendars (`FiscalCalendar(start_month=2, scheme="4-4-5")`), and signed
 `bias` / `pct_bias` governance metrics that catch sandbagged forecasts.
+
+### Snapshot history & forecast governance
+
+The one thing a live CRM query can't give you: a record of what you forecast,
+when. Snapshot panels and commits by `as_of` date, then analyze week over week
+(extra: `pip install "forecast-os[snapshots]"`).
+
+```python
+from forecast_os.snapshots import SnapshotStore, forecast_vs_actual, accuracy_over_time
+
+store = SnapshotStore("~/pipeline-history")
+store.snapshot(panel, as_of="2026-07-06", kind="panel")
+store.snapshot(forecast, as_of="2026-07-06", kind="forecast", label="Q4 commit")
+
+# once actuals land: was each committed forecast calibrated?
+accuracy_over_time(forecast_vs_actual(store.history(kind="forecast"), actuals))
+#      as_of   n     mae     bias  pct_bias
+# 2026-07-06  6  41_200  -18_400    -0.061   ← this commit ran 6% low
+```
 
 ## Plug in your pipeline
 
@@ -258,6 +277,13 @@ The server exposes `preview_panel`, `forecast`, `compare`, and
 map a raw export, sanity-check the panel, rank models, and report quota
 attainment probability without writing pandas.
 
+### REST API — the same engine over HTTP
+
+`pip install "forecast-os[serve]"` then `forecast-os-serve` exposes
+`/forecast`, `/compare`, `/quota`, `/models`, and `/mappings` as JSON
+endpoints (reusing the exact tool functions the MCP server does, so the two
+never drift). See [docs/serving.md](docs/serving.md).
+
 ## CLI
 
 ```bash
@@ -275,7 +301,7 @@ forecast-os simulate --s0 100 --mu 0.0004 --sigma 0.012 --h 252 --paths 5000
 | `ses`, `holt`, `holt_winters` | statistical | Exponential smoothing (level / trend / seasonality), SSE-optimized |
 | `auto_ets` | statistical | Picks the best ETS variant by AICc |
 | `theta` | statistical | The M3-winning Theta method with deseasonalization |
-| `arima`, `auto_arima` | statistical | ARIMA(p,d,q) via CSS; auto orders by AICc, ψ-weight intervals |
+| `arima`, `auto_arima` | statistical | ARIMA(p,d,q) via CSS; auto orders by AICc, ψ-weight intervals; exogenous drivers (regression with ARIMA errors) |
 | `kalman` | statistical | Local level / local linear trend state space, MLE, exact interval growth |
 | `ridge_lag` | ml | Ridge autoregression on lags + Fourier terms, recursive multi-step |
 | `croston`, `tsb` | statistical | Intermittent-demand models for lumpy series (sparse enterprise bookings) |
@@ -289,7 +315,9 @@ forecast-os simulate --s0 100 --mu 0.0004 --sigma 0.012 --h 252 --paths 5000
 Plus non-registry finance tools: `GARCH11`, `MonteCarloSimulator`,
 `MarkovRegimeSwitching`, `StrategyBacktester`, and metrics
 (`sharpe_ratio`, `sortino_ratio`, `max_drawdown`, `value_at_risk`,
-`conditional_var`, `calmar_ratio`, `hit_rate`, ...).
+`conditional_var`, `calmar_ratio`, `hit_rate`, ...). With the `[timegpt]`
+extra, `timegpt` registers a zero-shot Nixtla-TimeGPT baseline that plugs
+into every engine feature like any other model.
 
 ## Extending the OS
 
@@ -323,11 +351,15 @@ That's the whole integration: it now appears in `list_models()`, works in
 
 ## Roadmap
 
-- Snapshot store (point-in-time pipeline history for week-over-week analysis)
-- Terminal: source editing forms, drill-down, alert management screens
-- Foundation-model adapter (TimeGPT-style zero-shot baselines)
-- Exogenous regressors for ARIMA (RidgeLag ships them today)
-- REST serving layer
+The v0.1→v0.6 roadmap is complete: forecasting engine → probabilistic
+evaluation → GTM domain layer → data connectors + MCP → terminal console →
+snapshot history, driver-based ARIMA, foundation-model adapter, and REST
+serving. What's next:
+
+- Opportunity-level movement (created / advanced / slipped / won / lost)
+  pipeline waterfalls on top of the snapshot store
+- Seasonal ARIMA (SARIMA) and multiple seasonality (MSTL)
+- Terminal: settings editor and saved views
 
 ## Acknowledgments
 

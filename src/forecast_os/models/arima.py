@@ -123,6 +123,73 @@ def _psi_sigma(state: dict, h: int) -> np.ndarray:
     return state["_sigma"] * np.sqrt(np.cumsum(psi**2))
 
 
+def _fit_regression(y: np.ndarray, X: np.ndarray) -> dict:
+    """OLS of ``y`` on ``[1, standardized X]`` (regression part of ARIMAX).
+
+    Covariates are standardized exactly like :class:`RidgeLag` (per-column
+    mean/std, zero-variance columns left unscaled) so the stored ``beta`` lives
+    in standardized space; ``xb`` is the fitted regression component per row.
+    """
+    X = np.asarray(X, dtype=float)
+    x_mean = X.mean(axis=0)
+    x_std = X.std(axis=0)
+    x_std = np.where(x_std < 1e-12, 1.0, x_std)
+    xs = (X - x_mean) / x_std
+    design = np.column_stack([np.ones(len(y)), xs])
+    # lstsq (not solve) so a rank-deficient design — constant/duplicated
+    # covariates that standardize to zero columns — yields the minimum-norm
+    # solution instead of raising LinAlgError.
+    coef, *_ = np.linalg.lstsq(design, np.asarray(y, dtype=float), rcond=None)
+    return {
+        "reg_intercept": float(coef[0]),
+        "reg_beta": np.asarray(coef[1:], dtype=float),
+        "reg_x_mean": x_mean,
+        "reg_x_std": x_std,
+        "reg_xb": design @ coef,
+        "n_exog": int(X.shape[1]),
+    }
+
+
+def _attach_regression(state: dict, reg: dict) -> None:
+    """Fold a regression fit into an ARIMA-on-residuals ``state`` in place.
+
+    The combined in-sample fit is ``Xb + arima_fitted`` (NaN warm-up steps are
+    preserved), so the base class derives the residual sigma from the ARIMA
+    innovations of the error process, treating the regression as deterministic.
+    """
+    state["fitted"] = reg["reg_xb"] + state["fitted"]
+    for key in ("reg_intercept", "reg_beta", "reg_x_mean", "reg_x_std", "n_exog"):
+        state[key] = reg[key]
+
+
+def _forecast_with_exog(
+    state: dict, h: int, X_future: np.ndarray | None, name: str
+) -> np.ndarray:
+    """ARIMA-error forecast plus the deterministic regression component.
+
+    For a no-exog state this is just :func:`_forecast_css`; with covariates it
+    adds ``intercept + standardized(X_future) @ beta``. Mirrors ``RidgeLag``'s
+    missing/mis-shaped ``X_future`` messages for direct-call safety (the public
+    ``predict`` path validates ``X_df`` before reaching here).
+    """
+    fw = _forecast_css(state, h)
+    n_exog = state.get("n_exog", 0)
+    if not n_exog:
+        return fw
+    if X_future is None:
+        raise ForecastOSError(
+            f"{name} was fitted with {n_exog} exogenous covariate(s); "
+            f"X_future is required to predict"
+        )
+    X_future = np.asarray(X_future, dtype=float)
+    if X_future.shape != (h, n_exog):
+        raise ForecastOSError(
+            f"X_future must have shape ({h}, {n_exog}), got {X_future.shape}"
+        )
+    xs = (X_future - state["reg_x_mean"]) / state["reg_x_std"]
+    return state["reg_intercept"] + xs @ state["reg_beta"] + fw
+
+
 @register("arima", family="statistical")
 class ARIMA(PerSeriesForecaster):
     """ARIMA(p, d, q) forecaster estimated by conditional sum of squares.
@@ -133,7 +200,19 @@ class ARIMA(PerSeriesForecaster):
     the last observation with no drift term. :class:`AutoARIMA` can still
     capture drift-like behavior through AR structure on the differenced
     series.
+
+    Exogenous covariates (extra numeric panel columns) fit a regression with
+    ARIMA errors: OLS of ``y`` on ``[1, standardized X]`` supplies the
+    deterministic mean ``Xb``, and the ARIMA(p, d, q) machinery is fitted on
+    the residuals ``r = y - Xb`` (X is *not* fed through the AR recursion).
+    Forecasts are ``X_future @ beta + intercept`` plus the ARIMA-error
+    forecast; ``predict`` then requires an ``X_df`` of known future covariates.
+    Prediction intervals use the ARIMA-residual psi-weight sigma, i.e. the
+    regression is treated as known/deterministic given ``X_future``. With no
+    covariates the fit and forecast are byte-identical to the plain ARIMA.
     """
+
+    supports_exog = True
 
     def __init__(self, order: tuple[int, int, int] = (1, 1, 1), include_mean: bool = True):
         try:
@@ -147,11 +226,18 @@ class ARIMA(PerSeriesForecaster):
         p, d, q = order
         self.min_train_size = max(p, q) + d + 5
 
-    def _fit_series(self, y: np.ndarray) -> dict:
-        return _fit_css(y, self.order, self.include_mean)
+    def _fit_series(self, y: np.ndarray, X: np.ndarray | None = None) -> dict:
+        if X is None:
+            return _fit_css(y, self.order, self.include_mean)
+        reg = _fit_regression(y, X)
+        state = _fit_css(y - reg["reg_xb"], self.order, self.include_mean)
+        _attach_regression(state, reg)
+        return state
 
-    def _predict_series(self, state: dict, h: int) -> np.ndarray:
-        return _forecast_css(state, h)
+    def _predict_series(
+        self, state: dict, h: int, X_future: np.ndarray | None = None
+    ) -> np.ndarray:
+        return _forecast_with_exog(state, h, X_future, self.name)
 
     def _predict_sigma(self, state: dict, h: int) -> np.ndarray:
         return _psi_sigma(state, h)
@@ -159,7 +245,16 @@ class ARIMA(PerSeriesForecaster):
 
 @register("auto_arima", family="statistical")
 class AutoARIMA(PerSeriesForecaster):
-    """Automatic ARIMA: variance-heuristic d selection + AICc grid over (p, q)."""
+    """Automatic ARIMA: variance-heuristic d selection + AICc grid over (p, q).
+
+    With exogenous covariates the same regression-with-ARIMA-errors scheme as
+    :class:`ARIMA` applies: the per-series d heuristic and the ``(p, q)`` AICc
+    search both run on the regression residuals ``r = y - Xb``, and forecasts
+    add back the deterministic ``X_future @ beta + intercept``. Without
+    covariates the selection and forecasts are byte-identical to before.
+    """
+
+    supports_exog = True
 
     def __init__(self, max_p: int = 3, max_d: int = 2, max_q: int = 3):
         self.max_p = int(max_p)
@@ -181,12 +276,12 @@ class AutoARIMA(PerSeriesForecaster):
                 best_d, best_score = d, score
         return best_d
 
-    def _fit_series(self, y: np.ndarray) -> dict:
-        d = self._select_d(y)
+    def _search_order(self, s: np.ndarray, d: int) -> tuple[dict, tuple[int, int, int]]:
+        """AICc grid search over (p, q) at fixed d on series ``s``."""
         best_state, best_aicc, best_order = None, np.inf, None
         for p in range(self.max_p + 1):
             for q in range(self.max_q + 1):
-                state = _fit_css(y, (p, d, q), include_mean=True)
+                state = _fit_css(s, (p, d, q), include_mean=True)
                 if not state["converged"]:
                     continue
                 n, k = state["n_eff"], p + q + 1
@@ -197,12 +292,27 @@ class AutoARIMA(PerSeriesForecaster):
                 if aicc < best_aicc:
                     best_state, best_aicc, best_order = state, aicc, (p, d, q)
         if best_state is None:  # every candidate failed to converge
-            best_state, best_order = _fit_css(y, (0, d, 0), include_mean=True), (0, d, 0)
+            best_state, best_order = _fit_css(s, (0, d, 0), include_mean=True), (0, d, 0)
+        return best_state, best_order
+
+    def _fit_series(self, y: np.ndarray, X: np.ndarray | None = None) -> dict:
+        if X is None:
+            d = self._select_d(y)
+            best_state, best_order = self._search_order(y, d)
+            best_state["order_"] = best_order
+            return best_state
+        reg = _fit_regression(y, X)
+        r = y - reg["reg_xb"]
+        d = self._select_d(r)
+        best_state, best_order = self._search_order(r, d)
         best_state["order_"] = best_order
+        _attach_regression(best_state, reg)
         return best_state
 
-    def _predict_series(self, state: dict, h: int) -> np.ndarray:
-        return _forecast_css(state, h)
+    def _predict_series(
+        self, state: dict, h: int, X_future: np.ndarray | None = None
+    ) -> np.ndarray:
+        return _forecast_with_exog(state, h, X_future, self.name)
 
     def _predict_sigma(self, state: dict, h: int) -> np.ndarray:
         return _psi_sigma(state, h)

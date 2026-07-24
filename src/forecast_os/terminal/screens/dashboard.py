@@ -4,7 +4,8 @@ One row per watched series — last actual, fast 1-step outlook, percent
 delta, and a 12-period sparkline — rendered from
 :func:`~forecast_os.terminal.engine_bridge.dashboard_rows`, with the fired
 alert messages beneath the table. An empty workspace watchlist shows every
-series.
+series. Pressing Enter (or clicking) on a row drills into that series' fan
+chart via ``app.action_drill_down``.
 """
 
 from __future__ import annotations
@@ -29,6 +30,17 @@ class DashboardScreen(Screen):
 
     def on_screen_resume(self) -> None:
         self.update_view()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter (or click) on a watchlist row drills into that series' forecast."""
+        drill = getattr(self.app, "action_drill_down", None)
+        if drill is None:
+            return
+        try:
+            series = event.data_table.get_row(event.row_key)[0]
+        except Exception:
+            return  # the selected row has no addressable series (e.g. a hint row)
+        drill(str(series))
 
     def update_view(self) -> None:
         """Re-render the table and alert lines from the app's computed state."""

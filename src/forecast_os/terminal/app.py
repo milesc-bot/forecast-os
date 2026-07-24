@@ -32,6 +32,7 @@ try:
     from textual import work
     from textual.app import App
     from textual.reactive import reactive
+    from textual.widgets import ListView
 
     from .screens.dashboard import DashboardScreen
     from .screens.forecast import ForecastScreen
@@ -62,12 +63,12 @@ if _HAS_TEXTUAL:
             max-height: 6;
             padding: 0 1;
         }
-        #sources-title, #mappings-title {
+        #sources-title, #alerts-title, #mappings-title {
             height: 1;
             padding: 0 1;
             background: $boost;
         }
-        #sources-table {
+        #sources-table, #alerts-table {
             height: auto;
             max-height: 8;
         }
@@ -93,6 +94,7 @@ if _HAS_TEXTUAL:
             ("g", "show_screen('governance')", "Governance"),
             ("s", "show_screen('sources')", "Sources"),
             ("r", "refresh", "Refresh"),
+            ("ctrl+s", "save_workspace", "Save"),
             ("q", "quit", "Quit"),
         ]
 
@@ -120,6 +122,8 @@ if _HAS_TEXTUAL:
             self.last_refresh: str | None = None
             self._board_working = False
             self._governance_working = False
+            self._drill_target: str | None = None
+            self._save_note: str | None = None
 
         # -- lifecycle ---------------------------------------------------
 
@@ -142,6 +146,60 @@ if _HAS_TEXTUAL:
             self.governance = None
             self.refreshing = True
             self._refresh_worker()
+
+        def action_save_workspace(self) -> None:
+            """Persist the workspace (bound to ctrl+s); a no-op on the demo panel."""
+            self.save_workspace()
+            self._update_status()
+
+        def save_workspace(self) -> None:
+            """Write the workspace unless running on the demo panel.
+
+            Writes only when a home directory is set and the app is not in
+            ``--demo`` mode; in demo mode nothing is written and a status note
+            records that the save was skipped. Screens call this after every
+            source/alert mutation.
+            """
+            if self.demo or self.workspace.home is None:
+                self._save_note = "demo — not saved"
+                return
+            self.workspace.save()
+            self._save_note = f"saved {datetime.now().strftime('%H:%M:%S')}"
+
+        def action_drill_down(self, series: str) -> None:
+            """Open the forecast screen focused on ``series``.
+
+            Switches to the forecast screen and selects the matching series in
+            its existing series list; the selection is applied on a later
+            refresh cycle so it lands after the list has been (re)built.
+            """
+            self._drill_target = str(series)
+            self.switch_screen("forecast")
+            self.call_after_refresh(self._apply_drill_target)
+
+        def _apply_drill_target(self, _attempts: int = 0) -> None:
+            target = self._drill_target
+            if target is None:
+                return
+            listview = None
+            if type(self.screen) is ForecastScreen:
+                try:
+                    listview = self.screen.query_one("#series-list", ListView)
+                except Exception:
+                    listview = None
+            if listview is not None and len(listview.children):
+                for i, item in enumerate(listview.children):
+                    if getattr(item, "name", None) == target:
+                        listview.index = i
+                        break
+                self._drill_target = None
+                return
+            # The screen may not be mounted / the list not built yet; retry a
+            # bounded number of times before giving up so we never hot-loop.
+            if _attempts < 12:
+                self.call_after_refresh(self._apply_drill_target, _attempts + 1)
+            else:
+                self._drill_target = None
 
         # -- workers -----------------------------------------------------
 
@@ -250,6 +308,8 @@ if _HAS_TEXTUAL:
                 parts.append("refreshing…")
             if self.alerts_count:
                 parts.append(f"⚠ {self.alerts_count} alert(s)")
+            if self._save_note:
+                parts.append(self._save_note)
             self.sub_title = " · ".join(parts)
 
         def _update_active_screen(self) -> None:

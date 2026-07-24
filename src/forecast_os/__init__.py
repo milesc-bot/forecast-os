@@ -7,7 +7,7 @@ Importing this package registers every built-in model; see
 :func:`list_models` for the catalog.
 """
 
-from . import connectors, finance, gtm, preprocessing
+from . import connectors, finance, gtm, preprocessing, snapshots
 from .core import (
     BaseForecaster,
     DataContractError,
@@ -29,7 +29,7 @@ from .models import *  # noqa: F401,F403  (registers built-in models, re-exports
 from .models import __all__ as _models_all
 from .uncertainty import ConformalForecaster
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "__version__",
@@ -61,5 +61,6 @@ __all__ = [
     "finance",
     "gtm",
     "preprocessing",
+    "snapshots",
     *_models_all,
 ]
