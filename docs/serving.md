@@ -6,7 +6,7 @@ came over HTTP or through an MCP client.
 
 ## REST API
 
-`pip install "forecast-os[serve]"` then:
+`pip install "forecast-os-gtm[serve]"` then:
 
 ```bash
 forecast-os-serve --host 0.0.0.0 --port 8000
@@ -35,13 +35,13 @@ REST and MCP surfaces never drift.
 
 ## MCP server
 
-`pip install "forecast-os[mcp]"`, register `forecast-os-mcp` with your MCP
+`pip install "forecast-os-gtm[mcp]"`, register `forecast-os-mcp` with your MCP
 client, and an agent gets `preview_panel`, `forecast`, `compare`, and
 `quota_attainment` tools directly. See [connectors.md](connectors.md).
 
 ## Foundation models
 
-`pip install "forecast-os[timegpt]"` registers `timegpt`, a zero-shot
+`pip install "forecast-os-gtm[timegpt]"` registers `timegpt`, a zero-shot
 Nixtla-TimeGPT baseline that plugs into every engine feature (compare,
 ensembles, the terminal) like any other model — set `NIXTLA_API_KEY` and use
 `get_model("timegpt")`. It stays an optional adapter, so the core remains

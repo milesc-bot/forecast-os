@@ -29,8 +29,6 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
       - name: Publish to PyPI (trusted publishing)
-        # Best-effort until a PyPI Trusted Publisher is configured for this repo
-        # + workflow (https://docs.pypi.org/trusted-publishers/). Once set up,
-        # remove continue-on-error to make a failed publish fail the release.
-        continue-on-error: true
+        # Publishes forecast-os-gtm via a configured PyPI Trusted Publisher
+        # (repo milesc-bot/forecast-os, workflow release.yml, environment pypi).
         uses: pypa/gh-action-pypi-publish@release/v1

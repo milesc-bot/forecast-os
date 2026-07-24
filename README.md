@@ -1,5 +1,6 @@
 # forecast-os
 
+[![PyPI](https://img.shields.io/pypi/v/forecast-os-gtm.svg)](https://pypi.org/project/forecast-os-gtm/)
 [![CI](https://github.com/milesc-bot/forecast-os/actions/workflows/ci.yml/badge.svg)](https://github.com/milesc-bot/forecast-os/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
@@ -102,15 +103,19 @@ regenerate them all with `python scripts/generate_figures.py`.
 ## Install
 
 ```bash
-pip install forecast-os
+pip install forecast-os-gtm
 # optional layers (extras): connectors, mcp, terminal, snapshots, serve, timegpt
-pip install "forecast-os[connectors,terminal]"
+pip install "forecast-os-gtm[connectors,terminal]"
 ```
+
+> Install as `forecast-os-gtm`; import as `forecast_os` (`import forecast_os as fos`).
+> The console commands are `forecast-os`, `forecast-os-mcp`, `forecast-os-tui`,
+> and `forecast-os-serve`.
 
 For RevOps analysts who don't want to touch Python, an interactive console:
 
 ```bash
-pipx install "forecast-os[terminal]"
+pipx install "forecast-os-gtm[terminal]"
 forecast-os-tui --demo
 ```
 
@@ -241,7 +246,7 @@ detection (`detect_anomalies`), and multi-currency normalization
 
 The one thing a live CRM query can't give you: a record of what you forecast,
 when. Snapshot panels and commits by `as_of` date, then analyze week over week
-(extra: `pip install "forecast-os[snapshots]"`).
+(extra: `pip install "forecast-os-gtm[snapshots]"`).
 
 ```python
 from forecast_os.snapshots import SnapshotStore, forecast_vs_actual, accuracy_over_time
@@ -270,7 +275,7 @@ forecast-os forecast deals.csv --mapping hubspot_deals --h 6 --model auto_select
 ```python
 from forecast_os.connectors import HubSpotSource, SQLSource, apply_mapping
 
-# REST APIs (pip install "forecast-os[connectors]"): paginated, token-auth
+# REST APIs (pip install "forecast-os-gtm[connectors]"): paginated, token-auth
 panel = HubSpotSource(token=HUBSPOT_TOKEN).to_panel(id_cols=("owner",))
 
 # Any warehouse pandas can read — bring your own driver (DuckDB, Snowflake,
@@ -285,7 +290,7 @@ panel = apply_mapping(df, "posthog_events", freq="W")
 
 ### The terminal — an always-on console
 
-`pip install "forecast-os[terminal]"` then:
+`pip install "forecast-os-gtm[terminal]"` then:
 
 ```bash
 forecast-os-tui --demo                          # instant seeded GTM console
@@ -317,7 +322,7 @@ connectors (exits non-zero if anything fails).
 
 ### MCP server — let your agent drive the engine
 
-`pip install "forecast-os[mcp]"` and register `forecast-os-mcp` with any MCP
+`pip install "forecast-os-gtm[mcp]"` and register `forecast-os-mcp` with any MCP
 client (Claude Desktop / Claude Code / your agent framework):
 
 ```json
@@ -331,7 +336,7 @@ attainment probability without writing pandas.
 
 ### REST API — the same engine over HTTP
 
-`pip install "forecast-os[serve]"` then `forecast-os-serve` exposes
+`pip install "forecast-os-gtm[serve]"` then `forecast-os-serve` exposes
 `/forecast`, `/compare`, `/quota`, `/models`, and `/mappings` as JSON
 endpoints (reusing the exact tool functions the MCP server does, so the two
 never drift). See [docs/serving.md](docs/serving.md).

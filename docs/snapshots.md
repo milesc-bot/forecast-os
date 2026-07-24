@@ -4,7 +4,7 @@ Forecasting is judged over time: *was last quarter's commit calibrated? how
 did our Q4 number move week over week? which team's forecast should we
 trust?* Answering those needs the one thing a live CRM query cannot give you
 — **history of what you believed, when you believed it.** The snapshot store
-is that persistence layer (extra: `pip install "forecast-os[snapshots]"`).
+is that persistence layer (extra: `pip install "forecast-os-gtm[snapshots]"`).
 
 ```python
 from forecast_os.snapshots import SnapshotStore

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1 (2026-07-24)
+
+Packaging: first PyPI release. The distribution is published as
+**`forecast-os-gtm`** (`pip install forecast-os-gtm`); the import name is
+unchanged (`import forecast_os`), as are the `forecast-os` / `-mcp` / `-tui` /
+`-serve` console commands. No code changes.
+
 ## 0.7.0 (2026-07-24)
 
 Deal-grain analytics and go-public hardening — closing the highest-impact gaps

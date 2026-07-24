@@ -1,7 +1,7 @@
 # The terminal
 
 `forecast-os-tui` is an always-on, keyboard-driven console over the engine
-(extra: `pip install "forecast-os[terminal]"`).
+(extra: `pip install "forecast-os-gtm[terminal]"`).
 
 ```bash
 forecast-os-tui --demo                                    # seeded GTM console
