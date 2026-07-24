@@ -229,6 +229,21 @@ panel = SQLSource("SELECT owner, close_date, amount FROM won_deals",
 panel = apply_mapping(df, "posthog_events", freq="W")
 ```
 
+### The terminal — an always-on console
+
+`pip install "forecast-os[terminal]"` then:
+
+```bash
+forecast-os-tui --demo                          # instant seeded GTM console
+forecast-os-tui --data deals.csv --mapping hubspot_deals
+```
+
+A keyboard-driven console (`d` dashboard · `f` forecast fan chart · `l`
+leaderboard · `g` governance · `s` sources · `r` refresh): a watchlist with
+next-period forecasts and sparklines, calibration and signed-bias screens
+that highlight sandbagged forecasts, alert rules, and a persistent
+workspace in `~/.forecast-os/`.
+
 ### MCP server — let your agent drive the engine
 
 `pip install "forecast-os[mcp]"` and register `forecast-os-mcp` with any MCP
@@ -308,8 +323,8 @@ That's the whole integration: it now appears in `list_models()`, works in
 
 ## Roadmap
 
-- Terminal console (OpenBB-style always-on TUI over the engine)
-- Data connectors (warehouse / CRM export readers) and a snapshot store
+- Snapshot store (point-in-time pipeline history for week-over-week analysis)
+- Terminal: source editing forms, drill-down, alert management screens
 - Foundation-model adapter (TimeGPT-style zero-shot baselines)
 - Exogenous regressors for ARIMA (RidgeLag ships them today)
 - REST serving layer

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forecast-os"
-version = "0.4.0"
+version = "0.5.0"
 description = "An open-source forecasting engine: statistical, ML, and financial models behind one unified API."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -42,9 +42,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.4", "build", "matplotlib>=3.8", "requests>=2.31", "mcp>=1.0"]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+    "build",
+    "matplotlib>=3.8",
+    "requests>=2.31",
+    "mcp>=1.0",
+    "textual>=0.80",
+    "textual-plotext>=1.0",
+    "pytest-asyncio>=1.0",
+]
 connectors = ["requests>=2.31"]
 mcp = ["mcp>=1.0"]
+terminal = ["textual>=0.80", "textual-plotext>=1.0"]
 nixtla = ["statsforecast>=1.7"]
 neural = ["neuralforecast>=1.7"]
 
@@ -55,6 +66,7 @@ Issues = "https://github.com/milesc-bot/forecast-os/issues"
 [project.scripts]
 forecast-os = "forecast_os.cli:main"
 forecast-os-mcp = "forecast_os.mcp.server:main"
+forecast-os-tui = "forecast_os.terminal.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

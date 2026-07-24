@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0 (2026-07-24)
+
+The terminal: an always-on console scaffold.
+
+- **TUI** (`forecast-os-tui`, extra `[terminal]`): a keyboard-driven textual
+  console over the engine — dashboard watchlist with 1-step forecasts and
+  sparklines, forecast fan-chart screen, model leaderboard, governance
+  screen (signed bias + coverage, sandbagging highlighted), sources view;
+  persistent workspace at `~/.forecast-os/workspace.json`; auto-refresh via
+  a background worker; alert rules (`forecast_below`, `coverage_below`);
+  `--demo` mode that boots on seeded GTM data instantly.
+
 ## 0.4.0 (2026-07-24)
 
 The data plane: plug your pipeline in.
