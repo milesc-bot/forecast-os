@@ -41,11 +41,30 @@ class _CliMean(PerSeriesForecaster):
         return np.full(h, state["mean"])
 
 
+class _CliSeasonal(PerSeriesForecaster):
+    """Season-repeating dummy proving typed --param values reach the model."""
+
+    alias = "_test_cli_seasonal"
+
+    def __init__(self, season_length: int = 1):
+        self.season_length = season_length
+        self.min_train_size = season_length
+
+    def _fit_series(self, y):
+        # slicing with a str season_length would raise, so success proves the
+        # CLI coerced the --param value to int
+        return {"tail": np.asarray(y[-self.season_length :], dtype=float)}
+
+    def _predict_series(self, state, h):
+        return np.resize(state["tail"], h)
+
+
 @pytest.fixture(autouse=True)
 def _register_dummies():
     # re-registering the same class is a no-op, so autouse is safe
     register("_test_cli_naive", family="baseline")(_CliNaive)
     register("_test_cli_mean", family="baseline")(_CliMean)
+    register("_test_cli_seasonal", family="baseline")(_CliSeasonal)
 
 
 @pytest.fixture
@@ -59,6 +78,27 @@ def panel_csv(tmp_path):
     ]
     path = tmp_path / "panel.csv"
     pd.concat(frames, ignore_index=True).to_csv(path, index=False)
+    return path
+
+
+@pytest.fixture
+def gtm_csv(tmp_path):
+    """Messy GTM export: custom columns, duplicate dates, and a missing month.
+
+    Two reps, monthly close dates 2024-01 .. 2025-02 with 2024-05 absent and
+    two deals (100 + 25) in the final month.
+    """
+    months = pd.date_range("2024-01-01", periods=14, freq="MS")
+    rows = []
+    for rep in ("alice", "bob"):
+        for m in months:
+            if m == pd.Timestamp("2024-05-01"):
+                continue  # rep closed nothing that month
+            rows.append({"Rep": rep, "Close Date": m.strftime("%Y-%m-%d"), "Amount": 100.0})
+            if m == months[-1]:
+                rows.append({"Rep": rep, "Close Date": m.strftime("%Y-%m-%d"), "Amount": 25.0})
+    path = tmp_path / "gtm.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
     return path
 
 
@@ -178,6 +218,182 @@ def test_forecast_contract_violation_returns_2(tmp_path, capsys):
     rc = main(["forecast", str(bad), "--h", "3", "--model", "_test_cli_naive"])
     assert rc == 2
     assert "error:" in capsys.readouterr().err
+
+
+# -- panel mapping options (--id-col/--time-col/--target-col/--agg/--freq) ------
+
+
+def test_forecast_gtm_csv_with_mapping_agg_and_freq(tmp_path, gtm_csv):
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(gtm_csv), "--h", "3", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "MS", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    out = pd.read_csv(out_path)
+    assert len(out) == 2 * 3
+    assert set(out["unique_id"]) == {"alice", "bob"}
+    # the final month had two deals (100 + 25); naive-last forecasts their sum
+    assert (out["_test_cli_naive"] == 125.0).all()
+    # monthly grid continues after the last training month
+    assert out["ds"].min() == "2025-03-01"
+
+
+def test_forecast_freq_fills_missing_month_with_zero(tmp_path, gtm_csv):
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(gtm_csv), "--h", "2", "--model", "_test_cli_mean",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "MS", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    out = pd.read_csv(out_path)
+    # 14-month grid: 12 x 100, one 125, and the missing month filled with 0
+    expected = (12 * 100.0 + 125.0 + 0.0) / 14
+    assert out["_test_cli_mean"].to_numpy() == pytest.approx(expected)
+
+
+def test_forecast_agg_count_ignores_target_values(tmp_path, gtm_csv):
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(gtm_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--agg", "count",
+            "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    out = pd.read_csv(out_path)
+    # y becomes the deal count per month; the last month has two rows
+    assert (out["_test_cli_naive"] == 2.0).all()
+
+
+def test_compare_gtm_csv_with_mapping(tmp_path, gtm_csv):
+    out_path = tmp_path / "board.csv"
+    rc = main(
+        [
+            "compare", str(gtm_csv), "--h", "3", "--n-windows", "2",
+            "--models", "_test_cli_naive,_test_cli_mean",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "MS", "-o", str(out_path),
+        ]
+    )
+    assert rc == 0
+    board = pd.read_csv(out_path)
+    assert sorted(board["model"]) == ["_test_cli_mean", "_test_cli_naive"]
+    assert {"mae", "rmse", "smape"} <= set(board.columns)
+
+
+def test_forecast_duplicate_rows_without_agg_returns_2(gtm_csv, capsys):
+    rc = main(
+        [
+            "forecast", str(gtm_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "duplicate" in err
+
+
+def test_forecast_freq_with_duplicates_suggests_agg(gtm_csv, capsys):
+    rc = main(
+        [
+            "forecast", str(gtm_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--freq", "MS",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "--agg" in err
+
+
+def test_forecast_unknown_mapping_column_returns_2(panel_csv, capsys):
+    rc = main(
+        [
+            "forecast", str(panel_csv), "--h", "3", "--model", "_test_cli_naive",
+            "--id-col", "Nope",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "Nope" in err
+
+
+# -- forecast --param ------------------------------------------------------------
+
+
+def test_forecast_param_season_length_reaches_model(tmp_path):
+    pattern = [float(10 * (i + 1)) for i in range(12)]
+    path = tmp_path / "seasonal.csv"
+    pd.DataFrame(
+        {
+            "unique_id": "s0",
+            "ds": pd.date_range("2022-01-01", periods=36, freq="MS"),
+            "y": pattern * 3,
+        }
+    ).to_csv(path, index=False)
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(path), "--h", "4", "--model", "_test_cli_seasonal",
+            "--param", "season_length=12", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    out = pd.read_csv(out_path)
+    # season repeats: next 4 months replay the start of the pattern; the
+    # default season_length=1 would predict a constant 120 instead
+    assert list(out["_test_cli_seasonal"]) == pattern[:4]
+
+
+def test_forecast_param_repeatable_with_int_and_float(tmp_path, panel_csv):
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(panel_csv), "--h", "3", "--model", "ridge_lag",
+            "--param", "lags=6", "--param", "alpha=0.5", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    out = pd.read_csv(out_path)
+    assert len(out) == 2 * 3
+    assert np.isfinite(out["RidgeLag"]).all()
+
+
+def test_forecast_param_without_equals_returns_2(panel_csv, capsys):
+    rc = main(
+        [
+            "forecast", str(panel_csv), "--h", "3", "--model", "_test_cli_naive",
+            "--param", "nonsense",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "KEY=VALUE" in err
+
+
+def test_forecast_unknown_param_key_returns_2(panel_csv, capsys):
+    rc = main(
+        [
+            "forecast", str(panel_csv), "--h", "3", "--model", "_test_cli_naive",
+            "--param", "bogus_key=1",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "Traceback" not in err
 
 
 # -- compare -------------------------------------------------------------------

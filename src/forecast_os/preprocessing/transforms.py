@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.special import expit
 
 from ..core.exceptions import ForecastOSError, NotFittedError
 from ..core.types import ID_COL, TARGET_COL, TIME_COL, validate_panel
@@ -302,3 +303,131 @@ class Differencer(BaseTransform):
                 vals = out[c].to_numpy(dtype=float)[idx]
                 out.iloc[idx, out.columns.get_loc(c)] = _integrate(uid, vals, continuation)
         return out
+
+
+class LogitTransform(BaseTransform):
+    """Logit transform for series bounded in fixed ``[lower, upper]``.
+
+    Bounds come from the constructor — they are domain knowledge (win rates
+    in [0, 1], utilization in [0, 100]), never fitted from data. Each of
+    ``lower``/``upper`` is a number applied to every series or a
+    ``{unique_id: bound}`` dict for per-series bounds. ``fit`` validates that
+    every observation lies within its series' bounds and raises
+    :class:`ForecastOSError` otherwise.
+
+    The forward transform clips values into
+    ``[lo + eps*(hi-lo), hi - eps*(hi-lo)]`` (so boundary values stay
+    finite) and maps ``y -> log((y-lo)/(hi-y))``. The inverse is the scaled
+    sigmoid ``lo + (hi-lo)*expit(x)`` with the sigmoid output clamped into
+    the open unit interval (``expit`` saturates to exactly 1.0 for inputs
+    above ~36.7), applied to every numeric value column of forecast frames —
+    point and interval columns alike land strictly inside ``(lo, hi)``.
+    """
+
+    def __init__(
+        self,
+        lower: float | dict[Any, float] = 0.0,
+        upper: float | dict[Any, float] = 1.0,
+        eps: float = 1e-6,
+    ):
+        if not isinstance(lower, dict) and not isinstance(upper, dict) and not lower < upper:
+            raise ValueError(f"need lower < upper, got lower={lower!r}, upper={upper!r}")
+        if not 0 < eps < 0.5:
+            raise ValueError(f"eps must be in (0, 0.5), got {eps!r}")
+        self.lower = lower
+        self.upper = upper
+        self.eps = eps
+
+    def _bounds(self, uid: Any) -> tuple[float, float]:
+        def pick(bound: float | dict[Any, float], side: str) -> float:
+            if isinstance(bound, dict):
+                try:
+                    return float(bound[uid])
+                except KeyError:
+                    raise ForecastOSError(
+                        f"LogitTransform has no {side} bound for series {uid!r}"
+                    ) from None
+            return float(bound)
+
+        lo, hi = pick(self.lower, "lower"), pick(self.upper, "upper")
+        if not lo < hi:
+            raise ForecastOSError(
+                f"series {uid!r} bounds must satisfy lower < upper; got ({lo}, {hi})"
+            )
+        return lo, hi
+
+    def fit(self, df: pd.DataFrame) -> LogitTransform:
+        df = validate_panel(df)
+        for uid, g in df.groupby(ID_COL, sort=True):
+            lo, hi = self._bounds(uid)
+            ymin, ymax = float(g[TARGET_COL].min()), float(g[TARGET_COL].max())
+            if ymin < lo or ymax > hi:
+                raise ForecastOSError(
+                    f"series {uid!r} has values outside the logit bounds "
+                    f"[{lo}, {hi}]: observed range [{ymin}, {ymax}]"
+                )
+        self._is_fitted = True
+        return self
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        self._check_is_fitted()
+        out = validate_panel(df)
+
+        def _logit(uid: Any, vals: np.ndarray) -> np.ndarray:
+            lo, hi = self._bounds(uid)
+            span = hi - lo
+            v = np.clip(vals, lo + self.eps * span, hi - self.eps * span)
+            return np.log((v - lo) / (hi - v))
+
+        return self._apply_per_series(out, _logit)
+
+    def inverse_transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        def _sigmoid(uid: Any, vals: np.ndarray) -> np.ndarray:
+            lo, hi = self._bounds(uid)
+            # expit saturates to exactly 1.0 for x > ~36.7 (and 0.0 for very
+            # negative x), which would land the inverse ON a bound; clamp
+            # into the open unit interval so results stay strictly inside.
+            finfo = np.finfo(float)
+            p = np.clip(expit(vals), finfo.tiny, 1.0 - finfo.epsneg)
+            return lo + (hi - lo) * p
+
+        return self._apply_per_series(df, _sigmoid, inverse=True)
+
+
+def fill_gaps(df: pd.DataFrame, freq: str, fill_value: float = 0.0) -> pd.DataFrame:
+    """Reindex every series onto its full regular ``freq`` grid.
+
+    Each series is reindexed to ``date_range(min(ds), max(ds), freq=freq)``
+    — per-series ranges, no cross-series padding. Inserted rows get
+    ``fill_value`` in ``y`` (``np.nan`` is allowed, e.g. to impute
+    afterwards) and NaN in every extra column. Irregular exports with
+    missing periods silently misalign positional models (lag features,
+    seasonal indexing); filling the gaps restores ds alignment.
+
+    Raises :class:`ForecastOSError` when ``ds`` is not datetime or when an
+    existing timestamp does not lie on the ``freq`` grid. Returns a valid
+    sorted panel.
+    """
+    out = validate_panel(df, allow_missing=True)
+    if not pd.api.types.is_datetime64_any_dtype(out[TIME_COL]):
+        raise ForecastOSError(
+            f"fill_gaps requires a datetime {TIME_COL!r} column; "
+            f"got dtype {out[TIME_COL].dtype}"
+        )
+    columns = list(out.columns)
+    frames = []
+    for uid, g in out.groupby(ID_COL, sort=True):
+        g = g.set_index(TIME_COL)
+        grid = pd.date_range(g.index.min(), g.index.max(), freq=freq)
+        off_grid = g.index.difference(grid)
+        if len(off_grid) > 0:
+            raise ForecastOSError(
+                f"series {uid!r} has ds values off the {freq!r} grid, "
+                f"e.g. {off_grid[0]}; fill_gaps cannot align them"
+            )
+        r = g.reindex(grid)
+        r.loc[np.asarray(~grid.isin(g.index)), TARGET_COL] = fill_value
+        r[ID_COL] = uid
+        r.index.name = TIME_COL
+        frames.append(r.reset_index()[columns])
+    return validate_panel(pd.concat(frames, ignore_index=True), allow_missing=True)

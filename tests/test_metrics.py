@@ -5,15 +5,18 @@ import pandas as pd
 import pytest
 
 from forecast_os.evaluation.metrics import (
+    bias,
     coverage,
     evaluate,
     mae,
     mape,
     mase,
+    pct_bias,
     pinball_loss,
     rmse,
     rmsse,
     smape,
+    tracking_signal,
     winkler_score,
 )
 
@@ -59,6 +62,64 @@ def test_smape_bounded():
     y = rng.standard_normal(50)
     yhat = rng.standard_normal(50)
     assert 0.0 <= smape(y, yhat) <= 2.0
+
+
+# -- governance (bias) metrics ------------------------------------------------
+
+
+def test_bias_hand_computed():
+    assert bias([1, 2], [2, 4]) == pytest.approx(1.5)
+    assert bias([2, 4], [1, 2]) == pytest.approx(-1.5)
+    assert bias([1, 2], [1, 2]) == 0.0
+
+
+def test_bias_cancels_symmetric_errors():
+    # signed: offsetting misses net to zero while mae would report 2
+    assert bias([10, 10], [8, 12]) == 0.0
+
+
+def test_pct_bias_hand_computed():
+    assert pct_bias([100, 100], [95, 89]) == pytest.approx(-0.08)
+    # negatives count through |y| in the denominator: 10 / (100 + 100)
+    assert pct_bias([-100, 100], [-100, 110]) == pytest.approx(0.05)
+
+
+def test_pct_bias_zero_denominator_is_nan():
+    assert np.isnan(pct_bias([0, 0], [1, -1]))
+
+
+def test_tracking_signal_hand_computed():
+    assert tracking_signal([1, 2, 3], [2, 3, 4]) == pytest.approx(3.0)
+    assert tracking_signal([2, 3, 4], [1, 2, 3]) == pytest.approx(-3.0)
+    # offsetting errors: signed sum 0 over MAD 1
+    assert tracking_signal([0, 0], [1, -1]) == pytest.approx(0.0)
+
+
+def test_tracking_signal_perfect_forecast_is_nan():
+    assert np.isnan(tracking_signal([1, 2], [1, 2]))
+
+
+def test_bias_metrics_expose_sandbagged_forecast():
+    """A forecast running 8% low is clearly negative on the bias metrics
+    while mape reports the same 0.08 it would for an 8%-high forecast."""
+    y = np.array([100.0, 200.0, 300.0, 400.0])
+    yhat = 0.92 * y
+    assert bias(y, yhat) == pytest.approx(-20.0)
+    assert pct_bias(y, yhat) == pytest.approx(-0.08)
+    assert tracking_signal(y, yhat) == pytest.approx(-4.0)  # every error negative
+    assert mape(y, yhat) == pytest.approx(0.08)  # direction hidden
+
+
+@pytest.mark.parametrize("fn", [bias, pct_bias, tracking_signal])
+def test_bias_metric_shape_mismatch_raises(fn):
+    with pytest.raises(ValueError, match="shape mismatch"):
+        fn([1, 2, 3], [1, 2])
+
+
+@pytest.mark.parametrize("fn", [bias, pct_bias, tracking_signal])
+def test_bias_metric_empty_input_raises(fn):
+    with pytest.raises(ValueError, match="empty"):
+        fn([], [])
 
 
 # -- scaled metrics -----------------------------------------------------------
@@ -239,6 +300,89 @@ def test_evaluate_no_model_columns_raises():
     meta_only = _cv_frame()[["unique_id", "ds", "cutoff", "y"]]
     with pytest.raises(ValueError, match="no model forecast columns"):
         evaluate(meta_only)
+
+
+def test_evaluate_supports_bias_metrics():
+    res = evaluate(_cv_frame(), metrics=("bias", "pct_bias", "tracking_signal"))
+    row = res[(res["unique_id"] == "a") & (res["metric"] == "bias")]
+    assert row["m1"].iloc[0] == pytest.approx(0.5)  # m1 = y + 0.5 everywhere
+    row = res[(res["unique_id"] == "a") & (res["metric"] == "pct_bias")]
+    assert row["m1"].iloc[0] == pytest.approx(1.0 / 3.0)  # (0.5 + 0.5) / (1 + 2)
+    ts = res[(res["unique_id"] == "b") & (res["metric"] == "tracking_signal")]
+    assert ts["m1"].iloc[0] == pytest.approx(2.0)  # both errors +0.5
+    assert np.isnan(ts["m2"].iloc[0])  # m2 is perfect: MAD ~ 0 -> nan
+
+
+# -- evaluate(by="cutoff") ------------------------------------------------------
+
+
+def _two_cutoff_frame():
+    """Two series x two cutoffs with hand-computable per-cutoff errors."""
+    c1, c2 = pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-04")
+    ds = list(pd.date_range("2024-01-03", periods=4, freq="D"))
+    return pd.DataFrame(
+        {
+            "unique_id": ["a"] * 4 + ["b"] * 4,
+            "ds": ds * 2,
+            "cutoff": [c1, c1, c2, c2] * 2,
+            "y": [1.0, 2.0, 3.0, 4.0, 10.0, 10.0, 10.0, 10.0],
+            "m1": [2.0, 3.0, 3.0, 7.0, 10.0, 12.0, 10.0, 10.0],
+        }
+    )
+
+
+def test_evaluate_by_cutoff_row_counts_and_values():
+    c1, c2 = pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-04")
+    res = evaluate(_two_cutoff_frame(), metrics=("mae", "bias"), by="cutoff")
+    # n_series x n_cutoffs x n_metrics rows, with a cutoff column
+    assert len(res) == 2 * 2 * 2
+    assert "cutoff" in res.columns
+    assert set(res["cutoff"]) == {c1, c2}
+    mae_rows = res[res["metric"] == "mae"].set_index(["unique_id", "cutoff"])["m1"]
+    assert mae_rows[("a", c1)] == pytest.approx(1.0)  # errors +1, +1
+    assert mae_rows[("a", c2)] == pytest.approx(1.5)  # errors 0, +3
+    assert mae_rows[("b", c1)] == pytest.approx(1.0)  # errors 0, +2
+    assert mae_rows[("b", c2)] == pytest.approx(0.0)
+    bias_rows = res[res["metric"] == "bias"].set_index(["unique_id", "cutoff"])["m1"]
+    assert bias_rows[("a", c2)] == pytest.approx(1.5)
+
+
+def test_evaluate_default_pools_cutoffs():
+    res = evaluate(_two_cutoff_frame(), metrics=("mae",))
+    assert len(res) == 2  # one row per series, no cutoff column
+    assert "cutoff" not in res.columns
+    row = res[res["unique_id"] == "a"]
+    assert row["m1"].iloc[0] == pytest.approx(1.25)  # (1 + 1 + 0 + 3) / 4
+
+
+def test_evaluate_interval_metrics_by_cutoff():
+    c1, c2 = pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-04")
+    df = pd.DataFrame(
+        {
+            "unique_id": "a",
+            "ds": pd.date_range("2024-01-03", periods=4, freq="D"),
+            "cutoff": [c1, c1, c2, c2],
+            "y": [1.0, 2.0, 3.0, 4.0],
+            "m1": [1.0, 2.0, 3.0, 4.0],
+            "m1-lo-80": [0.0, 0.0, 4.0, 5.0],
+            "m1-hi-80": [2.0, 3.0, 5.0, 6.0],
+        }
+    )
+    res = evaluate(df, metrics=("coverage",), by="cutoff").set_index("cutoff")
+    assert list(res["metric"]) == ["coverage-80"] * 2
+    assert res.loc[c1, "m1"] == pytest.approx(1.0)  # both actuals inside
+    assert res.loc[c2, "m1"] == pytest.approx(0.0)  # both actuals outside
+
+
+def test_evaluate_unknown_by_raises():
+    with pytest.raises(ValueError, match="unknown by"):
+        evaluate(_cv_frame(), metrics=("mae",), by="model")
+
+
+def test_evaluate_by_cutoff_requires_cutoff_column():
+    no_cutoff = _cv_frame().drop(columns=["cutoff"])
+    with pytest.raises(ValueError, match="cutoff"):
+        evaluate(no_cutoff, metrics=("mae",), by="cutoff")
 
 
 # -- evaluate() interval metrics ------------------------------------------------

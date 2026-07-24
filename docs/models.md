@@ -62,6 +62,14 @@ recursively for multi-step forecasts. The "MLForecast pattern" without the depen
 a strong, fast tabular-ML baseline, and the natural bridge to gradient-boosted
 extensions.
 
+## Intermittent demand
+
+- `croston` — the classic method for lumpy series: separate exponential
+  smoothing of nonzero demand sizes and inter-demand intervals.
+- `tsb` — Teunter-Syntetos-Babai: smooths the demand *probability* every
+  period, so obsolescence decays the forecast. Both suit sparse enterprise
+  bookings where standard models produce flat lines with negative intervals.
+
 ## Meta-models
 
 - `ensemble` — mean / median / weighted combination; combining diverse models is the
@@ -74,6 +82,22 @@ extensions.
   MASE with train-only scaling (scale-free and safe on zero-crossing series).
 - `conformal` — wraps any model with split-conformal calibration for intervals with
   distribution-free coverage.
+- `reconciled` — hierarchical reconciliation over path-encoded ids
+  (`"west/alice"` rolls up to `"west"` and `"total"`): bottom-up, top-down
+  forecast-proportions, or MinT-OLS projection. Guarantees children sum to
+  parents at every horizon step; reconciled intervals are a linear-projection
+  approximation (documented in the docstring).
+
+## GTM (`forecast_os.gtm`)
+
+- `retention_sbg` — shifted-beta-geometric cohort retention (Fader-Hardie):
+  fits churn as a beta-mixture of geometric lifetimes per cohort, with pooled
+  parameters shrinking short cohorts; forecasts are monotone and stay in
+  [0, 1]. Feed it a cohort triangle via `gtm.cohort_panel`.
+- Plus non-registry primitives: `to_panel` (CRM events → panels),
+  `stage_panel` / `conversion_rates` / `propagate` (funnel math),
+  `attainment_probability` and `pipeline_coverage` (quota questions from
+  forecast intervals).
 
 ## Finance
 

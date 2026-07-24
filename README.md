@@ -175,6 +175,33 @@ Sizing rules: `"binary"` (long/flat), `"proportional"` (position =
 `P(r > 0)`-scaled, from the model's prediction intervals), `"kelly"`
 (fractional Kelly, capped at `max_leverage`).
 
+### Go-to-market analytics
+
+The `forecast_os.gtm` layer bridges CRM-shaped data (one row per opportunity,
+deal, or event) into the engine and answers revenue questions directly:
+
+```python
+from forecast_os.gtm import to_panel, attainment_probability
+
+panel = to_panel(opportunities, id_cols=["team", "rep"], date_col="close_date",
+                 value_col="amount", freq="MS", agg="sum")
+
+model = fos.get_model("reconciled", model="auto_ets", method="mint_ols")
+model.fit(panel)                       # rep, team, and total forecasts that add up
+fc = model.predict(h=6, level=[80])
+
+attainment_probability(fc, quota={"total": 3_400_000}, level=80)
+#  unique_id   expected      quota  p_attain
+#      total  3188234.3  3400000.0     0.424
+```
+
+Plus funnel primitives (`stage_panel`, `conversion_rates`, `propagate`),
+cohort retention forecasting (`retention_sbg`), driver-based forecasting
+(pass covariate columns — e.g. marketing spend — to exog-aware models like
+`ridge_lag`, with known future values via `predict(h, X_df=...)`), fiscal
+calendars (`FiscalCalendar(start_month=2, scheme="4-4-5")`), and signed
+`bias` / `pct_bias` governance metrics that catch sandbagged forecasts.
+
 ## CLI
 
 ```bash
@@ -195,10 +222,13 @@ forecast-os simulate --s0 100 --mu 0.0004 --sigma 0.012 --h 252 --paths 5000
 | `arima`, `auto_arima` | statistical | ARIMA(p,d,q) via CSS; auto orders by AICc, ψ-weight intervals |
 | `kalman` | statistical | Local level / local linear trend state space, MLE, exact interval growth |
 | `ridge_lag` | ml | Ridge autoregression on lags + Fourier terms, recursive multi-step |
+| `croston`, `tsb` | statistical | Intermittent-demand models for lumpy series (sparse enterprise bookings) |
 | `ensemble` | ensemble | Mean / median / weighted combination of any members |
-| `auto_select` | ensemble | Cross-validates candidates, picks the best model per series |
+| `auto_select` | ensemble | Cross-validates candidates, picks the best model per series (seasonality-aware) |
 | `conformal` | ensemble | Split-conformal calibrated intervals around any model |
+| `reconciled` | ensemble | Hierarchical reconciliation (bottom-up / top-down / MinT) over `"team/rep"` ids |
 | `garch` | financial | GARCH(1,1) conditional volatility forecasting |
+| `retention_sbg` | gtm | Shifted-beta-geometric cohort retention with pooled shrinkage |
 
 Plus non-registry finance tools: `GARCH11`, `MonteCarloSimulator`,
 `MarkovRegimeSwitching`, `StrategyBacktester`, and metrics
@@ -237,9 +267,10 @@ That's the whole integration: it now appears in `list_models()`, works in
 
 ## Roadmap
 
+- Terminal console (OpenBB-style always-on TUI over the engine)
+- Data connectors (warehouse / CRM export readers) and a snapshot store
 - Foundation-model adapter (TimeGPT-style zero-shot baselines)
-- Hierarchical reconciliation (regional → national coherence)
-- Exogenous regressors for ARIMA / RidgeLag
+- Exogenous regressors for ARIMA (RidgeLag ships them today)
 - REST serving layer
 
 ## Acknowledgments

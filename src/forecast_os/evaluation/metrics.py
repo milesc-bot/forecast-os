@@ -2,8 +2,11 @@
 
 Point metrics operate on aligned 1-D arrays. Percentage metrics (``mape``,
 ``smape``) return *fractions* (0.05 == 5%); ``smape`` is the symmetric variant
-bounded to [0, 2]. Scaled metrics (``mase``, ``rmsse``) additionally need the
-training series and a seasonality ``m`` (the M4/M5 convention).
+bounded to [0, 2]. Governance metrics (``bias``, ``pct_bias``,
+``tracking_signal``) are *signed*: they expose the direction of systematic
+under/over-forecasting that absolute-error metrics hide. Scaled metrics
+(``mase``, ``rmsse``) additionally need the training series and a seasonality
+``m`` (the M4/M5 convention).
 
 Interval metrics (:func:`coverage`, :func:`winkler_score`, pinball, CRPS)
 score ``lo``/``hi`` prediction-interval columns; lower is better everywhere
@@ -30,6 +33,9 @@ __all__ = [
     "rmse",
     "mape",
     "smape",
+    "bias",
+    "pct_bias",
+    "tracking_signal",
     "mase",
     "rmsse",
     "pinball_loss",
@@ -77,6 +83,45 @@ def smape(y, yhat) -> float:
     diff = np.abs(y - yhat)
     terms = np.where(denom > 1e-12, diff / np.where(denom > 1e-12, denom, 1.0), 0.0)
     return float(np.mean(terms))
+
+
+def bias(y, yhat) -> float:
+    """Mean signed error ``mean(yhat - y)``, in the units of ``y``.
+
+    Negative values mean the forecast runs low (sandbagging), positive means
+    it runs high — the direction that ``mae``/``mape`` hide. Offsetting
+    errors cancel, so pair it with a magnitude metric.
+    """
+    y, yhat = _align(y, yhat)
+    return float(np.mean(yhat - y))
+
+
+def pct_bias(y, yhat) -> float:
+    """Signed relative bias ``sum(yhat - y) / sum(|y|)`` as a fraction.
+
+    ``-0.08`` reads as "the forecast ran 8% low over the window". Returns
+    ``nan`` when the actuals are all ~0 (denominator below 1e-12).
+    """
+    y, yhat = _align(y, yhat)
+    denom = float(np.sum(np.abs(y)))
+    if denom < 1e-12:
+        return float("nan")
+    return float(np.sum(yhat - y) / denom)
+
+
+def tracking_signal(y, yhat) -> float:
+    """Cumulative signed error over the mean absolute error (bounded by ±n).
+
+    ``sum(yhat - y) / mean(|yhat - y|)``: values near ``+n`` / ``-n`` mean
+    every error shares one sign — a systematically high/low forecast that
+    needs review. Returns ``nan`` for a perfect forecast (MAD below 1e-12).
+    """
+    y, yhat = _align(y, yhat)
+    err = yhat - y
+    mad = float(np.mean(np.abs(err)))
+    if mad < 1e-12:
+        return float("nan")
+    return float(np.sum(err) / mad)
 
 
 def _naive_scale(y_train: np.ndarray, m: int, squared: bool) -> float:
@@ -144,6 +189,9 @@ _SIMPLE_METRICS: dict[str, Callable] = {
     "rmse": rmse,
     "mape": mape,
     "smape": smape,
+    "bias": bias,
+    "pct_bias": pct_bias,
+    "tracking_signal": tracking_signal,
 }
 _SCALED_METRICS: dict[str, Callable] = {"mase": mase, "rmsse": rmsse}
 _INTERVAL_METRICS = ("coverage", "winkler", "pinball", "crps")
@@ -207,12 +255,19 @@ def evaluate(
     metrics: Iterable[str] = ("mae", "rmse", "smape"),
     train_df: pd.DataFrame | None = None,
     seasonality: int = 1,
+    by: str | None = None,
 ) -> pd.DataFrame:
     """Score a cross-validation frame per (series, metric, model).
 
     ``cv_df`` must have columns ``unique_id, ds, cutoff, y`` plus one column
     per model. Scaled metrics (mase/rmsse) require ``train_df`` (the panel the
     models were cross-validated on) for the naive scaling term.
+
+    ``by=None`` (the default) pools all cutoffs into one score per series.
+    ``by="cutoff"`` scores every ``(unique_id, cutoff)`` group separately —
+    the output gains a ``cutoff`` column — which works for point and interval
+    metrics alike and requires ``cv_df`` to carry a ``cutoff`` column. Any
+    other ``by`` value raises :class:`ValueError`.
 
     Interval metrics — ``coverage``, ``winkler``, ``pinball``, ``crps`` — read
     each model's ``{model}-lo-{level}`` / ``{model}-hi-{level}`` columns (as
@@ -223,9 +278,16 @@ def evaluate(
     the quantile-approximated CRPS: the mean over all implied quantiles (both
     tails of every level) of twice the pinball loss.
     """
+    if by not in (None, "cutoff"):
+        raise ValueError(f"unknown by={by!r}; expected None or 'cutoff'")
     for col in (ID_COL, TARGET_COL):
         if col not in cv_df.columns:
             raise ValueError(f"cv_df is missing required column {col!r}")
+    if by == "cutoff" and "cutoff" not in cv_df.columns:
+        raise ValueError(
+            "by='cutoff' requires a 'cutoff' column in cv_df "
+            "(as produced by cross_validation), but this frame has none"
+        )
     model_cols = _model_columns(cv_df)
     if not model_cols:
         raise ValueError("cv_df has no model forecast columns")
@@ -253,20 +315,30 @@ def evaluate(
             )
     all_levels = sorted({lvl for levels in levels_by_model.values() for lvl in levels})
 
+    if by is None:
+        groups = [({ID_COL: uid}, g) for uid, g in cv_df.groupby(ID_COL, sort=True)]
+    else:
+        groups = [
+            ({ID_COL: uid, "cutoff": cutoff}, g)
+            for (uid, cutoff), g in cv_df.groupby([ID_COL, "cutoff"], sort=True)
+        ]
+
     rows = []
-    for uid, g in cv_df.groupby(ID_COL, sort=True):
+    for meta, g in groups:
         y_train = None
         if train_df is not None:
-            y_train = train_df.loc[train_df[ID_COL] == uid, TARGET_COL].to_numpy(float)
+            y_train = train_df.loc[
+                train_df[ID_COL] == meta[ID_COL], TARGET_COL
+            ].to_numpy(float)
         for metric in metrics:
             if metric == "crps":
-                row: dict = {ID_COL: uid, "metric": "crps"}
+                row: dict = {**meta, "metric": "crps"}
                 for col in model_cols:
                     row[col] = _score_crps(g, col, levels_by_model[col])
                 rows.append(row)
             elif metric in _INTERVAL_METRICS:
                 for lvl in all_levels:
-                    row = {ID_COL: uid, "metric": f"{metric}-{lvl}"}
+                    row = {**meta, "metric": f"{metric}-{lvl}"}
                     for col in model_cols:
                         if lvl in levels_by_model[col]:
                             row[col] = _score_interval(g, col, lvl, metric)
@@ -274,7 +346,7 @@ def evaluate(
                             row[col] = float("nan")
                     rows.append(row)
             else:
-                row = {ID_COL: uid, "metric": metric}
+                row = {**meta, "metric": metric}
                 for col in model_cols:
                     valid = g[[TARGET_COL, col]].dropna()
                     if len(valid) == 0:

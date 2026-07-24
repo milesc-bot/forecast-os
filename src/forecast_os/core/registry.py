@@ -21,7 +21,7 @@ import pandas as pd
 
 from .base import BaseForecaster
 
-FAMILIES = ("baseline", "statistical", "ml", "ensemble", "financial", "adapter")
+FAMILIES = ("baseline", "statistical", "ml", "ensemble", "financial", "adapter", "gtm")
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0 (2026-07-24)
+
+The GTM wave: driver-based forecasting, coherent hierarchies, and a
+go-to-market domain layer.
+
+- **Exogenous covariates**: extra numeric panel columns now reach models that
+  declare `supports_exog` (RidgeLag first); `predict(h, X_df=...)` takes known
+  future drivers; cross-validation threads held-out covariates automatically;
+  models that ignore covariates now warn instead of staying silent.
+- **Model persistence**: `model.save(path)` / `forecast_os.load(path)` with a
+  version-stamped envelope; every registered model contract-tested to
+  round-trip.
+- **Hierarchical reconciliation**: `reconciled` meta-model (bottom-up,
+  top-down forecast-proportions, MinT-OLS) over path-encoded ids
+  (`"west/alice"`), plus `aggregate_panel`; rep, team, and total forecasts
+  now add up.
+- **Governance**: signed `bias` / `pct_bias` / `tracking_signal` metrics;
+  `evaluate(by="cutoff")` rolling breakdowns; `compare()` degrades per model
+  instead of failing atomically; parameterized model specs
+  `("ridge_lag", {"lags": 12})`.
+- **GTM layer** (`forecast_os.gtm`): `to_panel` event→panel aggregation (the
+  CRM-export bridge), funnel stage/conversion/propagation, quota attainment
+  probability from forecast intervals, cohort retention with a pooled
+  shifted-beta-geometric model (`retention_sbg`).
+- **New models**: Croston and TSB for intermittent/lumpy demand.
+- **Fiscal calendars**: `FiscalCalendar` (FY start month, 4-4-5) with
+  quarter features; `LogitTransform` for bounded rates; `fill_gaps` for
+  irregular exports.
+- **CLI**: `--id-col/--time-col/--target-col/--agg/--freq` mapping flags so
+  raw CRM exports load directly; `--param key=value` model parameters.
+
 ## 0.2.0 (2026-07-23)
 
 Probabilistic evaluation, honest AutoML defaults, and a real risk loop.

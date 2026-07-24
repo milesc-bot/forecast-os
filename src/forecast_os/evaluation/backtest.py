@@ -5,18 +5,25 @@ cutoffs, every model is re-fitted on data up to the cutoff and scored on the
 next ``h`` observations. The output frame has one column per model (named by
 ``model.name``) plus ``unique_id, ds, cutoff, y`` and optional
 ``{model}-lo-{level}`` / ``{model}-hi-{level}`` interval columns.
+
+When the panel carries extra numeric covariate columns, they are threaded
+automatically: exog-capable models (``supports_exog=True``) are fitted on the
+covariate panel and predict with an ``X_df`` built from the held-out test rows
+(known future inputs), while other models run exactly as before with the
+per-fit :class:`IgnoredCovariatesWarning` suppressed to avoid warning spam.
 """
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 
 import pandas as pd
 
-from ..core.base import BaseForecaster
+from ..core.base import BaseForecaster, IgnoredCovariatesWarning, _method_accepts
 from ..core.exceptions import DataContractError
 from ..core.registry import get_model
-from ..core.types import ID_COL, TARGET_COL, TIME_COL, validate_panel
+from ..core.types import ID_COL, REQUIRED_COLS, TARGET_COL, TIME_COL, validate_panel
 
 __all__ = ["cross_validation"]
 
@@ -71,6 +78,11 @@ def cross_validation(
 
     df = validate_panel(df)
     resolved = _resolve_models(models)
+    exog_cols = sorted(
+        c
+        for c in df.columns
+        if c not in REQUIRED_COLS and pd.api.types.is_numeric_dtype(df[c])
+    )
 
     sizes = df.groupby(ID_COL)[TARGET_COL].size()
     span = h + (n_windows - 1) * step_size
@@ -97,9 +109,30 @@ def cross_validation(
         test.insert(2, "cutoff", test[ID_COL].map(cutoffs))
         test["_step"] = test.groupby(ID_COL).cumcount()
 
+        # Held-out covariate rows are known future inputs for exog models.
+        test_x = (
+            df.loc[test_mask, [ID_COL, TIME_COL, *exog_cols]].copy() if exog_cols else None
+        )
+
         for model in resolved:
-            fitted = model.clone().fit(train)
-            pred = fitted.predict(h, level=level)
+            with warnings.catch_warnings():
+                # Non-exog models on covariate panels warn once per fit; one
+                # warning per (model, window) here would be pure spam.
+                warnings.simplefilter("ignore", IgnoredCovariatesWarning)
+                fitted = model.clone().fit(train)
+            # Gate on what fit actually consumed, not on the class declaration:
+            # a model declaring supports_exog=True whose _fit_series takes no X
+            # ends up fitted without exog features, and passing X_df to it
+            # would emit an IgnoredCovariatesWarning outside the suppression
+            # block above (once per window).
+            if (
+                test_x is not None
+                and getattr(fitted, "_exog_features", None)
+                and _method_accepts(type(model), "predict", "X_df")
+            ):
+                pred = fitted.predict(h, level=level, X_df=test_x)
+            else:
+                pred = fitted.predict(h, level=level)
             _check_pred_sorted(pred, model.name)
             pred = pred.drop(columns=[TIME_COL])
             pred["_step"] = pred.groupby(ID_COL).cumcount()

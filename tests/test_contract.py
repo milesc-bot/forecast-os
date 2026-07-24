@@ -30,8 +30,20 @@ def _all_model_names():
     return names
 
 
+# Models whose fit() contract restricts inputs to a domain (e.g. retention
+# fractions in [0, 1]) cannot fit the generic panel; they carry their own
+# contract-equivalent tests next to their implementation.
+_DOMAIN_PANEL_MODELS = {"retention_sbg"}  # see tests/test_gtm_retention.py
+
+
+def _skip_if_domain_restricted(name):
+    if name in _DOMAIN_PANEL_MODELS:
+        pytest.skip(f"{name} has a domain-restricted input contract; covered by its own tests")
+
+
 @pytest.mark.parametrize("name", _all_model_names())
 def test_registered_model_contract(name):
+    _skip_if_domain_restricted(name)
     model = get_model(name)
     assert isinstance(model, BaseForecaster)
 
@@ -43,17 +55,19 @@ def test_registered_model_contract(name):
     assert list(pred.columns[:3]) == [ID_COL, TIME_COL, "yhat"]
     assert {"lo-80", "hi-80"} <= set(pred.columns)
 
-    # h rows per series, all finite point forecasts
+    # h rows per series, all finite point forecasts. Every training series must
+    # be forecast; hierarchical models may add aggregate series (e.g. "total").
     counts = pred.groupby(ID_COL).size()
-    assert set(counts.index) == set(df[ID_COL].unique())
+    assert set(counts.index) >= set(df[ID_COL].unique())
     assert (counts == H).all()
     assert np.isfinite(pred["yhat"]).all(), f"{name} produced non-finite forecasts"
     assert (pred["lo-80"] <= pred["hi-80"] + 1e-9).all()
 
-    # future ds strictly after the training data, strictly increasing
+    # future ds strictly after the training data, strictly increasing.
+    # Aggregate series not present in training are checked against the panel max.
     last_train = df.groupby(ID_COL)[TIME_COL].max()
     for uid, g in pred.groupby(ID_COL):
-        assert (g[TIME_COL] > last_train[uid]).all()
+        assert (g[TIME_COL] > last_train.get(uid, last_train.max())).all()
         assert g[TIME_COL].is_monotonic_increasing
 
     # clone() produces an equivalent unfitted instance
@@ -81,6 +95,7 @@ _FITTED_CACHE: dict[str, BaseForecaster] = {}
 
 
 def _fitted_model(name: str) -> BaseForecaster:
+    _skip_if_domain_restricted(name)
     if name not in _FITTED_CACHE:
         panel = generate_series(
             n_series=1, length=40, freq="D", trend=0.2, seasonality=7,
@@ -104,3 +119,22 @@ def test_registered_model_predict_rejects_bad_level(name, bad_level):
     model = _fitted_model(name)
     with pytest.raises(ValueError):
         model.predict(3, level=bad_level)
+
+
+# -- persistence ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", _all_model_names())
+def test_registered_model_save_load_roundtrip(name, tmp_path):
+    from forecast_os.core.base import load
+
+    _skip_if_domain_restricted(name)
+    model = get_model(name).fit(_contract_panel())
+    expected = model.predict(H, level=[80])
+
+    path = tmp_path / f"{name}.pkl"
+    model.save(path)
+    loaded = load(path)
+
+    assert type(loaded) is type(model)
+    pd.testing.assert_frame_equal(loaded.predict(H, level=[80]), expected)

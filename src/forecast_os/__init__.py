@@ -7,15 +7,17 @@ Importing this package registers every built-in model; see
 :func:`list_models` for the catalog.
 """
 
-from . import finance, preprocessing
+from . import finance, gtm, preprocessing
 from .core import (
     BaseForecaster,
     DataContractError,
     ForecastOSError,
+    IgnoredCovariatesWarning,
     NotFittedError,
     PerSeriesForecaster,
     get_model,
     list_models,
+    load,
     register,
     to_panel,
     validate_panel,
@@ -27,7 +29,7 @@ from .models import *  # noqa: F401,F403  (registers built-in models, re-exports
 from .models import __all__ as _models_all
 from .uncertainty import ConformalForecaster
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
@@ -37,11 +39,13 @@ __all__ = [
     "register",
     "get_model",
     "list_models",
+    "load",
     "validate_panel",
     "to_panel",
     "ForecastOSError",
     "DataContractError",
     "NotFittedError",
+    "IgnoredCovariatesWarning",
     # engine & evaluation
     "ForecastEngine",
     "cross_validation",
@@ -54,6 +58,7 @@ __all__ = [
     "load_air_passengers",
     # subpackages
     "finance",
+    "gtm",
     "preprocessing",
     *_models_all,
 ]

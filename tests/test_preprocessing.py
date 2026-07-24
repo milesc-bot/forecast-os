@@ -5,13 +5,17 @@ import pandas as pd
 import pytest
 
 from forecast_os.core.exceptions import ForecastOSError, NotFittedError
+from forecast_os.core.types import validate_panel
+from forecast_os.models.baselines import SeasonalNaive
 from forecast_os.preprocessing.calendar import calendar_features, fourier_features
 from forecast_os.preprocessing.pipeline import Pipeline
 from forecast_os.preprocessing.transforms import (
     Differencer,
     Imputer,
+    LogitTransform,
     LogTransform,
     StandardScaler,
+    fill_gaps,
 )
 
 
@@ -390,3 +394,209 @@ def test_pipeline_transform_matches_fit_transform():
     z1 = pipe.fit_transform(df)
     z2 = pipe.transform(df)
     np.testing.assert_allclose(z1["y"].to_numpy(), z2["y"].to_numpy(), rtol=1e-10)
+
+
+# -- LogitTransform ----------------------------------------------------------
+
+
+def rate_panel():
+    """Two series of rates strictly inside (0, 1)."""
+    return pd.DataFrame(
+        {
+            "unique_id": ["a"] * 5 + ["b"] * 5,
+            "ds": list(range(5)) * 2,
+            "y": [0.1, 0.2, 0.5, 0.7, 0.9, 0.02, 0.4, 0.55, 0.6, 0.98],
+        }
+    )
+
+
+def test_logit_round_trip_within_bounds():
+    df = rate_panel()
+    lt = LogitTransform()
+    back = lt.inverse_transform(lt.fit_transform(df))
+    np.testing.assert_allclose(back["y"].to_numpy(), df["y"].to_numpy(), rtol=1e-9)
+
+
+def test_logit_transform_values():
+    df = rate_panel()
+    z = LogitTransform().fit_transform(df)
+    y = df["y"].to_numpy()
+    np.testing.assert_allclose(z["y"].to_numpy(), np.log(y / (1 - y)), rtol=1e-12)
+
+
+def test_logit_custom_bounds_round_trip():
+    df = rate_panel()
+    df["y"] = df["y"] * 100.0  # rates in (0, 100)
+    lt = LogitTransform(lower=0.0, upper=100.0)
+    back = lt.inverse_transform(lt.fit_transform(df))
+    np.testing.assert_allclose(back["y"].to_numpy(), df["y"].to_numpy(), rtol=1e-9)
+
+
+def test_logit_boundary_values_squeezed_finite():
+    df = rate_panel()
+    df.loc[0, "y"] = 0.0
+    df.loc[4, "y"] = 1.0
+    lt = LogitTransform(eps=1e-6)
+    z = lt.fit_transform(df)
+    assert np.isfinite(z["y"]).all()
+    back = lt.inverse_transform(z)
+    assert (back["y"] > 0.0).all() and (back["y"] < 1.0).all()
+
+
+def test_logit_out_of_bounds_raises_at_fit():
+    for bad in (1.5, -0.1):
+        df = rate_panel()
+        df.loc[2, "y"] = bad
+        with pytest.raises(ForecastOSError):
+            LogitTransform().fit(df)
+
+
+def test_logit_forecast_frame_intervals_stay_inside_bounds():
+    lt = LogitTransform(lower=0.0, upper=1.0).fit(rate_panel())
+    fc = pd.DataFrame(
+        {
+            "unique_id": ["a"] * 3,
+            "ds": [5, 6, 7],
+            "yhat": [0.0, 5.0, -5.0],
+            "lo-80": [-30.0, -1.0, -40.0],
+            "hi-80": [30.0, 8.0, 2.0],
+        }
+    )
+    inv = lt.inverse_transform(fc)
+    for col in ("yhat", "lo-80", "hi-80"):
+        assert (inv[col] > 0.0).all() and (inv[col] < 1.0).all()
+    assert (inv["lo-80"] < inv["yhat"]).all() and (inv["yhat"] < inv["hi-80"]).all()
+    assert inv["yhat"].iloc[0] == pytest.approx(0.5)
+
+
+def test_logit_inverse_huge_logit_stays_strictly_inside_bounds():
+    """expit saturates to exactly 1.0 for x > ~36.7 (and 0.0 for very negative
+    x); the inverse must clamp so results never land ON a bound."""
+    lt = LogitTransform(lower=0.0, upper=1.0).fit(rate_panel())
+    fc = pd.DataFrame({"unique_id": ["a"] * 2, "ds": [5, 6], "yhat": [1000.0, -1000.0]})
+    inv = lt.inverse_transform(fc)
+    assert inv["yhat"].iloc[0] < 1.0  # strictly below the upper bound
+    assert inv["yhat"].iloc[1] > 0.0  # strictly above the lower bound
+
+    df = rate_panel()
+    df["y"] = df["y"] * 100.0
+    lt = LogitTransform(lower=0.0, upper=100.0).fit(df)
+    inv = lt.inverse_transform(fc)
+    assert inv["yhat"].iloc[0] < 100.0
+    assert inv["yhat"].iloc[1] > 0.0
+
+
+def test_logit_per_series_dict_bounds():
+    df = rate_panel()
+    df.loc[df["unique_id"] == "b", "y"] = [2.0, 40.0, 55.0, 60.0, 98.0]
+    lt = LogitTransform(lower=0.0, upper={"a": 1.0, "b": 100.0})
+    z = lt.fit_transform(df)
+    back = lt.inverse_transform(z)
+    np.testing.assert_allclose(back["y"].to_numpy(), df["y"].to_numpy(), rtol=1e-9)
+    b = z[z["unique_id"] == "b"]["y"].to_numpy()
+    np.testing.assert_allclose(b[1], np.log(40.0 / 60.0), rtol=1e-12)
+
+
+def test_logit_dict_bounds_unseen_series_raises():
+    lt = LogitTransform(upper={"a": 1.0})
+    with pytest.raises(ForecastOSError):
+        lt.fit(rate_panel())  # series "b" has no bound
+
+
+def test_logit_invalid_constructor():
+    with pytest.raises(ValueError):
+        LogitTransform(lower=1.0, upper=1.0)
+    with pytest.raises(ValueError):
+        LogitTransform(lower=2.0, upper=1.0)
+    for bad_eps in (0.0, -1e-6, 0.5):
+        with pytest.raises(ValueError):
+            LogitTransform(eps=bad_eps)
+
+
+def test_logit_transform_before_fit_raises():
+    with pytest.raises(NotFittedError):
+        LogitTransform().transform(rate_panel())
+
+
+# -- fill_gaps ---------------------------------------------------------------
+
+
+def gapped_weekly_panel():
+    """12 Mondays of period-4 demand with one week (a zero) missing.
+
+    The gap sits inside the final season so positional models misalign.
+    """
+    ds = pd.date_range("2025-01-06", periods=12, freq="W-MON")
+    y = [10.0, 0.0, 0.0, 0.0] * 3
+    df = pd.DataFrame({"unique_id": "sku", "ds": ds, "y": y})
+    return df.drop(index=9).reset_index(drop=True)
+
+
+def test_fill_gaps_restores_regular_grid():
+    out = fill_gaps(gapped_weekly_panel(), freq="W-MON")
+    assert len(out) == 12
+    validate_panel(out)  # must be a valid panel
+    assert pd.infer_freq(out["ds"]) == "W-MON"
+    assert out["y"].iloc[9] == 0.0
+    # existing observations untouched
+    np.testing.assert_allclose(out["y"].to_numpy(), [10.0, 0.0, 0.0, 0.0] * 3)
+
+
+def test_fill_gaps_seasonal_alignment_regression():
+    """The gap-analysis repro: a missing week shifts every later observation
+    one position left, so a seasonal model reads the wrong phase. fill_gaps
+    must restore positional ds alignment."""
+    df = gapped_weekly_panel()
+    misaligned = SeasonalNaive(season_length=4).fit(df).predict(4)["yhat"].to_numpy()
+    filled = fill_gaps(df, freq="W-MON")
+    aligned = SeasonalNaive(season_length=4).fit(filled).predict(4)["yhat"].to_numpy()
+    np.testing.assert_allclose(aligned, [10.0, 0.0, 0.0, 0.0])
+    assert not np.allclose(misaligned, aligned)
+
+
+def test_fill_gaps_extra_columns_nan_on_inserted_rows():
+    df = gapped_weekly_panel().assign(promo=1.0)
+    out = fill_gaps(df, freq="W-MON")
+    assert len(out) == 12
+    assert np.isnan(out["promo"].iloc[9])
+    assert (out["promo"].drop(index=9) == 1.0).all()
+
+
+def test_fill_gaps_nan_fill_value():
+    out = fill_gaps(gapped_weekly_panel(), freq="W-MON", fill_value=np.nan)
+    assert np.isnan(out["y"].iloc[9])
+    imputed = Imputer(method="ffill").fit_transform(out)
+    assert not imputed["y"].isna().any()
+
+
+def test_fill_gaps_per_series_ranges_independent():
+    a = pd.DataFrame(
+        {
+            "unique_id": "a",
+            "ds": pd.to_datetime(["2025-01-01", "2025-01-03"]),
+            "y": [1.0, 2.0],
+        }
+    )
+    b = pd.DataFrame(
+        {
+            "unique_id": "b",
+            "ds": pd.to_datetime(["2025-02-01", "2025-02-02"]),
+            "y": [3.0, 4.0],
+        }
+    )
+    out = fill_gaps(pd.concat([a, b], ignore_index=True), freq="D")
+    assert len(out[out["unique_id"] == "a"]) == 3  # one gap day inserted
+    assert len(out[out["unique_id"] == "b"]) == 2  # b is not padded to a's range
+    assert out[out["unique_id"] == "a"]["y"].iloc[1] == 0.0
+
+
+def test_fill_gaps_numeric_ds_raises():
+    with pytest.raises(ForecastOSError):
+        fill_gaps(make_panel(), freq="D")
+
+
+def test_fill_gaps_off_grid_ds_raises():
+    df = gapped_weekly_panel()
+    df.loc[3, "ds"] = df.loc[3, "ds"] + pd.Timedelta(days=1)  # a Tuesday
+    with pytest.raises(ForecastOSError):
+        fill_gaps(df, freq="W-MON")

@@ -10,6 +10,7 @@ import pytest
 
 from forecast_os.adapters import neuralforecast_adapter, statsforecast_adapter
 from forecast_os.core.base import PerSeriesForecaster
+from forecast_os.core.exceptions import ForecastOSError
 from forecast_os.core.registry import register
 from forecast_os.engine import ForecastEngine
 
@@ -34,8 +35,19 @@ class _ConstB(_ConstA):
         self.value = value
 
 
+class _Broken(PerSeriesForecaster):
+    """Dummy whose fit always raises (compare() failure-tolerance tests)."""
+
+    def _fit_series(self, y):
+        raise RuntimeError("boom")
+
+    def _predict_series(self, state, h):  # pragma: no cover - fit always raises
+        return np.full(h, 0.0)
+
+
 def _register_dummies():
     register("_test_engine_const", family="baseline")(_ConstA)
+    register("_test_engine_broken", family="baseline")(_Broken)
 
 
 def _make_panel(n_series=2, length=30, const=None, seed=0):
@@ -139,6 +151,7 @@ def test_cross_validate_passes_level_through():
 
 
 def test_compare_leaderboard_sorted_by_first_metric():
+    _register_dummies()  # _ConstA's registry name becomes its board index entry
     df = _make_panel(const=5.0, length=40)
     board = ForecastEngine().compare(
         df, h=4, n_windows=2, metrics=("mae", "rmse"),
@@ -147,17 +160,90 @@ def test_compare_leaderboard_sorted_by_first_metric():
     assert list(board.columns) == ["mae", "rmse"]
     assert board.shape == (2, 2)
     assert board.index.name == "model"
-    assert list(board.index) == ["_ConstA", "_ConstB"]  # exact model wins, sorted ascending
-    assert board.loc["_ConstA", "mae"] == pytest.approx(0.0, abs=1e-12)
+    # exact model wins, sorted ascending; registered classes index by registry name
+    assert list(board.index) == ["_test_engine_const", "_ConstB"]
+    assert board.loc["_test_engine_const", "mae"] == pytest.approx(0.0, abs=1e-12)
     assert board.loc["_ConstB", "mae"] == pytest.approx(95.0, abs=1e-9)
     assert board["mae"].is_monotonic_increasing
 
 
 def test_compare_default_metrics_one_row_per_model():
+    _register_dummies()
     df = _make_panel(length=40)
     board = ForecastEngine().compare(df, h=4, n_windows=2, models=[_ConstA(), _ConstB()])
     assert list(board.columns) == ["mae", "rmse", "smape"]
-    assert sorted(board.index) == ["_ConstA", "_ConstB"]
+    assert sorted(board.index) == ["_ConstB", "_test_engine_const"]
+
+
+# -- ForecastEngine.compare failure tolerance ------------------------------------
+
+
+def test_compare_survives_broken_model_and_warns():
+    _register_dummies()
+    df = _make_panel(const=5.0, length=40)
+    with pytest.warns(UserWarning, match="model _test_engine_broken failed"):
+        board = ForecastEngine().compare(
+            df, h=4, n_windows=2, metrics=("mae",),
+            models=["_test_engine_broken", "_test_engine_const"],
+        )
+    # the healthy model still gets a full board row
+    assert list(board.index) == ["_test_engine_const"]
+    assert board.loc["_test_engine_const", "mae"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_compare_all_models_failing_raises():
+    _register_dummies()
+    df = _make_panel(length=40)
+    with pytest.raises(ForecastOSError, match="all models failed"), pytest.warns(UserWarning):
+        ForecastEngine().compare(df, h=4, n_windows=2, models=["_test_engine_broken"])
+
+
+def test_compare_board_index_uses_registry_name_not_inherited():
+    _register_dummies()
+    df = _make_panel(const=5.0, length=40)
+    board = ForecastEngine().compare(
+        df, h=4, n_windows=2, metrics=("mae",),
+        models=["_test_engine_const", _ConstB()],
+    )
+    # _ConstA is registered -> registry name; _ConstB merely inherits the class
+    # attribute and must keep its own model name (no duplicate index labels)
+    assert sorted(board.index) == ["_ConstB", "_test_engine_const"]
+
+
+# -- parameterized model specs ---------------------------------------------------
+
+
+def test_forecast_accepts_param_spec_and_param_reaches_model():
+    df = _make_panel(length=20)
+    out = ForecastEngine().forecast(df, h=3, models=[("ridge_lag", {"lags": 6})])
+    assert "RidgeLag" in out.columns
+    assert len(out) == 2 * 3
+    # proof the lags override reached the model: the default (lags=14) needs
+    # 24 observations per series and fails on this 20-row panel
+    with pytest.raises(ForecastOSError):
+        ForecastEngine().forecast(df, h=3, models=["ridge_lag"])
+
+
+def test_compare_accepts_param_spec():
+    df = _make_panel(length=30)  # too short for ridge_lag's default lags=14 in CV
+    board = ForecastEngine().compare(
+        df, h=4, n_windows=2, metrics=("mae",), models=[("ridge_lag", {"lags": 6})]
+    )
+    assert list(board.index) == ["ridge_lag"]
+    assert np.isfinite(board["mae"]).all()
+
+
+def test_engine_single_spec_tuple_unwrapped():
+    df = _make_panel(length=30)
+    out = ForecastEngine(models=("ridge_lag", {"lags": 6})).forecast(df, h=2)
+    assert "RidgeLag" in out.columns
+    assert len(out) == 2 * 2
+
+
+def test_engine_rejects_malformed_spec():
+    df = _make_panel()
+    with pytest.raises(ValueError, match="resolve model spec"):
+        ForecastEngine().forecast(df, h=2, models=[("ridge_lag", 6)])
 
 
 # -- ForecastEngine.compare with interval metrics --------------------------------
@@ -190,6 +276,7 @@ class _NarrowMissIntervals(PerSeriesForecaster):
 
 
 def test_compare_level_board_has_coverage_and_sorts_by_mase():
+    _register_dummies()
     df = _make_panel(length=40)
     board = ForecastEngine().compare(
         df, h=4, n_windows=2, metrics=("mase", "coverage"),
@@ -198,7 +285,7 @@ def test_compare_level_board_has_coverage_and_sorts_by_mase():
     assert list(board.columns) == ["mase", "coverage-80"]
     # first metric is mase (not coverage), so plain ascending sort applies
     assert board["mase"].is_monotonic_increasing
-    assert list(board.index) == ["_ConstA", "_ConstB"]
+    assert list(board.index) == ["_test_engine_const", "_ConstB"]
     assert board["coverage-80"].between(0.0, 1.0).all()
 
 
@@ -213,6 +300,40 @@ def test_compare_coverage_first_sorting_closest_to_nominal_wins():
     assert list(board.index) == ["_WideIntervals", "_NarrowMissIntervals"]
     assert board.loc["_WideIntervals", "coverage-80"] == pytest.approx(1.0)
     assert board.loc["_NarrowMissIntervals", "coverage-80"] == pytest.approx(0.0)
+
+
+class _BiasSmall(PerSeriesForecaster):
+    """Forecasts the training mean minus 0.5 (bias -0.5 on a constant panel)."""
+
+    def _fit_series(self, y):
+        return {"mean": float(np.mean(y))}
+
+    def _predict_series(self, state, h):
+        return np.full(h, state["mean"] - 0.5)
+
+
+class _BiasLarge(_BiasSmall):
+    """Forecasts the training mean minus 31.1 (bias -31.1 on a constant panel)."""
+
+    def _predict_series(self, state, h):
+        return np.full(h, state["mean"] - 31.1)
+
+
+@pytest.mark.parametrize(
+    "metric, small, large",
+    [("bias", -0.5, -31.1), ("pct_bias", -0.1, -6.22)],
+)
+def test_compare_signed_metric_first_sorts_by_abs_closest_to_zero(metric, small, large):
+    """Signed governance metrics sort by |value|: a plain ascending sort would
+    rank the -31.1-bias model above the -0.5-bias one."""
+    df = _make_panel(const=5.0, length=40)
+    board = ForecastEngine().compare(
+        df, h=4, n_windows=2, metrics=(metric,),
+        models=[_BiasLarge(), _BiasSmall()],  # heavy sandbagger listed first
+    )
+    assert list(board.index) == ["_BiasSmall", "_BiasLarge"]
+    assert board.loc["_BiasSmall", metric] == pytest.approx(small)
+    assert board.loc["_BiasLarge", metric] == pytest.approx(large)
 
 
 def test_compare_interval_metric_without_level_raises():
