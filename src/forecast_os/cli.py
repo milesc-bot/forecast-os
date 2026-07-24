@@ -3,9 +3,11 @@
 CSV in, CSV (or printed table) out::
 
     forecast-os models [--family FAMILY]
+    forecast-os mappings
     forecast-os forecast data.csv --h 12 --model auto_ets --level 80
     forecast-os forecast crm.csv --h 6 --id-col Rep --time-col "Close Date" \\
         --target-col Amount --agg sum --freq MS
+    forecast-os forecast deals.csv --h 6 --mapping hubspot_deals
     forecast-os forecast data.csv --h 12 --model ridge_lag --param lags=12
     forecast-os compare data.csv --h 12 --models naive,theta,auto_ets
     forecast-os compare data.csv --h 12 --metrics mae,coverage --level 80,95
@@ -18,6 +20,12 @@ duplicate ``(unique_id, ds)`` rows (``count`` ignores target values), and
 ``--freq FREQ`` reindexes each series to a regular grid from its first to its
 last timestamp, filling gaps per ``--fill {zero,nan}`` (default ``zero``).
 Timestamps must land on the ``--freq`` grid (e.g. month starts for ``MS``).
+
+Alternatively ``--mapping NAME`` applies a named platform recipe (list them
+with ``forecast-os mappings``) that renames, filters, and aggregates the raw
+export in one step. It replaces the manual options above — combining it with
+``--id-col/--time-col/--target-col/--agg`` is an error — and ``--freq``
+becomes an override of the recipe's frequency.
 
 Errors (bad files, unknown models, contract violations) print ``error: ...``
 to stderr and exit with status 2 — never a traceback.
@@ -121,6 +129,27 @@ def _regularize(df: pd.DataFrame, freq: str, fill: str) -> pd.DataFrame:
 
 def _prepare_panel(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     """Apply the shared panel-mapping options before the engine validates."""
+    if args.mapping:
+        conflicts = [
+            flag
+            for flag, value in (
+                ("--id-col", args.id_col),
+                ("--time-col", args.time_col),
+                ("--target-col", args.target_col),
+                ("--agg", args.agg),
+            )
+            if value
+        ]
+        if conflicts:
+            raise ValueError(
+                f"--mapping replaces the manual panel options; drop "
+                f"{', '.join(conflicts)} (--freq is the only --mapping override)"
+            )
+        from .connectors import mappings  # noqa: F401  (registers platform recipes)
+        from .connectors.base import apply_mapping
+
+        overrides = {"freq": args.freq} if args.freq else {}
+        return apply_mapping(df, args.mapping, **overrides)
     rename = {}
     for source, target in (
         (args.id_col, ID_COL),
@@ -169,6 +198,13 @@ def _parse_params(pairs: list[str] | None) -> dict[str, Any]:
 
 def _cmd_models(args: argparse.Namespace) -> None:
     print(list_models(family=args.family).to_string(index=False))
+
+
+def _cmd_mappings(args: argparse.Namespace) -> None:
+    from .connectors import mappings  # noqa: F401  (registers platform recipes)
+    from .connectors.base import list_mappings
+
+    print(list_mappings().to_string(index=False))
 
 
 def _cmd_forecast(args: argparse.Namespace) -> None:
@@ -221,6 +257,12 @@ def _cmd_simulate(args: argparse.Namespace) -> None:
 
 def _add_panel_options(p: argparse.ArgumentParser) -> None:
     """Panel-mapping options shared by ``forecast`` and ``compare``."""
+    p.add_argument(
+        "--mapping", default=None, metavar="NAME",
+        help="named platform recipe (see `forecast-os mappings`) that renames, filters, "
+        "and aggregates the raw export; replaces --id-col/--time-col/--target-col/--agg "
+        "(--freq still overrides the recipe's frequency)",
+    )
     p.add_argument("--id-col", default=None, help="input column to use as unique_id")
     p.add_argument("--time-col", default=None, help="input column to use as ds")
     p.add_argument("--target-col", default=None, help="input column to use as y")
@@ -248,6 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_models = sub.add_parser("models", help="list registered models")
     p_models.add_argument("--family", default=None, help="filter by model family")
     p_models.set_defaults(func=_cmd_models)
+
+    p_map = sub.add_parser("mappings", help="list registered platform schema mappings")
+    p_map.set_defaults(func=_cmd_mappings)
 
     p_fc = sub.add_parser("forecast", help="forecast a CSV panel (unique_id, ds, y)")
     p_fc.add_argument("input", help="input CSV path")

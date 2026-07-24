@@ -202,6 +202,47 @@ cohort retention forecasting (`retention_sbg`), driver-based forecasting
 calendars (`FiscalCalendar(start_month=2, scheme="4-4-5")`), and signed
 `bias` / `pct_bias` governance metrics that catch sandbagged forecasts.
 
+## Plug in your pipeline
+
+Your GTM data lives in a CRM, a warehouse, or a product-analytics tool — the
+`connectors` layer meets it there. **Mapping recipes** know the export shapes
+of Salesforce, HubSpot, Pipedrive, Stripe, PostHog, GA4, Mixpanel, and
+Amplitude (`forecast-os mappings` lists them):
+
+```bash
+forecast-os forecast deals.csv --mapping hubspot_deals --h 6 --model auto_select
+```
+
+```python
+from forecast_os.connectors import HubSpotSource, SQLSource, apply_mapping
+
+# REST APIs (pip install "forecast-os[connectors]"): paginated, token-auth
+panel = HubSpotSource(token=HUBSPOT_TOKEN).to_panel(id_cols=("owner",))
+
+# Any warehouse pandas can read — bring your own driver (DuckDB, Snowflake,
+# BigQuery, Postgres):
+panel = SQLSource("SELECT owner, close_date, amount FROM won_deals",
+                  con=duckdb.connect("crm.db"),
+                  mapping="salesforce_opportunities").to_panel()
+
+# Or shape any records DataFrame yourself:
+panel = apply_mapping(df, "posthog_events", freq="W")
+```
+
+### MCP server — let your agent drive the engine
+
+`pip install "forecast-os[mcp]"` and register `forecast-os-mcp` with any MCP
+client (Claude Desktop / Claude Code / your agent framework):
+
+```json
+{"mcpServers": {"forecast-os": {"command": "forecast-os-mcp"}}}
+```
+
+The server exposes `preview_panel`, `forecast`, `compare`, and
+`quota_attainment` tools over CSV paths or inline records, so an agent can
+map a raw export, sanity-check the panel, rank models, and report quota
+attainment probability without writing pandas.
+
 ## CLI
 
 ```bash

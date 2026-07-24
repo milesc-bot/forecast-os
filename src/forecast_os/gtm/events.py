@@ -24,6 +24,7 @@ from ..core.types import ID_COL, TARGET_COL, TIME_COL, validate_panel
 __all__ = ["to_panel"]
 
 _AGGS = ("sum", "mean", "count")
+_DATE_UNITS = ("s", "ms", "us")
 
 
 def _bucket_to_period_label(dates: pd.Series, freq: str) -> pd.Series:
@@ -67,7 +68,10 @@ def to_panel(
     freq: str = "MS",
     agg: str = "sum",
     fill_value: float = 0.0,
+    span: str = "series",
     sep: str = "/",
+    date_unit: str | None = None,
+    date_format: str | None = None,
 ) -> pd.DataFrame:
     """Aggregate event-level records into a contract-clean ``(unique_id, ds, y)`` panel.
 
@@ -84,7 +88,12 @@ def to_panel(
     ----------
     records : one row per event/opportunity; duplicate dates are legal.
     id_cols : column name(s) identifying the series; joined by ``sep``.
-    date_col : event date column; parsed with ``pd.to_datetime``.
+    date_col : event date column; parsed with ``pd.to_datetime`` using
+        ``date_unit`` / ``date_format`` when given. Integer/float date
+        columns REQUIRE one of the two hints — bare ``pd.to_datetime``
+        reads ints as nanosecond epoch offsets, silently collapsing e.g.
+        Stripe epoch seconds or GA4 ``YYYYMMDD`` ints into 1970 — so
+        numeric dates without a hint raise :class:`DataContractError`.
     value_col : column to aggregate. When ``None`` the records are counted
         and ``agg`` is ignored.
     freq : pandas offset alias for the panel period (default monthly starts).
@@ -94,7 +103,24 @@ def to_panel(
         ``"mean"`` skip them). Row counting regardless of value is
         ``value_col=None``.
     fill_value : value for interior periods with no records (default 0.0).
+        ``NaN`` marks the gaps as missing instead of inventing zeros; the
+        panel then validates with ``allow_missing=True`` and downstream
+        consumers must impute (e.g. ``preprocessing``) before models that
+        reject missing targets.
+    span : ``"series"`` (default) fills each series over its own first-to-last
+        period; ``"panel"`` aligns every series to the global period range —
+        required for hierarchies (``reconciled``) where children must share an
+        aligned ``ds`` index, and correct for additive metrics (a rep who had
+        not started yet booked 0.0).
     sep : separator joining ``id_cols`` into ``unique_id``.
+    date_unit : epoch unit of numeric timestamps — ``"s"`` (Stripe
+        ``created``, Mixpanel ``time``), ``"ms"``, or ``"us"`` (GA4
+        ``event_timestamp``). Parsed via ``pd.to_datetime(..., unit=...)``;
+        digit strings (e.g. a CSV read with ``dtype=str``) are coerced
+        numeric first. Mutually exclusive with ``date_format``.
+    date_format : strftime format for formatted dates, e.g. ``"%Y%m%d"``
+        for GA4 ``event_date``. Numeric input is coerced int -> str before
+        parsing so ``20260115`` and ``20260115.0`` both read as 2026-01-15.
 
     Returns
     -------
@@ -107,6 +133,12 @@ def to_panel(
         )
     if agg not in _AGGS:
         raise ValueError(f"unknown agg {agg!r}; expected one of {_AGGS}")
+    if span not in ("series", "panel"):
+        raise ValueError(f"unknown span {span!r}; expected 'series' or 'panel'")
+    if date_unit is not None and date_format is not None:
+        raise ValueError("pass date_unit or date_format, not both")
+    if date_unit is not None and date_unit not in _DATE_UNITS:
+        raise ValueError(f"unknown date_unit {date_unit!r}; expected one of {_DATE_UNITS}")
     if isinstance(id_cols, str):
         id_cols = [id_cols]
     id_cols = list(id_cols)
@@ -117,8 +149,25 @@ def to_panel(
     if len(records) == 0:
         raise DataContractError("records frame is empty")
 
+    raw = records[date_col]
+    numeric_dates = pd.api.types.is_integer_dtype(raw) or pd.api.types.is_float_dtype(raw)
+    if numeric_dates and date_unit is None and date_format is None:
+        raise DataContractError(
+            f"column {date_col!r} has numeric dtype {raw.dtype}: integer/float dates "
+            "are ambiguous (epoch seconds? milliseconds? YYYYMMDD?) and would be read "
+            "as nanosecond offsets from 1970. Pass date_unit='s'|'ms'|'us' for epoch "
+            "timestamps or date_format (e.g. '%Y%m%d') for formatted numeric dates"
+        )
     try:
-        dates = pd.to_datetime(records[date_col])
+        if date_unit is not None:
+            # to_numeric first so digit strings (CSV dtype=str) also parse
+            dates = pd.to_datetime(pd.to_numeric(raw), unit=date_unit)
+        elif date_format is not None:
+            if numeric_dates:  # 20260115 / 20260115.0 -> "20260115" (NaN-safe)
+                raw = raw.astype("Int64").astype("string")
+            dates = pd.to_datetime(raw, format=date_format)
+        else:
+            dates = pd.to_datetime(raw)
     except (ValueError, TypeError) as exc:
         raise DataContractError(
             f"column {date_col!r} contains unparseable dates: {exc}"
@@ -141,11 +190,21 @@ def to_panel(
     y = y.astype(float).rename(TARGET_COL)
 
     frames = []
+    panel_range = None
+    if span == "panel":
+        all_ds = y.index.get_level_values(TIME_COL)
+        panel_range = pd.date_range(all_ds.min(), all_ds.max(), freq=freq)
     for series_id, g in y.groupby(level=0):
         counts = g.droplevel(0)
-        full = pd.date_range(counts.index.min(), counts.index.max(), freq=freq)
+        if panel_range is not None:
+            full = panel_range
+        else:
+            full = pd.date_range(counts.index.min(), counts.index.max(), freq=freq)
         counts = counts.reindex(full, fill_value=fill_value)
         frames.append(
             pd.DataFrame({ID_COL: series_id, TIME_COL: counts.index, TARGET_COL: counts.values})
         )
-    return validate_panel(pd.concat(frames, ignore_index=True))
+    # a NaN fill deliberately marks gap periods as missing-for-imputation
+    return validate_panel(
+        pd.concat(frames, ignore_index=True), allow_missing=bool(pd.isna(fill_value))
+    )

@@ -544,6 +544,145 @@ def test_short_output_alias_o(mc, tmp_path, panel_csv):
     assert len(pd.read_csv(sim_path)) == 5
 
 
+# -- schema mappings (--mapping / mappings subcommand) -------------------------
+
+
+@pytest.fixture
+def hubspot_csv(tmp_path):
+    """HubSpot-style deal export: one closed-won deal per month for 10 months.
+
+    The last month has a second closed-won deal (25) on the same date, and
+    February has a closed-lost deal that the recipe's filter must drop.
+    """
+    months = pd.date_range("2025-01-01", periods=10, freq="MS")
+    rows = [
+        {
+            "closedate": (m + pd.Timedelta(days=4)).strftime("%Y-%m-%d"),
+            "amount": 100.0,
+            "dealstage": "closedwon",
+            "hubspot_owner_id": "42",
+        }
+        for m in months
+    ]
+    rows.append(
+        {
+            "closedate": (months[-1] + pd.Timedelta(days=4)).strftime("%Y-%m-%d"),
+            "amount": 25.0,
+            "dealstage": "closedwon",
+            "hubspot_owner_id": "7",
+        }
+    )
+    rows.append(
+        {
+            "closedate": "2025-02-20",
+            "amount": 999.0,
+            "dealstage": "closedlost",
+            "hubspot_owner_id": "42",
+        }
+    )
+    path = tmp_path / "hubspot.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def test_forecast_with_mapping_hubspot_deals(tmp_path, hubspot_csv):
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(hubspot_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--mapping", "hubspot_deals", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    out = pd.read_csv(out_path)
+    assert len(out) == 2
+    assert set(out["unique_id"]) == {"hubspot_deals"}
+    # last training month sums both closed-won deals (100 + 25); closedlost
+    # never reaches the panel
+    assert (out["_test_cli_naive"] == 125.0).all()
+    # monthly grid continues after the last training month
+    assert out["ds"].min() == "2025-11-01"
+
+
+def test_forecast_mapping_freq_override_takes_effect(tmp_path, hubspot_csv):
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(hubspot_csv), "--h", "1", "--model", "_test_cli_mean",
+            "--mapping", "hubspot_deals", "--freq", "D", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    out = pd.read_csv(out_path)
+    # daily grid from the first to the last close date, zeros between deals;
+    # the monthly default would predict (9 * 100 + 125) / 10 = 102.5 instead
+    n_days = len(pd.date_range("2025-01-05", "2025-10-05", freq="D"))
+    expected = (9 * 100.0 + 125.0) / n_days
+    assert out["_test_cli_mean"].to_numpy() == pytest.approx(expected)
+    assert out["ds"].min() == "2025-10-06"
+
+
+def test_compare_with_mapping(tmp_path, hubspot_csv):
+    out_path = tmp_path / "board.csv"
+    rc = main(
+        [
+            "compare", str(hubspot_csv), "--h", "2", "--n-windows", "2",
+            "--models", "_test_cli_naive,_test_cli_mean",
+            "--mapping", "hubspot_deals", "-o", str(out_path),
+        ]
+    )
+    assert rc == 0
+    board = pd.read_csv(out_path)
+    assert sorted(board["model"]) == ["_test_cli_mean", "_test_cli_naive"]
+    assert {"mae", "rmse", "smape"} <= set(board.columns)
+
+
+def test_mappings_subcommand_lists_recipes(capsys):
+    assert main(["mappings"]) == 0
+    out = capsys.readouterr().out
+    assert "name" in out and "description" in out
+    for name in ("salesforce_opportunities", "hubspot_deals", "stripe_invoices",
+                 "posthog_events", "generic_events"):
+        assert name in out
+
+
+def test_mapping_conflicts_with_manual_panel_options(hubspot_csv, capsys):
+    rc = main(
+        [
+            "forecast", str(hubspot_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--mapping", "hubspot_deals", "--id-col", "hubspot_owner_id",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "--mapping" in err and "--id-col" in err
+
+    rc = main(
+        [
+            "compare", str(hubspot_csv), "--h", "2", "--models", "_test_cli_naive",
+            "--mapping", "hubspot_deals", "--agg", "sum",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "--mapping" in err and "--agg" in err
+
+
+def test_forecast_unknown_mapping_returns_2(hubspot_csv, capsys):
+    rc = main(
+        [
+            "forecast", str(hubspot_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--mapping", "not_a_mapping",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "unknown mapping" in err
+
+
 def test_simulate_writes_csv(mc, tmp_path):
     out_path = tmp_path / "sim.csv"
     rc = main(

@@ -239,6 +239,188 @@ class TestCountSkipnaSemantics:
         assert list(alice[TARGET_COL]) == [100.0, 0.0, 50.0]
 
 
+class TestNumericDateHints:
+    """Regression: numeric date columns must never silently parse as 1970.
+
+    ``pd.to_datetime`` reads bare ints as NANOSECOND offsets from the epoch,
+    so Stripe/Mixpanel epoch-second exports and GA4 ``YYYYMMDD`` ints all
+    collapsed into 1970-01-01 buckets. ``date_unit`` / ``date_format`` are
+    the explicit hints; with neither, integer/float date columns now raise.
+    """
+
+    @staticmethod
+    def _epoch(day: str) -> int:
+        # naive pd.Timestamp.timestamp() treats the wall time as UTC, matching
+        # the naive datetimes produced by pd.to_datetime(..., unit=...)
+        return int(pd.Timestamp(day).timestamp())
+
+    def _stripe_like(self, scale: int = 1) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "rep": ["a", "a", "a"],
+                "created": [
+                    self._epoch("2026-01-15") * scale,
+                    self._epoch("2026-02-10") * scale,
+                    self._epoch("2026-03-05") * scale,
+                ],
+                "amount": [10.0, 20.0, 30.0],
+            }
+        )
+
+    def test_epoch_seconds_bucket_into_2026_months(self):
+        panel = to_panel(
+            self._stripe_like(),
+            id_cols="rep",
+            date_col="created",
+            value_col="amount",
+            date_unit="s",
+        )
+        assert list(panel[TIME_COL]) == [
+            pd.Timestamp("2026-01-01"),
+            pd.Timestamp("2026-02-01"),
+            pd.Timestamp("2026-03-01"),
+        ]
+        assert list(panel[TARGET_COL]) == [10.0, 20.0, 30.0]
+
+    def test_epoch_milliseconds(self):
+        panel = to_panel(
+            self._stripe_like(scale=1000),
+            id_cols="rep",
+            date_col="created",
+            value_col="amount",
+            date_unit="ms",
+        )
+        assert list(panel[TIME_COL]) == [
+            pd.Timestamp("2026-01-01"),
+            pd.Timestamp("2026-02-01"),
+            pd.Timestamp("2026-03-01"),
+        ]
+
+    def test_epoch_seconds_as_digit_strings_still_parse(self):
+        # a CSV read with dtype=str delivers epoch seconds as digit strings
+        records = self._stripe_like()
+        records["created"] = records["created"].astype(str)
+        panel = to_panel(
+            records, id_cols="rep", date_col="created", value_col="amount", date_unit="s"
+        )
+        assert panel[TIME_COL].min() == pd.Timestamp("2026-01-01")
+        assert panel[TIME_COL].max() == pd.Timestamp("2026-03-01")
+
+    @pytest.mark.parametrize("cast", [int, float, str])
+    def test_date_format_yyyymmdd_across_dtypes(self, cast):
+        # GA4 event_date arrives as int (read_csv), float (numeric-text
+        # cleaning), or str (dtype=str) — all must land on 2026-01-15
+        records = pd.DataFrame(
+            {
+                "rep": ["a", "a"],
+                "event_date": [cast(20260115), cast(20260116)],
+                "v": [1.0, 2.0],
+            }
+        )
+        panel = to_panel(
+            records,
+            id_cols="rep",
+            date_col="event_date",
+            value_col="v",
+            freq="D",
+            date_format="%Y%m%d",
+        )
+        assert list(panel[TIME_COL]) == [
+            pd.Timestamp("2026-01-15"),
+            pd.Timestamp("2026-01-16"),
+        ]
+        assert list(panel[TARGET_COL]) == [1.0, 2.0]
+
+    def test_bare_integer_dates_without_hint_raise(self):
+        records = self._stripe_like()
+        with pytest.raises(DataContractError, match="date_unit"):
+            to_panel(records, id_cols="rep", date_col="created", value_col="amount")
+
+    def test_bare_float_dates_without_hint_raise(self):
+        records = self._stripe_like()
+        records["created"] = records["created"].astype(float)
+        with pytest.raises(DataContractError, match="date_format"):
+            to_panel(records, id_cols="rep", date_col="created", value_col="amount")
+
+    def test_string_dates_unaffected_by_guard(self):
+        panel = to_panel(_sfdc_export(), id_cols="rep", date_col="close_date")
+        assert panel[TIME_COL].min() == pd.Timestamp("2024-01-01")
+
+    def test_both_hints_raise(self):
+        with pytest.raises(ValueError, match="not both"):
+            to_panel(
+                self._stripe_like(),
+                id_cols="rep",
+                date_col="created",
+                value_col="amount",
+                date_unit="s",
+                date_format="%Y%m%d",
+            )
+
+    def test_unknown_date_unit_raises(self):
+        with pytest.raises(ValueError, match="date_unit"):
+            to_panel(
+                self._stripe_like(),
+                id_cols="rep",
+                date_col="created",
+                value_col="amount",
+                date_unit="fortnights",
+            )
+
+    def test_date_unit_on_unconvertible_strings_raises_contract_error(self):
+        records = self._stripe_like()
+        records["created"] = ["2026-01-15", "2026-02-10", "2026-03-05"]
+        with pytest.raises(DataContractError, match="unparseable"):
+            to_panel(
+                records, id_cols="rep", date_col="created", value_col="amount", date_unit="s"
+            )
+
+
+class TestNaNFillValue:
+    """Regression: fill_value=NaN must not trip validate_panel's NaN check.
+
+    to_panel now validates with ``allow_missing=True`` when the fill value
+    is NaN — the gaps are deliberately marked missing for downstream
+    imputation instead of being invented as zeros.
+    """
+
+    def _ragged(self):
+        return pd.DataFrame(
+            {
+                "rep": ["a"] * 2 + ["b"] * 2,
+                "d": ["2026-01-05", "2026-03-10", "2026-03-02", "2026-05-20"],
+                "amt": [1.0, 2.0, 3.0, 4.0],
+            }
+        )
+
+    def test_span_panel_nan_fill_round_trips(self):
+        panel = to_panel(
+            self._ragged(),
+            id_cols=["rep"],
+            date_col="d",
+            value_col="amt",
+            span="panel",
+            fill_value=np.nan,
+        )
+        # b had not started in January: marked missing, not invented
+        b_jan = panel[(panel[ID_COL] == "b") & (panel[TIME_COL] == "2026-01-01")]
+        assert b_jan[TARGET_COL].isna().all() and len(b_jan) == 1
+        # round-trips through the contract with allow_missing
+        pd.testing.assert_frame_equal(panel, validate_panel(panel, allow_missing=True))
+
+    def test_series_span_nan_fill_for_interior_gaps(self):
+        panel = to_panel(
+            self._ragged(), id_cols=["rep"], date_col="d", value_col="amt", fill_value=np.nan
+        )
+        a = panel[panel[ID_COL] == "a"]
+        assert a[TARGET_COL].isna().tolist() == [False, True, False]
+
+    def test_default_zero_fill_still_validates_strictly(self):
+        panel = to_panel(self._ragged(), id_cols=["rep"], date_col="d", value_col="amt")
+        assert not panel[TARGET_COL].isna().any()
+        pd.testing.assert_frame_equal(panel, validate_panel(panel))
+
+
 class TestToPanelValidation:
     def test_missing_id_col_raises(self):
         with pytest.raises(DataContractError, match="missing"):
@@ -277,3 +459,27 @@ class TestToPanelValidation:
     def test_non_dataframe_raises(self):
         with pytest.raises(DataContractError, match="DataFrame"):
             to_panel([1, 2, 3], id_cols="rep", date_col="close_date")
+
+
+def test_span_panel_aligns_ragged_series_for_hierarchies():
+    """span='panel' aligns every series to the global range (0-filled)."""
+    recs = pd.DataFrame(
+        {
+            "rep": ["a"] * 2 + ["b"] * 2,
+            "d": ["2026-01-05", "2026-03-10", "2026-03-02", "2026-05-20"],
+            "amt": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    default = to_panel(recs, id_cols=["rep"], date_col="d", value_col="amt")
+    assert default.groupby("unique_id")["ds"].min().nunique() == 2  # ragged
+
+    aligned = to_panel(recs, id_cols=["rep"], date_col="d", value_col="amt", span="panel")
+    spans = aligned.groupby("unique_id")["ds"].agg(["min", "max", "size"])
+    assert spans["min"].nunique() == 1 and spans["max"].nunique() == 1
+    assert (spans["size"] == 5).all()  # Jan..May for both series
+    assert aligned.loc[
+        (aligned["unique_id"] == "b") & (aligned["ds"] == "2026-01-01"), "y"
+    ].item() == 0.0
+
+    with pytest.raises(ValueError, match="span"):
+        to_panel(recs, id_cols=["rep"], date_col="d", value_col="amt", span="global")

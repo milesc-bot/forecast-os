@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0 (2026-07-24)
+
+The data plane: plug your pipeline in.
+
+- **Connectors** (`forecast_os.connectors`, extra `[connectors]`): a `Source`
+  + `SchemaMapping` contract with registered recipes for Salesforce,
+  HubSpot, Pipedrive, Stripe, PostHog, GA4, Mixpanel, and Amplitude export
+  shapes; `CSVSource`/`ParquetSource` with conservative currency cleaning;
+  `RestSource` with cursor/offset/page/next-link pagination plus thin
+  `HubSpotSource`, `PostHogSource`, `StripeSource`, `SalesforceSource`
+  clients; `SQLSource` for any warehouse pandas can read (bring your own
+  driver: DuckDB, Snowflake, BigQuery, Postgres).
+- **MCP server** (`forecast-os-mcp`, extra `[mcp]`): exposes the engine to
+  any MCP client (Claude Desktop/Code, agents) — preview panels, forecast,
+  compare, and quota-attainment tools over CSV paths or inline records.
+- **CLI**: `--mapping hubspot_deals` applies a platform recipe directly;
+  new `mappings` subcommand lists available recipes.
+
 ## 0.3.0 (2026-07-24)
 
 The GTM wave: driver-based forecasting, coherent hierarchies, and a

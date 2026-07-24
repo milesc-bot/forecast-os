@@ -96,8 +96,9 @@ def aggregate_panel(df: pd.DataFrame, sep: str = "/", total_id="total") -> pd.Da
     for leaf in leaves[1:]:
         if not np.array_equal(groups[leaf][TIME_COL].to_numpy(), ref_ds):
             raise DataContractError(
-                f"series under a common parent must share an aligned 'ds' index; "
-                f"{leaves[0]!r} and {leaf!r} differ"
+                f"series under a common parent must share an aligned 'ds' index "
+                f"(re-bucket with gtm.to_panel(span='panel') or "
+                f"preprocessing.fill_gaps); {leaves[0]!r} and {leaf!r} differ"
             )
     values = S @ np.vstack([groups[leaf][TARGET_COL].to_numpy(dtype=float) for leaf in leaves])
     out = pd.concat(
