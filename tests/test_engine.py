@@ -160,6 +160,78 @@ def test_compare_default_metrics_one_row_per_model():
     assert sorted(board.index) == ["_ConstA", "_ConstB"]
 
 
+# -- ForecastEngine.compare with interval metrics --------------------------------
+
+
+class _WideIntervals(PerSeriesForecaster):
+    """Mean forecaster with huge intervals: empirical coverage ~1.0."""
+
+    def _fit_series(self, y):
+        return {"mean": float(np.mean(y))}
+
+    def _predict_series(self, state, h):
+        return np.full(h, state["mean"])
+
+    def _predict_sigma(self, state, h):
+        return np.full(h, 1000.0)
+
+
+class _NarrowMissIntervals(PerSeriesForecaster):
+    """Biased forecaster with near-zero-width intervals: coverage ~0.0."""
+
+    def _fit_series(self, y):
+        return {"mean": float(np.mean(y))}
+
+    def _predict_series(self, state, h):
+        return np.full(h, state["mean"] + 10.0)
+
+    def _predict_sigma(self, state, h):
+        return np.full(h, 1e-9)
+
+
+def test_compare_level_board_has_coverage_and_sorts_by_mase():
+    df = _make_panel(length=40)
+    board = ForecastEngine().compare(
+        df, h=4, n_windows=2, metrics=("mase", "coverage"),
+        models=[_ConstB(), _ConstA()], level=[80],
+    )
+    assert list(board.columns) == ["mase", "coverage-80"]
+    # first metric is mase (not coverage), so plain ascending sort applies
+    assert board["mase"].is_monotonic_increasing
+    assert list(board.index) == ["_ConstA", "_ConstB"]
+    assert board["coverage-80"].between(0.0, 1.0).all()
+
+
+def test_compare_coverage_first_sorting_closest_to_nominal_wins():
+    df = _make_panel(length=40)
+    board = ForecastEngine().compare(
+        df, h=4, n_windows=2, metrics=("coverage",),
+        models=[_NarrowMissIntervals(), _WideIntervals()], level=[80],
+    )
+    # wide covers everything (|1.0 - 0.8| = 0.2) and beats narrow-missing
+    # (|0.0 - 0.8| = 0.8) even though a plain ascending sort would flip them
+    assert list(board.index) == ["_WideIntervals", "_NarrowMissIntervals"]
+    assert board.loc["_WideIntervals", "coverage-80"] == pytest.approx(1.0)
+    assert board.loc["_NarrowMissIntervals", "coverage-80"] == pytest.approx(0.0)
+
+
+def test_compare_interval_metric_without_level_raises():
+    df = _make_panel(length=40)
+    with pytest.raises(ValueError, match=r"level=\["):
+        ForecastEngine().compare(
+            df, h=4, n_windows=2, metrics=("coverage",), models=[_ConstA()]
+        )
+
+
+def test_compare_uses_constructor_level_by_default():
+    df = _make_panel(length=40)
+    engine = ForecastEngine(level=[90])
+    board = engine.compare(
+        df, h=4, n_windows=2, metrics=("mae", "coverage"), models=[_ConstA()]
+    )
+    assert list(board.columns) == ["mae", "coverage-90"]
+
+
 # -- adapters --------------------------------------------------------------------
 
 

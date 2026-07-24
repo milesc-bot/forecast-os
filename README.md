@@ -44,7 +44,8 @@ model for any other without changing a line of surrounding code.
   recursions where the theory provides them (ARIMA ψ-weights, Kalman covariance
   propagation, ETS), plus distribution-free split-conformal calibration for any model.
 - **Evaluation built in** — walk-forward cross-validation and a leaderboard in two
-  calls; scaled metrics (MASE, RMSSE) done correctly.
+  calls; scaled metrics (MASE, RMSSE) done correctly, and interval quality
+  (coverage, Winkler, pinball, CRPS) scored through the same pipeline.
 - **Finance is first-class** — GARCH volatility forecasts, GBM scenario simulation,
   bull/bear regime detection, and a strategy backtester that scores any forecaster with
   Sharpe / Sortino / max drawdown / hit rate.
@@ -130,10 +131,11 @@ model.predict(h=12, level=[80, 95])
 # AirPassengers 1961-01-01  447.2  432.7  461.7  425.1  469.4
 # ...
 
-# 2. Compare models with walk-forward cross-validation
+# 2. Compare models with walk-forward cross-validation — point AND interval quality
 engine = fos.ForecastEngine(models=["seasonal_naive", "theta", "auto_ets", "auto_arima"])
-leaderboard = engine.compare(df, h=12, n_windows=3, metrics=["mase", "smape"], seasonality=12)
-print(leaderboard)          # models ranked by MASE
+leaderboard = engine.compare(df, h=12, n_windows=3, seasonality=12,
+                             metrics=["mase", "coverage"], level=[80])
+print(leaderboard)          # ranked by MASE, with each model's 80% coverage
 
 # 3. Calibrated intervals for ANY model via conformal prediction
 conf = fos.ConformalForecaster(model=fos.get_model("theta", season_length=12))
@@ -163,10 +165,15 @@ regimes.smoothed_probs_                    # bull/bear probabilities per day
 ```python
 from forecast_os.finance import StrategyBacktester
 
-bt = StrategyBacktester(fos.get_model("ridge_lag", lags=10), cost_bps=1.0)
-result = bt.run(returns_panel, test_size=250)   # walk-forward, refit each step
-print(result.summary)                            # sharpe, sortino, max_drawdown, hit_rate...
+bt = StrategyBacktester(fos.get_model("ridge_lag", lags=10), cost_bps=1.0,
+                        sizing="proportional")   # exposure scaled by forecast confidence
+result = bt.run(returns_panel, test_size=250)    # walk-forward, refit each step
+print(result.summary)   # sharpe, sortino, max_drawdown, VaR/CVaR, calmar, hit_rate...
 ```
+
+Sizing rules: `"binary"` (long/flat), `"proportional"` (position =
+`P(r > 0)`-scaled, from the model's prediction intervals), `"kelly"`
+(fractional Kelly, capped at `max_leverage`).
 
 ## CLI
 

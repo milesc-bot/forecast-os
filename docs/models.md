@@ -67,7 +67,11 @@ extensions.
 - `ensemble` — mean / median / weighted combination; combining diverse models is the
   most reliable accuracy win in forecasting practice.
 - `auto_select` — cross-validates candidate models and picks the best **per series**
-  (different series often want different models).
+  (different series often want different models). Seasonality-aware: by default
+  (`season_length="auto"`) it infers the season from the data frequency
+  (daily→7, business-daily→5, monthly→12, quarterly→4, hourly→24) and fields
+  seasonal candidates (seasonal naive, seasonal Theta/AutoETS); selection uses
+  MASE with train-only scaling (scale-free and safe on zero-crossing series).
 - `conformal` — wraps any model with split-conformal calibration for intervals with
   distribution-free coverage.
 
@@ -80,5 +84,10 @@ extensions.
   observed returns (`from_returns`).
 - `MarkovRegimeSwitching` — 2-state Gaussian hidden Markov model fitted by EM;
   produces smoothed bull/bear probabilities and regime-conditional expectations.
-- `StrategyBacktester` — walk-forward one-step forecasts → long/flat positions →
-  Sharpe / Sortino / max drawdown / hit rate, with transaction costs.
+- `StrategyBacktester` — walk-forward one-step forecasts → positions → a full
+  risk report (Sharpe / Sortino / max drawdown / hit rate / annualized vol /
+  Calmar / historic VaR & CVaR), with transaction costs. Three sizing rules:
+  `"binary"` (long/flat on the forecast sign), `"proportional"`
+  (exposure scaled by `P(r > threshold)` under the forecast distribution —
+  uses the model's prediction intervals), and `"kelly"` (fractional Kelly
+  `f·ŷ/σ²`, capped at `max_leverage`).

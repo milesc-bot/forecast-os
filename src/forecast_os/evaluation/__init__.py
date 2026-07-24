@@ -11,6 +11,7 @@ from .metrics import (
     rmse,
     rmsse,
     smape,
+    winkler_score,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "rmsse",
     "pinball_loss",
     "coverage",
+    "winkler_score",
 ]

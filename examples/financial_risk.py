@@ -45,3 +45,10 @@ print("\n=== Strategy backtest: ridge forecaster, long/flat, 1bp costs ===")
 bt = StrategyBacktester(fos.get_model("ridge_lag", lags=5), cost_bps=1.0)
 result = bt.run(panel, test_size=120)
 print(result.summary.round(3).to_string(index=False))
+
+print("\n=== Same forecaster, uncertainty-aware sizing (proportional) ===")
+bt_prop = StrategyBacktester(
+    fos.get_model("ridge_lag", lags=5), cost_bps=1.0, sizing="proportional", level=80
+)
+result_prop = bt_prop.run(panel, test_size=120)
+print(result_prop.summary.round(3).to_string(index=False))

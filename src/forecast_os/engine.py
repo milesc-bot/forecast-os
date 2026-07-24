@@ -114,18 +114,43 @@ class ForecastEngine:
         metrics: Sequence[str] = ("mae", "rmse", "smape"),
         seasonality: int = 1,
         models: Sequence[BaseForecaster | str] | None = None,
+        level: list[int] | None = None,
     ) -> pd.DataFrame:
         """Cross-validate and rank models on ``metrics`` (mean over series).
 
         Returns a leaderboard indexed by model name with one column per
-        metric, sorted ascending by the first metric (best model first).
+        metric (best model first). Interval metrics (``coverage``,
+        ``winkler``, ``pinball``, ``crps``) require ``level`` (falling back
+        to the constructor default) and appear under their emitted per-level
+        names, e.g. a ``coverage-80`` column for ``level=[80]``.
+
+        Sorting: the board is ordered by the first metric's first emitted
+        column. If that metric is ``coverage``, models sort by
+        ``|value - level/100|`` ascending (closest to nominal coverage wins);
+        otherwise plain ascending (lower is better).
         """
         df = validate_panel(df)
         metrics = list(metrics)
-        cv = cross_validation(df, self._resolve(models), h, n_windows=n_windows)
+        level = self.level if level is None else level
+        cv = cross_validation(df, self._resolve(models), h, n_windows=n_windows, level=level)
         scores = evaluate(cv, metrics=metrics, train_df=df, seasonality=seasonality)
+        # map each requested metric to its emitted column(s), e.g.
+        # "coverage" -> ["coverage-80", "coverage-95"]; point metrics map to themselves
+        emitted = list(dict.fromkeys(scores["metric"]))
+        columns: list[str] = []
+        for name in metrics:
+            per_level = [
+                e for e in emitted if e.startswith(f"{name}-") and e[len(name) + 1 :].isdigit()
+            ]
+            columns += sorted(per_level, key=lambda e: int(e.rsplit("-", 1)[1])) or [name]
         board = scores.drop(columns=ID_COL).groupby("metric").mean().T
-        board = board[metrics].sort_values(metrics[0])
+        board = board[columns]
+        first = columns[0]
+        if metrics[0] == "coverage":
+            nominal = int(first.rsplit("-", 1)[1]) / 100.0
+            board = board.reindex((board[first] - nominal).abs().sort_values().index)
+        else:
+            board = board.sort_values(first)
         board.index.name = "model"
         board.columns.name = None
         return board

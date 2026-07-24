@@ -20,8 +20,13 @@ SUMMARY_COLS = [
     "hit_rate",
     "n_trades",
     "exposure",
+    "annualized_vol",
+    "calmar",
+    "var_95",
+    "cvar_95",
 ]
 FRAME_COLS = [ID_COL, "ds", "y", "yhat", "position", "strategy_return", "equity"]
+SIZED_FRAME_COLS = [ID_COL, "ds", "y", "yhat", "sigma", "position", "strategy_return", "equity"]
 
 
 class MeanForecaster(PerSeriesForecaster):
@@ -158,3 +163,206 @@ def test_params_stored_as_attributes():
     assert bt.model is model
     assert bt.threshold == 0.5
     assert bt.cost_bps == 10.0
+
+
+# ---------------------------------------------------------------------------
+# sizing rules (proportional / kelly) and the risk report
+# ---------------------------------------------------------------------------
+
+RISK_COLS = ["annualized_vol", "calmar", "var_95", "cvar_95"]
+
+
+class ScriptedForecaster(PerSeriesForecaster):
+    """Deterministic h=1 forecaster with fully controllable yhat and sigma.
+
+    Walk-forward window ``i`` trains on ``offset + i`` rows, so the step index
+    is recovered as ``len(y) - offset`` and used to look up ``yhats[i]`` /
+    ``sigmas[i]``.
+    """
+
+    def __init__(self, yhats, sigmas, offset):
+        self.yhats = yhats
+        self.sigmas = sigmas
+        self.offset = offset
+
+    def _fit_series(self, y):
+        return {"idx": len(y) - self.offset}
+
+    def _predict_series(self, state, h):
+        return np.full(h, self.yhats[state["idx"]])
+
+    def _predict_sigma(self, state, h):
+        return np.full(h, self.sigmas[state["idx"]])
+
+
+def scripted_run(yhats, sigmas, y_test=None, **bt_kwargs):
+    """Backtest a ScriptedForecaster over exactly ``len(yhats)`` test steps."""
+    k = len(yhats)
+    head = [0.001, -0.002, 0.003, -0.001, 0.002, -0.003, 0.001, -0.002]
+    y_test = [0.01] * k if y_test is None else list(y_test)
+    y = np.array(head + y_test)
+    model = ScriptedForecaster(tuple(yhats), tuple(sigmas), offset=len(head))
+    return StrategyBacktester(model, **bt_kwargs).run(to_panel(y), test_size=k, step_size=1)
+
+
+def test_binary_summary_gains_risk_columns_finite_and_ordered(drift_result):
+    """Existing binary fixture: new risk columns present, finite, cvar >= var >= 0."""
+    row = drift_result.summary.iloc[0]
+    for col in RISK_COLS:
+        assert np.isfinite(row[col]), col
+    assert row["var_95"] >= 0.0
+    assert row["cvar_95"] >= row["var_95"]
+
+
+def test_binary_risk_columns_match_metrics_functions(drift_result):
+    from forecast_os.finance.metrics import (
+        annualized_vol,
+        calmar_ratio,
+        conditional_var,
+        value_at_risk,
+    )
+
+    r = drift_result.frame["strategy_return"].to_numpy()
+    row = drift_result.summary.iloc[0]
+    assert np.isclose(row["annualized_vol"], annualized_vol(r))
+    assert np.isclose(row["calmar"], calmar_ratio(r))
+    assert np.isclose(row["var_95"], value_at_risk(r, level=0.95))
+    assert np.isclose(row["cvar_95"], conditional_var(r, level=0.95))
+
+
+def test_binary_frame_has_no_sigma_column(drift_result):
+    assert "sigma" not in drift_result.frame.columns
+
+
+@pytest.mark.parametrize(
+    "bad_kwargs",
+    [
+        {"sizing": "martingale"},
+        {"sizing": ""},
+        {"level": 0},
+        {"level": 100},
+        {"level": -5},
+        {"kelly_fraction": 0.0},
+        {"kelly_fraction": -0.5},
+        {"kelly_fraction": float("nan")},
+        {"max_leverage": 0.0},
+        {"max_leverage": -1.0},
+    ],
+)
+def test_init_rejects_bad_sizing_params(bad_kwargs):
+    with pytest.raises(ValueError):
+        StrategyBacktester(MeanForecaster(), **bad_kwargs)
+
+
+def test_sizing_params_stored_as_attributes():
+    bt = StrategyBacktester(
+        MeanForecaster(), sizing="kelly", level=90, kelly_fraction=0.25, max_leverage=2.0
+    )
+    assert bt.sizing == "kelly"
+    assert bt.level == 90
+    assert bt.kelly_fraction == 0.25
+    assert bt.max_leverage == 2.0
+
+
+def test_proportional_positions_bounded_and_monotone_in_yhat():
+    """For fixed sigma, proportional positions are in [0, 1] and monotone in yhat."""
+    from scipy import stats
+
+    yhats = (-0.05, -0.01, -0.002, 0.0, 0.002, 0.01, 0.05, 0.2)
+    sigmas = (0.01,) * len(yhats)
+    res = scripted_run(yhats, sigmas, sizing="proportional")
+
+    assert list(res.frame.columns) == SIZED_FRAME_COLS
+    pos = res.frame["position"].to_numpy()
+    assert np.all(pos >= 0.0) and np.all(pos <= 1.0)
+    assert np.all(np.diff(pos) >= 0.0)  # monotone nondecreasing in yhat
+    assert np.all(np.diff(pos[3:7]) > 0.0)  # strictly increasing off the clip bounds
+
+    p_up = stats.norm.sf((0.0 - np.asarray(yhats)) / 0.01)
+    expected = np.clip(2.0 * (p_up - 0.5), 0.0, 1.0)
+    np.testing.assert_allclose(pos, expected, atol=1e-10)
+    # sigma recovered from the (lo, hi) interval round-trips exactly
+    np.testing.assert_allclose(res.frame["sigma"].to_numpy(), sigmas, atol=1e-12)
+
+
+def test_kelly_interior_value_and_max_leverage_clip():
+    """Hand-computed kelly step: 0.5 * 0.004 / 0.1**2 = 0.2; big edges clip at max_leverage."""
+    yhats = (0.004, 0.05, -0.01, 0.008)
+    sigmas = (0.1, 0.05, 0.1, 0.2)
+    res = scripted_run(yhats, sigmas, sizing="kelly", kelly_fraction=0.5, max_leverage=1.5)
+    pos = res.frame["position"].to_numpy()
+    # interior: kelly_fraction * (yhat - threshold) / sigma**2
+    np.testing.assert_allclose(pos, [0.5 * 0.004 / 0.01, 1.5, 0.0, 0.5 * 0.008 / 0.04], atol=1e-10)
+    assert np.all(pos <= 1.5)
+
+
+@pytest.mark.parametrize("sizing", ["proportional", "kelly"])
+def test_zero_sigma_falls_back_to_binary(sizing):
+    yhats = (0.01, -0.01, 0.02, 0.005)
+    sigmas = (0.0, 0.0, 0.02, 0.0)
+    res = scripted_run(yhats, sigmas, sizing=sizing, kelly_fraction=0.5, max_leverage=1.0)
+    pos = res.frame["position"].to_numpy()
+    # steps 0, 1, 3 have sigma == 0 -> binary rule; step 2 is sized normally
+    assert pos[0] == 1.0
+    assert pos[1] == 0.0
+    assert pos[3] == 1.0
+    assert 0.0 < pos[2] <= 1.0
+
+
+def test_fractional_resize_cost_accounting_hand_computed():
+    """Position path 0 -> 0.4 -> 1.0 -> 0.0 charges cost_bps/1e4 * |dpos| each step."""
+    yhats = (0.008, 0.02, -0.01)
+    sigmas = (0.1, 0.1, 0.1)
+    y_test = [0.05, -0.02, 0.03]
+    res = scripted_run(
+        yhats,
+        sigmas,
+        y_test=y_test,
+        sizing="kelly",
+        kelly_fraction=0.5,
+        max_leverage=1.0,
+        cost_bps=100.0,
+    )
+    pos = res.frame["position"].to_numpy()
+    np.testing.assert_allclose(pos, [0.4, 1.0, 0.0], atol=1e-10)
+    # |dpos| = [0.4, 0.6, 1.0] at 100 bps -> per-step costs 0.004, 0.006, 0.010
+    expected = np.array([0.4 * 0.05 - 0.004, 1.0 * -0.02 - 0.006, 0.0 * 0.03 - 0.010])
+    np.testing.assert_allclose(res.frame["strategy_return"].to_numpy(), expected, atol=1e-10)
+    np.testing.assert_allclose(
+        res.frame["equity"].to_numpy(), np.cumprod(1.0 + expected), atol=1e-10
+    )
+    assert res.summary.iloc[0]["n_trades"] == 3
+
+
+class AR1Forecaster(PerSeriesForecaster):
+    """Least-squares AR(1) with residual-based default sigma."""
+
+    min_train_size = 3
+
+    def _fit_series(self, y):
+        y0, y1 = y[:-1], y[1:]
+        phi = float(np.dot(y0, y1) / np.dot(y0, y0))
+        fitted = np.concatenate([[np.nan], phi * y[:-1]])
+        return {"phi": phi, "last": float(y[-1]), "fitted": fitted}
+
+    def _predict_series(self, state, h):
+        return state["phi"] ** np.arange(1, h + 1) * state["last"]
+
+
+def test_proportional_on_predictable_ar_panel_partial_exposure():
+    """Strongly autocorrelated returns: proportional sizing is partially invested."""
+    rng = np.random.default_rng(7)
+    n = 300
+    y = np.zeros(n)
+    eps = 0.002 * rng.standard_normal(n)
+    for t in range(1, n):
+        y[t] = 0.9 * y[t - 1] + eps[t]
+    df = to_panel(y, unique_id="asset-0")
+
+    res = StrategyBacktester(AR1Forecaster(), sizing="proportional").run(df, test_size=60)
+    pos = res.frame["position"].to_numpy()
+    assert np.all(pos >= 0.0) and np.all(pos <= 1.0)
+    row = res.summary.iloc[0]
+    assert 0.0 < row["exposure"] < 1.0
+    assert np.isfinite(row["sharpe"])
+    assert np.isfinite(res.frame["sigma"]).all()

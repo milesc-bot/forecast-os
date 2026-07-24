@@ -5,8 +5,15 @@ Point metrics operate on aligned 1-D arrays. Percentage metrics (``mape``,
 bounded to [0, 2]. Scaled metrics (``mase``, ``rmsse``) additionally need the
 training series and a seasonality ``m`` (the M4/M5 convention).
 
+Interval metrics (:func:`coverage`, :func:`winkler_score`, pinball, CRPS)
+score ``lo``/``hi`` prediction-interval columns; lower is better everywhere
+except ``coverage``, which should sit close to its nominal ``level/100``.
+
 :func:`evaluate` scores a :func:`~forecast_os.evaluation.backtest.cross_validation`
-output frame per series and per model.
+output frame per series and per model. Interval metrics are requested through
+the same ``metrics`` list (``"coverage"``, ``"winkler"``, ``"pinball"``,
+``"crps"``) and discover each model's confidence levels from its
+``{model}-lo-{level}`` / ``{model}-hi-{level}`` sibling columns.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ __all__ = [
     "rmsse",
     "pinball_loss",
     "coverage",
+    "winkler_score",
     "evaluate",
 ]
 
@@ -112,6 +120,25 @@ def coverage(y, lo, hi) -> float:
     return float(np.mean((y >= lo) & (y <= hi)))
 
 
+def winkler_score(y, lo, hi, level: float) -> float:
+    """Mean Winkler (interval) score at confidence ``level`` (e.g. 80).
+
+    Each observation scores the interval width ``hi - lo`` plus, when the
+    actual falls outside ``[lo, hi]``, a penalty of ``2/a`` times the distance
+    to the violated bound, where ``a = 1 - level/100``. Lower is better;
+    narrow intervals that still cover win.
+    """
+    if not 0 < level < 100:
+        raise ValueError(f"level must be in (0, 100), got {level}")
+    y, lo = _align(y, lo)
+    _, hi = _align(y, hi)
+    a = 1.0 - level / 100.0
+    score = hi - lo
+    score = score + np.where(y < lo, (2.0 / a) * (lo - y), 0.0)
+    score = score + np.where(y > hi, (2.0 / a) * (y - hi), 0.0)
+    return float(np.mean(score))
+
+
 _SIMPLE_METRICS: dict[str, Callable] = {
     "mae": mae,
     "rmse": rmse,
@@ -119,6 +146,7 @@ _SIMPLE_METRICS: dict[str, Callable] = {
     "smape": smape,
 }
 _SCALED_METRICS: dict[str, Callable] = {"mase": mase, "rmsse": rmsse}
+_INTERVAL_METRICS = ("coverage", "winkler", "pinball", "crps")
 
 _META_COLS = {ID_COL, TIME_COL, TARGET_COL, "cutoff"}
 
@@ -129,6 +157,49 @@ def _model_columns(cv_df: pd.DataFrame) -> list[str]:
         for c in cv_df.columns
         if c not in _META_COLS and "-lo-" not in c and "-hi-" not in c
     ]
+
+
+def _interval_levels(columns: Iterable[str], model: str) -> list[int]:
+    """Levels implied by ``{model}-lo-{l}`` / ``{model}-hi-{l}`` column pairs."""
+    columns = set(columns)
+    prefix = f"{model}-lo-"
+    levels = set()
+    for c in columns:
+        if c.startswith(prefix):
+            suffix = c[len(prefix) :]
+            if suffix.isdigit() and f"{model}-hi-{suffix}" in columns:
+                levels.add(int(suffix))
+    return sorted(levels)
+
+
+def _score_interval(g: pd.DataFrame, col: str, lvl: int, metric: str) -> float:
+    """One interval-metric value for model ``col`` at level ``lvl`` on group ``g``."""
+    lo_col, hi_col = f"{col}-lo-{lvl}", f"{col}-hi-{lvl}"
+    valid = g[[TARGET_COL, col, lo_col, hi_col]].dropna(subset=[TARGET_COL, col])
+    if len(valid) == 0:
+        return float("nan")
+    y, lo, hi = valid[TARGET_COL], valid[lo_col], valid[hi_col]
+    if metric == "coverage":
+        return coverage(y, lo, hi)
+    if metric == "winkler":
+        return winkler_score(y, lo, hi, lvl)
+    # pinball: mean of the losses at the two implied tail quantiles
+    q_lo, q_hi = 0.5 - lvl / 200.0, 0.5 + lvl / 200.0
+    return 0.5 * (pinball_loss(y, lo, q_lo) + pinball_loss(y, hi, q_hi))
+
+
+def _score_crps(g: pd.DataFrame, col: str, levels: list[int]) -> float:
+    """Quantile-approximated CRPS: mean of 2x pinball over all implied quantiles."""
+    interval_cols = [f"{col}-{side}-{lvl}" for lvl in levels for side in ("lo", "hi")]
+    valid = g[[TARGET_COL, col, *interval_cols]].dropna(subset=[TARGET_COL, col])
+    if len(valid) == 0:
+        return float("nan")
+    y = valid[TARGET_COL]
+    terms = []
+    for lvl in levels:
+        terms.append(2.0 * pinball_loss(y, valid[f"{col}-lo-{lvl}"], 0.5 - lvl / 200.0))
+        terms.append(2.0 * pinball_loss(y, valid[f"{col}-hi-{lvl}"], 0.5 + lvl / 200.0))
+    return float(np.mean(terms))
 
 
 def evaluate(
@@ -142,6 +213,15 @@ def evaluate(
     ``cv_df`` must have columns ``unique_id, ds, cutoff, y`` plus one column
     per model. Scaled metrics (mase/rmsse) require ``train_df`` (the panel the
     models were cross-validated on) for the naive scaling term.
+
+    Interval metrics — ``coverage``, ``winkler``, ``pinball``, ``crps`` — read
+    each model's ``{model}-lo-{level}`` / ``{model}-hi-{level}`` columns (as
+    produced by ``cross_validation(..., level=[...])``). The first three emit
+    one row per discovered level, named ``coverage-{l}`` / ``winkler-{l}`` /
+    ``pinball-{l}``; ``pinball-{l}`` is the mean pinball loss at the two
+    implied tail quantiles ``0.5 -/+ l/200``. ``crps`` emits a single row with
+    the quantile-approximated CRPS: the mean over all implied quantiles (both
+    tails of every level) of twice the pinball loss.
     """
     for col in (ID_COL, TARGET_COL):
         if col not in cv_df.columns:
@@ -151,11 +231,27 @@ def evaluate(
         raise ValueError("cv_df has no model forecast columns")
     metrics = list(metrics)
     for name in metrics:
-        if name not in _SIMPLE_METRICS and name not in _SCALED_METRICS:
-            known = sorted(_SIMPLE_METRICS) + sorted(_SCALED_METRICS)
+        if (
+            name not in _SIMPLE_METRICS
+            and name not in _SCALED_METRICS
+            and name not in _INTERVAL_METRICS
+        ):
+            known = sorted(_SIMPLE_METRICS) + sorted(_SCALED_METRICS) + sorted(_INTERVAL_METRICS)
             raise ValueError(f"unknown metric {name!r}; known: {known}")
         if name in _SCALED_METRICS and train_df is None:
             raise ValueError(f"metric {name!r} requires train_df")
+
+    levels_by_model = {col: _interval_levels(cv_df.columns, col) for col in model_cols}
+    interval_requested = [m for m in metrics if m in _INTERVAL_METRICS]
+    if interval_requested:
+        missing = [col for col in model_cols if not levels_by_model[col]]
+        if missing:
+            raise ValueError(
+                f"interval metrics {interval_requested} need lo/hi columns, but "
+                f"model(s) {missing} have none; pass level=[...] to "
+                f"cross_validation (e.g. cross_validation(..., level=[80, 95]))"
+            )
+    all_levels = sorted({lvl for levels in levels_by_model.values() for lvl in levels})
 
     rows = []
     for uid, g in cv_df.groupby(ID_COL, sort=True):
@@ -163,16 +259,31 @@ def evaluate(
         if train_df is not None:
             y_train = train_df.loc[train_df[ID_COL] == uid, TARGET_COL].to_numpy(float)
         for metric in metrics:
-            row: dict = {ID_COL: uid, "metric": metric}
-            for col in model_cols:
-                valid = g[[TARGET_COL, col]].dropna()
-                if len(valid) == 0:
-                    row[col] = float("nan")
-                elif metric in _SIMPLE_METRICS:
-                    row[col] = _SIMPLE_METRICS[metric](valid[TARGET_COL], valid[col])
-                else:
-                    row[col] = _SCALED_METRICS[metric](
-                        valid[TARGET_COL], valid[col], y_train, m=seasonality
-                    )
-            rows.append(row)
+            if metric == "crps":
+                row: dict = {ID_COL: uid, "metric": "crps"}
+                for col in model_cols:
+                    row[col] = _score_crps(g, col, levels_by_model[col])
+                rows.append(row)
+            elif metric in _INTERVAL_METRICS:
+                for lvl in all_levels:
+                    row = {ID_COL: uid, "metric": f"{metric}-{lvl}"}
+                    for col in model_cols:
+                        if lvl in levels_by_model[col]:
+                            row[col] = _score_interval(g, col, lvl, metric)
+                        else:
+                            row[col] = float("nan")
+                    rows.append(row)
+            else:
+                row = {ID_COL: uid, "metric": metric}
+                for col in model_cols:
+                    valid = g[[TARGET_COL, col]].dropna()
+                    if len(valid) == 0:
+                        row[col] = float("nan")
+                    elif metric in _SIMPLE_METRICS:
+                        row[col] = _SIMPLE_METRICS[metric](valid[TARGET_COL], valid[col])
+                    else:
+                        row[col] = _SCALED_METRICS[metric](
+                            valid[TARGET_COL], valid[col], y_train, m=seasonality
+                        )
+                rows.append(row)
     return pd.DataFrame(rows)

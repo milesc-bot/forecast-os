@@ -213,6 +213,51 @@ def test_compare_writes_csv(tmp_path, panel_csv):
     assert sorted(board["model"]) == ["_test_cli_mean", "_test_cli_naive"]
 
 
+def test_compare_with_level_runs_end_to_end(tmp_path, panel_csv):
+    out_path = tmp_path / "board.csv"
+    rc = main(
+        [
+            "compare", str(panel_csv), "--h", "4",
+            "--models", "_test_cli_naive,_test_cli_mean", "--n-windows", "2",
+            "--metrics", "mae,coverage", "--level", "80",
+            "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    board = pd.read_csv(out_path)
+    assert {"mae", "coverage-80"} <= set(board.columns)
+    assert sorted(board["model"]) == ["_test_cli_mean", "_test_cli_naive"]
+    assert board["coverage-80"].between(0.0, 1.0).all()
+
+
+def test_compare_level_repeat_and_comma_list(tmp_path, panel_csv):
+    out_path = tmp_path / "board.csv"
+    rc = main(
+        [
+            "compare", str(panel_csv), "--h", "4",
+            "--models", "_test_cli_naive", "--n-windows", "2",
+            "--metrics", "coverage", "--level", "80,95", "--level", "60",
+            "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    board = pd.read_csv(out_path)
+    assert {"coverage-60", "coverage-80", "coverage-95"} <= set(board.columns)
+
+
+def test_compare_interval_metric_without_level_returns_2(panel_csv, capsys):
+    rc = main(
+        [
+            "compare", str(panel_csv), "--h", "4",
+            "--models", "_test_cli_naive", "--metrics", "coverage",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "level" in err
+
+
 # -- simulate ------------------------------------------------------------------
 
 

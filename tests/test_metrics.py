@@ -14,6 +14,7 @@ from forecast_os.evaluation.metrics import (
     rmse,
     rmsse,
     smape,
+    winkler_score,
 )
 
 # -- point metrics ------------------------------------------------------------
@@ -115,6 +116,39 @@ def test_coverage_hand_computed():
     assert coverage([1, 2], [0, 0], [9, 9]) == 1.0
 
 
+def test_winkler_inside_interval_equals_width():
+    # both actuals inside their intervals -> score is just the mean width
+    assert winkler_score([1, 2], [0, 0], [4, 4], level=80) == pytest.approx(4.0)
+    assert winkler_score([5], [4], [7], level=95) == pytest.approx(3.0)
+
+
+def test_winkler_below_lo_adds_penalty():
+    # level=80 -> a=0.2 -> penalty factor 2/a = 10
+    # width 3, y=1 undershoots lo=2 by 1: W = 3 + 10*1 = 13
+    assert winkler_score([1], [2], [5], level=80) == pytest.approx(13.0)
+
+
+def test_winkler_above_hi_adds_penalty():
+    # width 3, y=7 overshoots hi=5 by 2: W = 3 + 10*2 = 23
+    assert winkler_score([7], [2], [5], level=80) == pytest.approx(23.0)
+
+
+def test_winkler_mixed_mean():
+    # element 1 inside (W=4), element 2 below lo by 1 (W = 3 + 10 = 13)
+    assert winkler_score([1, 1], [0, 2], [4, 5], level=80) == pytest.approx(8.5)
+
+
+@pytest.mark.parametrize("level", [0, 100, -5, 150])
+def test_winkler_invalid_level_raises(level):
+    with pytest.raises(ValueError, match="level must be in"):
+        winkler_score([1], [0], [2], level=level)
+
+
+def test_winkler_shape_mismatch_raises():
+    with pytest.raises(ValueError, match="shape mismatch"):
+        winkler_score([1, 2], [0], [3, 3], level=80)
+
+
 # -- input validation ---------------------------------------------------------
 
 
@@ -205,3 +239,105 @@ def test_evaluate_no_model_columns_raises():
     meta_only = _cv_frame()[["unique_id", "ds", "cutoff", "y"]]
     with pytest.raises(ValueError, match="no model forecast columns"):
         evaluate(meta_only)
+
+
+# -- evaluate() interval metrics ------------------------------------------------
+
+
+def _interval_cv_frame():
+    """One series, one model, known 80% intervals for hand-computed scores."""
+    return pd.DataFrame(
+        {
+            "unique_id": ["a"] * 4,
+            "ds": list(pd.date_range("2024-01-05", periods=4, freq="D")),
+            "cutoff": [pd.Timestamp("2024-01-04")] * 4,
+            "y": [1.0, 2.0, 3.0, 4.0],
+            "m1": [1.5, 2.5, 3.5, 4.5],
+            "m1-lo-80": [0.0, 3.0, 2.0, 5.0],
+            "m1-hi-80": [2.0, 4.0, 4.0, 6.0],
+        }
+    )
+
+
+def test_evaluate_coverage_and_winkler_rows():
+    res = evaluate(_interval_cv_frame(), metrics=("coverage", "winkler"))
+    assert set(res["metric"]) == {"coverage-80", "winkler-80"}
+    # y in [lo, hi]: yes, no, yes, no -> 0.5
+    cov = res[res["metric"] == "coverage-80"]
+    assert cov["m1"].iloc[0] == pytest.approx(0.5)
+    # widths [2,1,2,1]; misses undershoot lo by 1 -> +10 each (a=0.2)
+    # W = [2, 11, 2, 11] -> mean 6.5
+    wink = res[res["metric"] == "winkler-80"]
+    assert wink["m1"].iloc[0] == pytest.approx(6.5)
+
+
+def test_evaluate_pinball_rows():
+    res = evaluate(_interval_cv_frame(), metrics=("pinball",))
+    assert list(res["metric"]) == ["pinball-80"]
+    # q=0.1 on lo: per-element [0.1, 0.9, 0.1, 0.9] -> 0.5
+    # q=0.9 on hi: per-element [0.1, 0.2, 0.1, 0.2] -> 0.15
+    assert res["m1"].iloc[0] == pytest.approx(0.5 * (0.5 + 0.15))
+
+
+def _degenerate_interval_frame():
+    """lo == yhat == hi at every level: crps collapses to point-forecast MAE."""
+    df = pd.DataFrame(
+        {
+            "unique_id": ["a"] * 4,
+            "ds": list(pd.date_range("2024-01-05", periods=4, freq="D")),
+            "cutoff": [pd.Timestamp("2024-01-04")] * 4,
+            "y": [1.0, 2.0, 3.0, 4.0],
+            "m1": [2.0, 2.0, 2.0, 2.0],
+            "m2": [1.0, 2.0, 3.0, 4.0],  # perfect forecast
+        }
+    )
+    for model in ("m1", "m2"):
+        for lvl in (80, 95):
+            df[f"{model}-lo-{lvl}"] = df[model]
+            df[f"{model}-hi-{lvl}"] = df[model]
+    return df
+
+
+def test_evaluate_crps_degenerate_equals_point_pinball_mean():
+    df = _degenerate_interval_frame()
+    res = evaluate(df, metrics=("crps",))
+    assert list(res["metric"]) == ["crps"]
+    # implied quantiles of levels {80, 95}: 0.1/0.9 and 0.025/0.975
+    y, yhat = df["y"], df["m1"]
+    expected = np.mean(
+        [2 * pinball_loss(y, yhat, q) for q in (0.1, 0.9, 0.025, 0.975)]
+    )
+    assert res["m1"].iloc[0] == pytest.approx(expected)
+    # degenerate intervals make crps the point MAE (here 1.0)
+    assert res["m1"].iloc[0] == pytest.approx(mae(y, yhat))
+    # a forecast equal to y scores exactly 0
+    assert res["m2"].iloc[0] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_evaluate_interval_metric_without_columns_raises():
+    # _cv_frame has intervals for m1 but none for m2 -> helpful error
+    with pytest.raises(ValueError, match=r"level=\["):
+        evaluate(_cv_frame(), metrics=("coverage",))
+    no_intervals = _interval_cv_frame()[["unique_id", "ds", "cutoff", "y", "m1"]]
+    with pytest.raises(ValueError, match="cross_validation"):
+        evaluate(no_intervals, metrics=("winkler",))
+
+
+def test_evaluate_mixes_point_and_interval_metrics():
+    res = evaluate(_interval_cv_frame(), metrics=("mae", "coverage"))
+    assert set(res["metric"]) == {"mae", "coverage-80"}
+    assert res[res["metric"] == "mae"]["m1"].iloc[0] == pytest.approx(0.5)
+
+
+def test_evaluate_interval_level_union_nan_for_missing_level():
+    df = _interval_cv_frame()
+    df["m2"] = df["y"]
+    df["m2-lo-80"] = df["y"] - 1.0
+    df["m2-hi-80"] = df["y"] + 1.0
+    df["m2-lo-95"] = df["y"] - 2.0
+    df["m2-hi-95"] = df["y"] + 2.0
+    res = evaluate(df, metrics=("coverage",))
+    assert set(res["metric"]) == {"coverage-80", "coverage-95"}
+    row95 = res[res["metric"] == "coverage-95"]
+    assert np.isnan(row95["m1"].iloc[0])  # m1 has no 95% interval columns
+    assert row95["m2"].iloc[0] == pytest.approx(1.0)

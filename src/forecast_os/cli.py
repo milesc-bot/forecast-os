@@ -5,6 +5,7 @@ CSV in, CSV (or printed table) out::
     forecast-os models [--family FAMILY]
     forecast-os forecast data.csv --h 12 --model auto_ets --level 80
     forecast-os compare data.csv --h 12 --models naive,theta,auto_ets
+    forecast-os compare data.csv --h 12 --metrics mae,coverage --level 80,95
     forecast-os simulate --s0 100 --h 30 --mu 0.0005 --sigma 0.02
 
 Errors (bad files, unknown models, contract violations) print ``error: ...``
@@ -62,8 +63,11 @@ def _cmd_compare(args: argparse.Namespace) -> None:
     df = _read_panel(args.input)
     models = _split_csv_arg(args.models) if args.models else None
     metrics = _split_csv_arg(args.metrics)
+    level = None
+    if args.level:
+        level = [int(part) for value in args.level for part in _split_csv_arg(value)]
     board = ForecastEngine().compare(
-        df, h=args.h, n_windows=args.n_windows, metrics=metrics, models=models
+        df, h=args.h, n_windows=args.n_windows, metrics=metrics, models=models, level=level
     )
     _emit(board, args.output, index=True)
 
@@ -119,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("--n-windows", type=int, default=3, help="CV windows (default 3)")
     p_cmp.add_argument(
         "--metrics", default="mae,rmse,smape", help="comma-separated metric names"
+    )
+    p_cmp.add_argument(
+        "--level", action="append", default=None,
+        help="confidence level(s) for interval metrics such as coverage/winkler; "
+        "repeat the flag or comma-separate (e.g. --level 80,95)",
     )
     p_cmp.add_argument(
         "-o", "--output", default=None, help="output CSV path (default: print)"
