@@ -263,6 +263,23 @@ next-period forecasts and sparklines, calibration and signed-bias screens
 that highlight sandbagged forecasts, alert rules, and a persistent
 workspace in `~/.forecast-os/`.
 
+<table>
+  <tr>
+    <td width="50%"><img alt="Console dashboard: a watchlist table of six team/rep series with last value, next-period forecast, percent delta, and 12-month sparklines" src="docs/assets/console-dashboard.png"></td>
+    <td width="50%"><img alt="Console forecast screen: a fan chart for west/alice with blue history, green forecast continuation, and red/yellow 80% interval bands" src="docs/assets/console-forecast.png"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img alt="Console leaderboard: models ranked by MASE with 80% interval coverage, ridge_lag first" src="docs/assets/console-leaderboard.png"></td>
+    <td width="50%"><img alt="Console governance screen: per-series, per-cutoff MASE, signed bias, and coverage, with sandbagging and narrow intervals flagged" src="docs/assets/console-governance.png"></td>
+  </tr>
+</table>
+
+Every subsystem is exercised together by
+[`examples/engine_benchmark.py`](examples/engine_benchmark.py) — a
+champion/challenger bakeoff across the whole model zoo plus a health check of
+reconciliation, quota, conformal, exogenous drivers, finance, snapshots, and
+connectors (exits non-zero if anything fails).
+
 ### MCP server — let your agent drive the engine
 
 `pip install "forecast-os[mcp]"` and register `forecast-os-mcp` with any MCP

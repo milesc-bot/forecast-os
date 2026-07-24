@@ -45,7 +45,7 @@ print(f"\nSQLSource: {len(wh_panel)} monthly rows from SQL, "
       f"total ${wh_panel['y'].sum():,.0f} closed-won")
 
 # --- 3. What an MCP agent sees ---------------------------------------------
-from forecast_os.mcp.server import list_mappings_tool, preview_panel
+from forecast_os.mcp.server import list_mappings_tool, preview_panel  # noqa: E402
 
 preview = preview_panel(records=hubspot.assign(
     closedate=hubspot["closedate"].astype(str)).to_dict("records"),

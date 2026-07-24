@@ -11,7 +11,6 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 import forecast_os as fos
 from forecast_os.snapshots import (
@@ -29,7 +28,7 @@ base = fos.generate_series(n_series=1, length=40, freq="W", level=500.0,
                            trend=3.0, seasonality=13, season_amp=40.0, seed=4)
 base["unique_id"] = "total"
 
-for week, cutoff in enumerate(range(28, 32)):
+for cutoff in range(28, 32):
     as_of = base["ds"].iloc[cutoff - 1]
     known = base.iloc[:cutoff].copy()                 # what we knew that week
     store.snapshot(known, as_of=as_of, kind="panel")

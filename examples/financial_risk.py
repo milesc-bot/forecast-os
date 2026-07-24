@@ -33,7 +33,8 @@ print(f"next-5-day vol forecast   : {np.round(garch.forecast_volatility(5), 5)}"
 
 print("\n=== Monte Carlo: 1-year price scenarios from $100 ===")
 mc = MonteCarloSimulator.from_returns(returns, seed=7)
-print(mc.summary(s0=100.0, h=252, n_paths=2000).iloc[[0, 62, 125, 251]].round(2).to_string(index=False))
+fan = mc.summary(s0=100.0, h=252, n_paths=2000).iloc[[0, 62, 125, 251]]
+print(fan.round(2).to_string(index=False))
 
 print("\n=== Bull/bear regime detection ===")
 reg = MarkovRegimeSwitching(seed=3).fit(returns)

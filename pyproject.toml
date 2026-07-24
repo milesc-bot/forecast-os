@@ -47,6 +47,7 @@ dev = [
     "ruff>=0.4",
     "build",
     "matplotlib>=3.8",
+    "cairosvg>=2.7",
     "requests>=2.31",
     "mcp>=1.0",
     "textual>=0.80",
