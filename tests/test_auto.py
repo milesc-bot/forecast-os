@@ -250,3 +250,45 @@ def test_season_length_stored_and_clone_safe():
 def test_invalid_season_length_string_raises():
     with pytest.raises(ValueError, match="season_length"):
         AutoSelect(season_length="monthly")
+
+
+# --- v0.2.0 verifier regressions ------------------------------------------
+
+
+def _freq_panel(n, freq, seed=1):
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame(
+        {
+            ID_COL: "s1",
+            TIME_COL: pd.date_range("2020-01-06", periods=n, freq=freq),
+            "y": 10 + np.sin(np.arange(n)) + rng.normal(0, 0.1, n),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "n,freq",
+    [(60, "W"), (30, "MS"), (16, "MS"), (28, "D")],
+)
+def test_auto_inference_capped_on_short_seasonal_panels(n, freq):
+    """Auto-inferred m larger than the train slice falls back to m=1 (no crash)."""
+    sel = AutoSelect().fit(_freq_panel(n, freq))
+    assert sel.best_models_["s1"]
+    assert len(sel.predict(3)) == 3
+
+
+def test_perfectly_periodic_series_picks_seasonal_winner():
+    """All-NaN mase (zero seasonal-naive scale) falls back to mae ranking."""
+    pattern = np.array([10.0, 12.0, 15.0, 11.0, 9.0, 20.0, 25.0])
+    y = np.tile(pattern, 12)[:80]
+    df = pd.DataFrame(
+        {
+            ID_COL: "s1",
+            TIME_COL: pd.date_range("2024-01-01", periods=80, freq="D"),
+            "y": y,
+        }
+    )
+    sel = AutoSelect().fit(df)
+    assert sel.best_models_["s1"] == "SeasonalNaive"
+    pred = sel.predict(7)["yhat"].to_numpy()
+    np.testing.assert_allclose(pred, np.tile(pattern, 2)[80 - 77 : 80 - 77 + 7], atol=1e-9)

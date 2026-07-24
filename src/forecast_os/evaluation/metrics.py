@@ -175,7 +175,7 @@ def _interval_levels(columns: Iterable[str], model: str) -> list[int]:
 def _score_interval(g: pd.DataFrame, col: str, lvl: int, metric: str) -> float:
     """One interval-metric value for model ``col`` at level ``lvl`` on group ``g``."""
     lo_col, hi_col = f"{col}-lo-{lvl}", f"{col}-hi-{lvl}"
-    valid = g[[TARGET_COL, col, lo_col, hi_col]].dropna(subset=[TARGET_COL, col])
+    valid = g[[TARGET_COL, col, lo_col, hi_col]].dropna()
     if len(valid) == 0:
         return float("nan")
     y, lo, hi = valid[TARGET_COL], valid[lo_col], valid[hi_col]
@@ -191,7 +191,7 @@ def _score_interval(g: pd.DataFrame, col: str, lvl: int, metric: str) -> float:
 def _score_crps(g: pd.DataFrame, col: str, levels: list[int]) -> float:
     """Quantile-approximated CRPS: mean of 2x pinball over all implied quantiles."""
     interval_cols = [f"{col}-{side}-{lvl}" for lvl in levels for side in ("lo", "hi")]
-    valid = g[[TARGET_COL, col, *interval_cols]].dropna(subset=[TARGET_COL, col])
+    valid = g[[TARGET_COL, col, *interval_cols]].dropna()
     if len(valid) == 0:
         return float("nan")
     y = valid[TARGET_COL]

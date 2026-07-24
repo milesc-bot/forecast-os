@@ -121,7 +121,11 @@ class StrategyBacktester:
                 0.0,
                 self.max_leverage,
             )
-        return np.where(valid, pos, binary)
+        fallback = binary
+        if self.sizing == "kelly":
+            # the binary fallback must still honor the hard leverage cap
+            fallback = np.minimum(binary, self.max_leverage)
+        return np.where(valid, pos, fallback)
 
     def run(self, df: pd.DataFrame, test_size: int = 60, step_size: int = 1) -> BacktestResult:
         """Walk-forward backtest over the last ``test_size`` one-step windows."""

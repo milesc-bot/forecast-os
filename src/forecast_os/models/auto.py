@@ -93,7 +93,9 @@ class AutoSelect(BaseForecaster):
         ``m`` at fit time from the panel's modal inferred time step using the
         map D->7, B->5, W->52, M/MS/ME->12, Q/QS/QE->4, H->24 (anything else,
         including numeric ``ds``, -> 1); when candidates are given explicitly
-        nothing is inferred (``m = 1``). An explicit int is used as-is
+        nothing is inferred (``m = 1``). An auto-inferred ``m`` is dropped back
+        to 1 when the shortest training slice would not exceed it (e.g. 60
+        weekly rows cannot support m=52). An explicit int is used as-is
         (``m <= 1`` disables seasonal candidates); ``None`` means 1 (disabled).
     """
 
@@ -156,7 +158,22 @@ class AutoSelect(BaseForecaster):
 
     def fit(self, df: pd.DataFrame) -> AutoSelect:
         df = validate_panel(df)
+        sizes = df.groupby(ID_COL)[TARGET_COL].size()
+        span = self.val_h * self.n_windows  # h + (n_windows - 1) * step_size, step = h
+        use_cv = int(sizes.min()) > span
+        # Shortest training slice any candidate will see (first CV fold, or the
+        # 75% holdout train); seasonal candidates and seasonal MASE scaling both
+        # need strictly more than m training rows.
+        if use_cv:
+            train_len = int((sizes - span).min())
+        else:
+            train_len = int((sizes - np.maximum(1, sizes // 4)).min())
+
         m = self._resolve_season_length(df)
+        if m > 1 and train_len <= m and self.season_length == "auto":
+            m = 1  # auto-inferred season doesn't fit the data; fall back
+        scale_m = m if train_len > m else 1
+
         resolved = [
             get_model(c) if isinstance(c, str) else c.clone() for c in self._candidate_specs(m)
         ]
@@ -164,23 +181,29 @@ class AutoSelect(BaseForecaster):
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate candidate model names: {names}")
 
-        sizes = df.groupby(ID_COL)[TARGET_COL].size()
-        span = self.val_h * self.n_windows  # h + (n_windows - 1) * step_size, step = h
-        if int(sizes.min()) > span:
+        # "mae" rides along as the tie-breaker for series where the primary
+        # metric is undefined (e.g. mase on a perfectly periodic series whose
+        # seasonal-naive scale is exactly 0).
+        metrics_list = [self.metric] if self.metric == "mae" else [self.metric, "mae"]
+        if use_cv:
             cv = cross_validation(df, resolved, h=self.val_h, n_windows=self.n_windows)
             n = df.groupby(ID_COL)[TARGET_COL].transform("size").to_numpy()
             pos = df.groupby(ID_COL).cumcount().to_numpy()
             # MASE/RMSSE scaling must only see the first fold's training slice
             # (rows up to the first cutoff), matching the M4 convention.
             train_df = df[pos < n - span]
-            scores = evaluate(cv, metrics=[self.metric], train_df=train_df, seasonality=m)
+            scores = evaluate(cv, metrics=metrics_list, train_df=train_df, seasonality=scale_m)
         else:
-            scores = self._holdout_scores(df, resolved, m)
+            scores = self._holdout_scores(df, resolved, scale_m, metrics_list)
 
         score_cols = [c for c in scores.columns if c not in (ID_COL, "metric")]
+        primary = scores[scores["metric"] == self.metric].set_index(ID_COL)[score_cols]
+        fallback = scores[scores["metric"] == "mae"].set_index(ID_COL)[score_cols]
         winners: dict = {}
-        for uid, row in scores.set_index(ID_COL)[score_cols].iterrows():
+        for uid, row in primary.iterrows():
             vals = row.astype(float)
+            if not vals.notna().any() and uid in fallback.index:
+                vals = fallback.loc[uid].astype(float)
             winners[uid] = str(vals.idxmin()) if vals.notna().any() else names[0]
 
         by_name = {m.name: m for m in resolved}
@@ -191,7 +214,13 @@ class AutoSelect(BaseForecaster):
         self._is_fitted = True
         return self
 
-    def _holdout_scores(self, df: pd.DataFrame, resolved: list, seasonality: int) -> pd.DataFrame:
+    def _holdout_scores(
+        self,
+        df: pd.DataFrame,
+        resolved: list,
+        seasonality: int,
+        metrics_list: list[str],
+    ) -> pd.DataFrame:
         """Score candidates on a per-series 75/25 holdout (short-panel fallback)."""
         n = df.groupby(ID_COL)[TARGET_COL].transform("size").to_numpy()
         hold = np.maximum(1, n // 4)
@@ -207,7 +236,7 @@ class AutoSelect(BaseForecaster):
             test = test.merge(pred[[ID_COL, "_step", m.name]], on=[ID_COL, "_step"], how="left")
         return evaluate(
             test.drop(columns="_step"),
-            metrics=[self.metric],
+            metrics=metrics_list,
             train_df=train,
             seasonality=seasonality,
         )

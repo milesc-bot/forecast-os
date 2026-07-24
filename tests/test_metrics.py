@@ -341,3 +341,29 @@ def test_evaluate_interval_level_union_nan_for_missing_level():
     row95 = res[res["metric"] == "coverage-95"]
     assert np.isnan(row95["m1"].iloc[0])  # m1 has no 95% interval columns
     assert row95["m2"].iloc[0] == pytest.approx(1.0)
+
+
+# --- v0.2.0 verifier regressions ------------------------------------------
+
+
+def test_interval_metrics_drop_nan_bounds_consistently():
+    """Rows with NaN interval bounds are excluded from every interval metric."""
+    df = pd.DataFrame(
+        {
+            "unique_id": "s1",
+            "ds": pd.date_range("2024-01-01", periods=4),
+            "cutoff": pd.Timestamp("2023-12-31"),
+            "y": [0.0, 0.0, 0.0, 10.0],
+            "m": [0.0, 0.0, 0.0, 0.0],
+            "m-lo-80": [-1.0, -1.0, -1.0, np.nan],
+            "m-hi-80": [1.0, 1.0, 1.0, np.nan],
+        }
+    )
+    out = evaluate(df, metrics=["coverage", "winkler"]).set_index("metric")["m"]
+    # the NaN-bounds row (a miss if counted) is dropped -> full coverage
+    assert out["coverage-80"] == 1.0
+    assert out["winkler-80"] == 2.0  # width only, no violations
+
+    all_nan = df.assign(**{"m-lo-80": np.nan, "m-hi-80": np.nan})
+    out2 = evaluate(all_nan, metrics=["coverage", "winkler", "crps"]).set_index("metric")["m"]
+    assert out2.isna().all()

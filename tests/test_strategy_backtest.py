@@ -366,3 +366,20 @@ def test_proportional_on_predictable_ar_panel_partial_exposure():
     assert 0.0 < row["exposure"] < 1.0
     assert np.isfinite(row["sharpe"])
     assert np.isfinite(res.frame["sigma"]).all()
+
+
+def test_kelly_sigma_fallback_respects_max_leverage():
+    """Degenerate-sigma steps fall back to binary capped at max_leverage."""
+    result = scripted_run(
+        yhats=[0.01, 0.01, -0.01],
+        sigmas=[0.0, 0.02, 0.0],
+        sizing="kelly",
+        level=80,
+        kelly_fraction=0.5,
+        max_leverage=0.4,
+    )
+    pos = result.frame["position"].to_numpy()
+    assert pos[0] == pytest.approx(0.4)  # binary 1.0 capped at max_leverage
+    assert pos[1] == pytest.approx(min(0.5 * 0.01 / 0.02**2, 0.4))
+    assert pos[2] == 0.0
+    assert (pos <= 0.4 + 1e-12).all()
