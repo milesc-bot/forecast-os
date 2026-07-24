@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0 (2026-07-24)
+
+Deal-grain analytics and go-public hardening — closing the highest-impact gaps
+from the competitive review.
+
+- **Opportunity-grain layer** (`forecast_os.gtm`): `DealScorer` — a calibrated
+  logistic win-probability model on deal features — and `weighted_pipeline`,
+  a probabilistic pipeline forecast (Σ p·amount with a calibrated interval
+  from the Bernoulli variance). The keystone that the aggregate panel contract
+  could not express.
+- **Pipeline waterfall**: a `deals` snapshot kind plus `pipeline_waterfall`,
+  which diffs two point-in-time opportunity snapshots into created / advanced /
+  slipped / pushed / won / lost by amount and count.
+- **Currency normalization**: `CurrencyNormalizer` / `convert_currency` with a
+  guard that refuses to aggregate mixed-currency amounts without a rate table
+  (previously a silent correctness landmine).
+- **Scenario planning**: a driver-based `Scenario` object (win-rate, ACV, rep
+  count …) over the funnel and quota primitives.
+- **Funnel anomaly detection**: `detect_anomalies` flags rate/volume breaks
+  (rolling z-score) across the segmented panel.
+- **Adoption/CI hardening**: `py.typed` (the library now ships its types),
+  mocked statsforecast/neuralforecast adapter tests, a core-only install CI
+  job, lazier imports, community-health files, and PyPI release automation.
+
 ## 0.6.0 (2026-07-24)
 
 Roadmap complete: snapshot history, driver-based ARIMA, foundation-model

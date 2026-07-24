@@ -34,7 +34,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 from .exceptions import DataContractError, ForecastOSError, NotFittedError
 from .types import (
@@ -79,6 +78,26 @@ def _package_version() -> str:
     from forecast_os import __version__
 
     return __version__
+
+
+_STATS = None
+
+
+def _get_stats():
+    """Return ``scipy.stats``, importing it lazily on first use.
+
+    ``scipy.stats`` costs roughly ~380ms to import and is only needed on the
+    prediction-interval code path (``stats.norm.ppf``). Deferring the import
+    to this cached getter keeps ``import forecast_os`` fast for the common
+    point-forecast case without changing any numerics — the returned module
+    is exactly ``scipy.stats``.
+    """
+    global _STATS
+    if _STATS is None:
+        from scipy import stats
+
+        _STATS = stats
+    return _STATS
 
 
 def load(path: str | PathLike) -> BaseForecaster:
@@ -417,6 +436,7 @@ class PerSeriesForecaster(BaseForecaster):
             }
             if levels:
                 sigma = np.asarray(self._predict_sigma(state, int(h)), dtype=float)
+                stats = _get_stats()
                 for lvl in levels:
                     z = float(stats.norm.ppf(0.5 + lvl / 200))
                     data[f"lo-{lvl}"] = mean - z * sigma

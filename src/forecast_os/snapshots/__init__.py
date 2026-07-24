@@ -14,10 +14,13 @@ guard fires only when a :class:`SnapshotStore` is constructed.
 
 from .analysis import accuracy_over_time, forecast_vs_actual, snapshot_evolution
 from .store import SnapshotStore
+from .waterfall import pipeline_waterfall, waterfall_summary
 
 __all__ = [
     "SnapshotStore",
     "snapshot_evolution",
     "forecast_vs_actual",
     "accuracy_over_time",
+    "pipeline_waterfall",
+    "waterfall_summary",
 ]

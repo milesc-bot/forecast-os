@@ -41,10 +41,15 @@ _SNAPSHOTS_HINT = (
 )
 
 #: Frame kinds the store understands and how each is validated.
-_KINDS = ("panel", "forecast")
+_KINDS = ("panel", "forecast", "deals")
 
 #: Columns a ``forecast`` snapshot must carry (the committed forecast shape).
 _FORECAST_COLS = (ID_COL, TIME_COL, "yhat")
+
+#: Columns a ``deals`` snapshot must carry (the opportunity contract). A deal
+#: table is DEAL-GRAIN (one row per opportunity), not the (unique_id, ds, y)
+#: panel, so it is stored verbatim rather than normalized.
+_DEALS_COLS = ("opp_id", "amount", "stage")
 
 _MANIFEST_NAME = "manifest.json"
 
@@ -112,7 +117,9 @@ class SnapshotStore:
 
         ``panel`` kinds are run through :func:`validate_panel` (and the
         normalized copy is stored); ``forecast`` kinds must carry the
-        ``(unique_id, ds, yhat)`` columns and are stored as-is.
+        ``(unique_id, ds, yhat)`` columns and ``deals`` kinds the deal-grain
+        ``(opp_id, amount, stage)`` opportunity contract. Both non-panel kinds
+        are stored as-is (a copy), preserving any extra feature/segment columns.
         """
         if kind == "panel":
             return validate_panel(frame)
@@ -120,6 +127,16 @@ class SnapshotStore:
             raise DataContractError(
                 f"expected a pandas DataFrame, got {type(frame).__name__}"
             )
+        if kind == "deals":
+            missing = [c for c in _DEALS_COLS if c not in frame.columns]
+            if missing:
+                raise DataContractError(
+                    f"deals snapshot is missing required column(s) {missing}; the "
+                    f"opportunity contract is (opp_id, amount, stage)"
+                )
+            if len(frame) == 0:
+                raise DataContractError("deals snapshot is empty")
+            return frame.copy()
         missing = [c for c in _FORECAST_COLS if c not in frame.columns]
         if missing:
             raise DataContractError(
@@ -157,7 +174,9 @@ class SnapshotStore:
 
         ``panel`` frames must pass :func:`~forecast_os.core.types.validate_panel`
         (the normalized copy is stored); ``forecast`` frames must carry
-        ``(unique_id, ds, yhat)``. ``as_of`` is coerced to a midnight-normalized
+        ``(unique_id, ds, yhat)`` and ``deals`` frames the deal-grain
+        ``(opp_id, amount, stage)`` opportunity contract (stored verbatim).
+        ``as_of`` is coerced to a midnight-normalized
         :class:`pandas.Timestamp`; the frame is written to
         ``<path>/<kind>/<as_of:%Y%m%d>[-<n>].parquet`` (a numeric suffix keeps
         earlier same-day snapshots) and a manifest row is appended.
@@ -190,7 +209,9 @@ class SnapshotStore:
         to_write.to_parquet(file_path, index=False)
 
         ds_unit = None
-        if pd.api.types.is_datetime64_any_dtype(to_write[TIME_COL]):
+        if TIME_COL in to_write.columns and pd.api.types.is_datetime64_any_dtype(
+            to_write[TIME_COL]
+        ):
             ds_unit = to_write[TIME_COL].dt.unit
 
         entry = {
@@ -248,8 +269,10 @@ class SnapshotStore:
         """Every ``kind`` snapshot stacked, with an added ``as_of`` column.
 
         Optionally filtered to the ``unique_id`` value(s) in ``series``; the
-        result is sorted by ``(as_of, unique_id, ds)``. Returns an empty frame
-        when the store holds no matching snapshots.
+        result is sorted by whichever of ``(as_of, unique_id, ds)`` the frames
+        carry — deal-grain ``deals`` snapshots have neither ``unique_id`` nor
+        ``ds`` and are sorted by ``as_of`` alone. Returns an empty frame when
+        the store holds no matching snapshots.
         """
         entries = [e for e in self._read_manifest() if e["kind"] == kind]
         if not entries:
@@ -265,9 +288,8 @@ class SnapshotStore:
                 frame = frame[frame[ID_COL].isin(series)]
             frames.append(frame)
         stacked = pd.concat(frames, ignore_index=True)
-        return stacked.sort_values(["as_of", ID_COL, TIME_COL], kind="stable").reset_index(
-            drop=True
-        )
+        sort_cols = [c for c in ("as_of", ID_COL, TIME_COL) if c in stacked.columns]
+        return stacked.sort_values(sort_cols, kind="stable").reset_index(drop=True)
 
     def manifest(self) -> pd.DataFrame:
         """The snapshot index as a DataFrame (``as_of`` parsed to datetime)."""

@@ -27,3 +27,23 @@ jobs:
         run: ruff check src tests
       - name: Test
         run: pytest -q
+
+  core-install:
+    # Proves the minimal install works with only numpy/pandas/scipy — no
+    # extras, no optional backends. Guards the advertised public surface
+    # against accidentally growing a heavy hard dependency.
+    name: Core-only install (numpy/pandas/scipy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with no extras
+        run: pip install .
+      - name: Forecast round-trip on a clean install
+        run: |
+          python -c "import forecast_os as f; f.ForecastEngine(models=['auto_ets']).forecast(f.generate_series(n_series=2, length=40), h=3)"
+      - name: CLI model catalog
+        run: forecast-os models

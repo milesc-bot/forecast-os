@@ -99,6 +99,23 @@ extensions.
   `attainment_probability` and `pipeline_coverage` (quota questions from
   forecast intervals).
 
+### Deal-grain (one row per opportunity)
+
+- `DealScorer` — a calibrated logistic win-probability model on deal features
+  (L2-regularized logistic fit by scipy, Platt-scaled so predicted
+  probabilities match empirical win rates). `weighted_pipeline` turns those
+  odds into a *probabilistic* pipeline forecast: expected won-$ =
+  Σ p·amount with a calibrated interval from the Bernoulli variance
+  Σ p(1−p)·amount².
+- `pipeline_waterfall` / `waterfall_summary` — diff two point-in-time
+  opportunity snapshots (`SnapshotStore` `kind="deals"`) into created /
+  advanced / expanded / won / lost / removed by count and signed amount; the
+  bridge closes exactly from opening to closing pipeline.
+- `Scenario` / `compare_scenarios` — driver-based what-if (top-of-funnel,
+  win-rate, ACV, rep count) over the funnel primitives.
+- `detect_anomalies` — rolling-z-score flags on rate/volume series across the
+  segmented panel (a conversion drop in one region).
+
 ## Finance
 
 - `garch` / `GARCH11` — GARCH(1,1): tomorrow's variance = ω + α·(today's shock)² +

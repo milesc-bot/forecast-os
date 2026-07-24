@@ -102,9 +102,16 @@ regenerate them all with `python scripts/generate_figures.py`.
 ## Install
 
 ```bash
-pip install git+https://github.com/milesc-bot/forecast-os
-# optional heavy backends:
-pip install "forecast-os[nixtla] @ git+https://github.com/milesc-bot/forecast-os"
+pip install forecast-os
+# optional layers (extras): connectors, mcp, terminal, snapshots, serve, timegpt
+pip install "forecast-os[connectors,terminal]"
+```
+
+For RevOps analysts who don't want to touch Python, an interactive console:
+
+```bash
+pipx install "forecast-os[terminal]"
+forecast-os-tui --demo
 ```
 
 Development install:
@@ -201,6 +208,34 @@ cohort retention forecasting (`retention_sbg`), driver-based forecasting
 `ridge_lag` and `arima`, with known future values via `predict(h, X_df=...)`),
 fiscal calendars (`FiscalCalendar(start_month=2, scheme="4-4-5")`), and signed
 `bias` / `pct_bias` governance metrics that catch sandbagged forecasts.
+
+### Deal-grain: scoring, probabilistic pipeline, and waterfalls
+
+Beyond the aggregate panel, the opportunity layer works one row per deal — the
+analyses the revenue-intelligence category is built on, with calibrated
+intervals nobody else open-sources:
+
+```python
+from forecast_os.gtm import DealScorer, weighted_pipeline
+from forecast_os.snapshots import waterfall_summary
+
+# calibrated per-deal win probability, trained on closed history
+scorer = DealScorer().fit(closed_deals, target="won", features=["stage_age", "activities"])
+
+# a PROBABILISTIC pipeline forecast: E[won $] with an interval from each deal's odds
+weighted_pipeline(open_deals, scorer=scorer, by="region", level=80)
+#  region  expected     lo-80      hi-80  n_deals
+#    EMEA   784_049   607_021    961_076       79
+
+# how the pipeline moved week over week (created / advanced / won / lost / …)
+waterfall_summary(last_week_deals, this_week_deals, stages=STAGES,
+                  won_stage="closed_won", lost_stage="closed_lost")
+```
+
+Plus driver-based what-if (`Scenario` / `compare_scenarios`), funnel anomaly
+detection (`detect_anomalies`), and multi-currency normalization
+(`convert_currency`, with a guard that refuses to sum mixed currencies). See
+[`examples/deal_pipeline.py`](examples/deal_pipeline.py).
 
 ### Snapshot history & forecast governance
 

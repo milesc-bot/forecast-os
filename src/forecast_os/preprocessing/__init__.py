@@ -1,6 +1,7 @@
 """Panel preprocessing: imputation, scaling, transforms, calendar features, pipelines."""
 
 from .calendar import calendar_features, fourier_features
+from .currency import CurrencyNormalizer, convert_currency, guard_single_currency
 from .fiscal import FiscalCalendar
 from .pipeline import Pipeline
 from .transforms import (
@@ -22,5 +23,8 @@ __all__ = [
     "calendar_features",
     "fourier_features",
     "FiscalCalendar",
+    "CurrencyNormalizer",
+    "convert_currency",
+    "guard_single_currency",
     "Pipeline",
 ]
