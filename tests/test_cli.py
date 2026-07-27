@@ -7,12 +7,13 @@ names at run time. The ``simulate`` command is tested against a minimal fake
 
 import sys
 import types
+import warnings
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from forecast_os.cli import main
+from forecast_os.cli import _bucket_ds, _prepare_panel, _read_panel, build_parser, main
 from forecast_os.core.base import PerSeriesForecaster
 from forecast_os.core.registry import register
 
@@ -327,6 +328,225 @@ def test_forecast_unknown_mapping_column_returns_2(panel_csv, capsys):
     err = capsys.readouterr().err
     assert err.startswith("error:")
     assert "Nope" in err
+
+
+# -- --freq bucketing (regression: off-grid rows were silently deleted) --------
+#
+# --freq used to group on the EXACT timestamp and then reindex onto
+# date_range(min, max, freq), so every row that did not literally land on the
+# grid was dropped and --fill zero wrote 0.0 over it. The module docstring's
+# own flagship example (a CRM export closed on arbitrary days, --freq MS) lost
+# 96% of its revenue and forecast all zeros with exit status 0. Off-grid
+# timestamps must be bucketed into the period that CONTAINS them — the same
+# semantics --mapping already uses — and any residual misalignment must raise.
+
+
+@pytest.fixture
+def offgrid_crm_csv(tmp_path):
+    """CRM export closed on arbitrary days of the month, as exports really are."""
+    rows = []
+    for rep, day in (("alice", 3), ("bob", 17)):
+        for month in range(1, 8):
+            rows.append(
+                {
+                    "Rep": rep,
+                    "Close Date": f"2024-{month:02d}-{day:02d}",
+                    "Amount": 100.0 * month,
+                }
+            )
+            rows.append(
+                {"Rep": rep, "Close Date": f"2024-{month:02d}-28", "Amount": 25.0}
+            )
+    path = tmp_path / "crm.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def test_freq_buckets_offgrid_rows_instead_of_dropping_them(offgrid_crm_csv):
+    """Every input row must land in its own month; none may be deleted."""
+    args = build_parser().parse_args(
+        [
+            "forecast", str(offgrid_crm_csv), "--h", "1",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "MS",
+        ]
+    )
+    raw = pd.read_csv(offgrid_crm_csv)
+    panel = _prepare_panel(_read_panel(str(offgrid_crm_csv)), args)
+    # no revenue is destroyed by regularizing (this returned 0.0 before the fix)
+    assert panel["y"].sum() == pytest.approx(raw["Amount"].sum())
+    # January is present: the grid starts at the containing month, not day 3
+    assert panel["ds"].min() == pd.Timestamp("2024-01-01")
+    alice = panel[panel["unique_id"] == "alice"]
+    assert list(alice["y"]) == [125.0, 225.0, 325.0, 425.0, 525.0, 625.0, 725.0]
+
+
+def test_forecast_offgrid_crm_export_end_to_end(tmp_path, offgrid_crm_csv):
+    """The docstring's flagship example must forecast real revenue, not zeros."""
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(offgrid_crm_csv), "--h", "3", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "MS", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    out = pd.read_csv(out_path)
+    # last month is 700 + 25; the old behaviour forecast 0.0 and still exited 0
+    assert (out["_test_cli_naive"] == 725.0).all()
+    assert out["ds"].min() == "2024-08-01"
+
+
+def test_freq_without_agg_buckets_one_row_per_period(tmp_path):
+    """One off-grid row per month needs no --agg; it belongs in that month."""
+    path = tmp_path / "sparse.csv"
+    pd.DataFrame(
+        {
+            "Rep": "alice",
+            "Close Date": ["2024-01-09", "2024-02-23", "2024-04-11"],
+            "Amount": [10.0, 20.0, 40.0],
+        }
+    ).to_csv(path, index=False)
+    args = build_parser().parse_args(
+        [
+            "forecast", str(path), "--h", "1",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--freq", "MS",
+        ]
+    )
+    panel = _prepare_panel(_read_panel(str(path)), args)
+    assert list(panel["ds"]) == list(pd.date_range("2024-01-01", periods=4, freq="MS"))
+    assert list(panel["y"]) == [10.0, 20.0, 0.0, 40.0]  # March gap filled
+
+
+def test_freq_without_agg_reports_offgrid_duplicates(offgrid_crm_csv, capsys):
+    """Two rows in one month cannot be regularized without an aggregation rule."""
+    rc = main(
+        [
+            "forecast", str(offgrid_crm_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--freq", "MS",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "--agg" in err
+
+
+def test_freq_buckets_end_anchored_periods(tmp_path):
+    """End-anchored grids (ME) label the period end, keeping the month whole."""
+    path = tmp_path / "me.csv"
+    pd.DataFrame(
+        {
+            "Rep": "alice",
+            "Close Date": ["2024-01-05", "2024-01-31", "2024-02-14"],
+            "Amount": [1.0, 2.0, 4.0],
+        }
+    ).to_csv(path, index=False)
+    args = build_parser().parse_args(
+        [
+            "forecast", str(path), "--h", "1",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "ME",
+        ]
+    )
+    panel = _prepare_panel(_read_panel(str(path)), args)
+    assert list(panel["ds"]) == [pd.Timestamp("2024-01-31"), pd.Timestamp("2024-02-29")]
+    assert list(panel["y"]) == [3.0, 4.0]
+
+
+@pytest.mark.parametrize("freq", ["D", "ME", "W-MON", "QE", "YE", "MS", "h"])
+def test_freq_keeps_the_timezone_of_ds(freq):
+    """Bucketing must not silently change ds's timezone.
+
+    The bucketing fix routed every ds through the period-label helper, whose
+    ``to_period`` hop warns 'will drop timezone information' and returns
+    tz-naive labels: a zoned ds came out of --freq D/ME/W-*/QE/YE as
+    datetime64[us], so the dtype and the printed offsets changed under the
+    user without a word. --freq chooses a grid; it does not re-zone the data,
+    and the label a row lands in is the one its LOCAL wall clock falls in.
+    """
+    ds = pd.to_datetime(["2024-01-08 09:30", "2024-02-14 16:00"]).tz_localize(
+        "America/New_York"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the tz-drop UserWarning must not fire
+        out = _bucket_ds(pd.DataFrame({"ds": ds}), freq)
+    assert str(out["ds"].dt.tz) == "America/New_York"
+    naive = _bucket_ds(pd.DataFrame({"ds": ds.tz_localize(None)}), freq)["ds"]
+    assert list(out["ds"].dt.tz_localize(None)) == list(naive)
+
+
+def test_freq_buckets_a_zone_whose_local_midnight_does_not_exist():
+    """A DST spring-forward at midnight must not abort the run.
+
+    Bucketing normalizes to local midnight, which does not exist in Santiago
+    on 2024-09-08 (and Havana, Beirut, Sao Paulo have the same shape), so
+    ``--freq D`` failed with 'error: 2024-09-08 00:00:00 is a nonexistent time
+    due to daylight savings time' — no mention of ds or of a timezone. The day
+    a 12:00 local timestamp belongs to is still that day; its label is the
+    first instant the zone actually has.
+    """
+    ds = pd.to_datetime(["2024-09-08 12:00"]).tz_localize("America/Santiago")
+    out = _bucket_ds(pd.DataFrame({"ds": ds}), "D")
+    assert list(out["ds"]) == [pd.Timestamp("2024-09-08 01:00", tz="America/Santiago")]
+
+
+# -- null ds (regression: --agg silently deleted undated rows) -----------------
+
+
+@pytest.fixture
+def undated_crm_csv(tmp_path):
+    """CRM export where two open deals have no close date yet."""
+    path = tmp_path / "undated.csv"
+    pd.DataFrame(
+        {
+            "Rep": ["alice"] * 5,
+            "Close Date": ["2024-01-05", "2024-02-05", "", "", "2024-03-05"],
+            "Amount": [10.0, 20.0, 1000.0, 554.0, 10.0],
+        }
+    ).to_csv(path, index=False)
+    return path
+
+
+def test_agg_and_freq_reject_rows_with_a_null_ds(undated_crm_csv, capsys):
+    """A blank close date must be reported, not quietly deleted.
+
+    The module docstring promises 'nothing is dropped', but ``_aggregate``'s
+    groupby defaults to dropna=True, so a row with no close date never
+    reached the grid: this export sums to 1594.0 and the CLI printed a panel
+    summing to 40.0 with exit status 0. ``--mapping``/``to_panel`` already
+    raises on the same data, so raising here is also what makes the two paths
+    agree; an undated row's period is unknowable, and only the user can say
+    whether to drop or fill it.
+    """
+    rc = main(
+        [
+            "forecast", str(undated_crm_csv), "--h", "1", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "MS",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "2 row(s)" in err and "null" in err
+
+
+def test_agg_without_freq_rejects_rows_with_a_null_ds(undated_crm_csv, capsys):
+    """--agg drops undated rows on its own too, with no --freq involved."""
+    rc = main(
+        [
+            "forecast", str(undated_crm_csv), "--h", "1", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "null" in err and "ds" in err
 
 
 # -- forecast --param ------------------------------------------------------------

@@ -90,6 +90,97 @@ class TestKalmanForecaster:
         # one-step predictions of a noisy constant should hug the level
         assert abs(np.nanmean(fitted) - 10.0) < 0.5
 
+    @pytest.mark.parametrize("model", ["local_level", "local_linear"])
+    def test_mle_is_scale_equivariant(self, model):
+        """Fitted variances and forecasts must follow the units of ``y``.
+
+        Through v0.8.0 the optimizer searched the *absolute* log-variances of R
+        and Q inside a fixed ``(-30, 30)`` box, starting from
+        ``log(var(diff(y)))``. Both are unit-carrying, so re-denominating a
+        series (dollars instead of millions) walked the fit into the corner of
+        the box: R and Q were clamped, the trend was killed off the point
+        forecast and the intervals came out ~5x too narrow at ``c = 1e8`` and
+        ~50x too wide at ``c = 1e-8`` -- silently, with no convergence check.
+
+        The Gaussian state-space likelihood obeys
+        ``nll(c*y; c^2 R, c^2 Q, c^2 P0) = nll(y; R, Q, P0) + (n - k)*log(c)``
+        (the offset is one ``log(c)`` per *retained* prediction error, and the
+        filter skips the ``k`` diffuse warm-up rows; either way it does not
+        depend on the parameters), so the
+        MLE is exactly equivariant: ``R/c^2``, ``Q/c^2``, ``yhat/c`` and
+        ``sigma/c`` must not depend on ``c``. Fitting a unit-scale copy of the
+        series and scaling the units-carrying quantities back restores that; the
+        tolerances here only absorb float noise in ``y * c`` (the slope variance
+        of ``local_linear`` sits at the degenerate zero boundary for this DGP,
+        hence the absolute floor on the variance comparison).
+        """
+        rng = np.random.default_rng(11)
+        n = 200
+        base = (
+            50.0
+            + np.cumsum(rng.standard_normal(n))
+            + 0.4 * np.arange(n)
+            + 2.0 * rng.standard_normal(n)
+        )
+        var_floor = 1e-4 * float(np.var(np.diff(base)))
+        ref_var = ref_fcst = None
+        for c in (1e-8, 1e-6, 1e-3, 1.0, 1e3, 1e6, 1e8):
+            fitted = KalmanForecaster(model=model).fit(to_panel(base * c))
+            state = next(iter(fitted._series_state.values()))
+            pred = fitted.predict(10, level=[80])
+            var = np.concatenate([[state["R_"] / c**2], np.diag(state["Q_"]) / c**2])
+            fcst = np.concatenate(
+                [pred["yhat"].to_numpy() / c, (pred["hi-80"] - pred["lo-80"]).to_numpy() / c]
+            )
+            if ref_var is None:
+                ref_var, ref_fcst = var, fcst
+            else:
+                np.testing.assert_allclose(var, ref_var, rtol=2e-2, atol=var_floor)
+                np.testing.assert_allclose(fcst, ref_fcst, rtol=2e-3)
+
+    def test_large_magnitude_series_is_not_pinned_to_the_variance_bounds(self):
+        """A dollar-denominated series must not clamp R and Q on the search box.
+
+        The v0.8.0 bound artifact was directly observable: for ``var(diff(y)) >
+        exp(30)`` the fit stopped at the corner of the box with ``R == Q ==
+        exp(30)`` -- 140 nats worse than the optimum -- rather than at the MLE.
+        The box is now applied to the variance *ratios* to ``var(diff(y))``, so
+        the fitted variances must track the series' own scale and leave real
+        headroom inside the box.
+        """
+        rng = np.random.default_rng(12)
+        y = 1e8 * (100.0 + np.cumsum(rng.standard_normal(150)))
+        state = next(
+            iter(KalmanForecaster(model="local_level").fit(to_panel(y))._series_state.values())
+        )
+        var_dy = float(np.var(np.diff(y)))
+        assert var_dy > np.exp(30.0), "the DGP must exceed the old absolute upper bound"
+        ratios = np.concatenate([[state["R_"]], np.diag(state["Q_"])]) / var_dy
+        assert np.all(np.exp(-30.0) < ratios) and np.all(ratios < np.exp(30.0))
+        assert np.all(ratios < 10.0), f"variances not tracking var(diff(y)): {ratios}"
+        assert state["R_"] != state["Q_"][0, 0], "R and Q collapsed onto the same bound"
+
+    def test_absurd_magnitude_does_not_raise_a_bare_overflowerror(self):
+        """Rescaling must saturate, not raise an untyped Python exception.
+
+        The unit-scale fit multiplies the fitted variances back by the square of
+        the series scale. Written as ``scale ** 2`` that is a *float* power,
+        which raises ``OverflowError: (34, 'Result too large')`` above ~1.3e154
+        instead of returning inf -- so a 1e155-magnitude panel died with a bare
+        builtin exception from inside the library (1e153 fitted fine: the
+        threshold was invisible to the caller). Every other quantity in the
+        filter saturates to inf, and a library must not leak an untyped
+        OverflowError, so the multiplication saturates too: the point forecasts
+        stay in the units of ``y`` and only the (genuinely unrepresentable)
+        variances go to inf.
+        """
+        rng = np.random.default_rng(0)
+        y = (10.0 + rng.standard_normal(40)) * 1e155
+        fitted = KalmanForecaster().fit(to_panel(y))
+        pred = fitted.predict(3)
+        assert np.isfinite(pred["yhat"]).all()
+        assert pred["yhat"].iloc[0] == pytest.approx(y[-1], rel=0.5)
+
     def test_default_on_contract_panel(self):
         df = _contract_panel()
         pred = KalmanForecaster().fit(df).predict(H, level=[80])

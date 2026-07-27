@@ -19,7 +19,11 @@ CSV in, CSV (or printed table) out::
 duplicate ``(unique_id, ds)`` rows (``count`` ignores target values), and
 ``--freq FREQ`` reindexes each series to a regular grid from its first to its
 last timestamp, filling gaps per ``--fill {zero,nan}`` (default ``zero``).
-Timestamps must land on the ``--freq`` grid (e.g. month starts for ``MS``).
+Timestamps need not land on the grid: each is bucketed into the period that
+contains it (a deal closed 2024-01-17 counts in the ``MS`` period
+2024-01-01), so nothing is dropped: two rows in one period then need
+``--agg`` to say how they combine, and a row with no date at all belongs to
+no period and is an error rather than a silent deletion.
 
 Alternatively ``--mapping NAME`` applies a named platform recipe (list them
 with ``forecast-os mappings``) that renames, filters, and aggregates the raw
@@ -74,6 +78,25 @@ def _split_csv_arg(value: str) -> list[str]:
 # -- panel mapping (--id-col/--time-col/--target-col/--agg/--freq) -------------
 
 
+def _require_dated_rows(df: pd.DataFrame, flag: str) -> None:
+    """Reject rows whose ds is null: they cannot be placed in any period.
+
+    A groupby drops null keys by default, so an undated row (an open deal
+    with no close date) vanished from the panel along with its y. That is the
+    silent loss :func:`~forecast_os.gtm.to_panel` already refuses to make, so
+    ``--mapping`` and the manual options answer the same way.
+    """
+    null = df[TIME_COL].isna()
+    if not bool(null.any()):
+        return
+    labels = list(df.index[null][:5])
+    raise ValueError(
+        f"{flag} cannot place {int(null.sum())} row(s) with a null/blank ds "
+        f"(row label(s) {labels}); their period is unknowable, so filter or "
+        "fill them first — dropping them here would silently lose their y"
+    )
+
+
 def _aggregate(df: pd.DataFrame, how: str) -> pd.DataFrame:
     """Collapse duplicate (unique_id, ds) rows; ``count`` ignores target values."""
     for col in (ID_COL, TIME_COL):
@@ -81,6 +104,7 @@ def _aggregate(df: pd.DataFrame, how: str) -> pd.DataFrame:
             raise ValueError(
                 f"--agg requires a {col!r} column; map one with --id-col/--time-col"
             )
+    _require_dated_rows(df, "--agg")
     if how == "count":
         counted = df.groupby([ID_COL, TIME_COL], as_index=False).size()
         return counted.rename(columns={"size": TARGET_COL})
@@ -91,11 +115,46 @@ def _aggregate(df: pd.DataFrame, how: str) -> pd.DataFrame:
     return df.groupby([ID_COL, TIME_COL], as_index=False)[TARGET_COL].agg(how)
 
 
+def _bucket_ds(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Snap each ds to the label of the ``freq`` period that CONTAINS it.
+
+    Exports close deals on arbitrary days, so requiring timestamps to land
+    on the grid meant reindexing deleted them (and ``--fill zero`` then
+    invented a 0.0 in their place). Bucketing first is what ``--mapping``
+    already does, so both paths agree: a period's y is the total of every
+    row inside it, and a row with no date at all is refused rather than
+    dropped (see :func:`_require_dated_rows`).
+
+    A tz-aware ds buckets by its LOCAL wall clock and stays in its own
+    timezone: the period-label helper's ``to_period`` hop returns naive
+    labels, so the conversion happens here and back again.
+    """
+    if TIME_COL not in df.columns:
+        raise ValueError(f"--freq requires a {TIME_COL!r} column; map one with --time-col")
+    if not pd.api.types.is_datetime64_any_dtype(df[TIME_COL]):
+        raise ValueError("--freq requires a datetime 'ds' column")
+    if len(df) == 0:
+        return df
+    _require_dated_rows(df, "--freq")
+    from .gtm.events import _bucket_to_period_label
+
+    tz = df[TIME_COL].dt.tz
+    dates = df[TIME_COL] if tz is None else df[TIME_COL].dt.tz_localize(None)
+    labels = _bucket_to_period_label(dates, freq)
+    if tz is not None:
+        # a period may start in a gap (Santiago has no 2024-09-08 00:00) or be
+        # repeated by a fall-back; label it with the first instant that exists
+        labels = labels.dt.tz_localize(tz, ambiguous=True, nonexistent="shift_forward")
+    return df.assign(**{TIME_COL: labels})
+
+
 def _regularize(df: pd.DataFrame, freq: str, fill: str) -> pd.DataFrame:
     """Reindex each series to a regular ``freq`` grid over its own ds range.
 
-    Gaps get ``y = 0.0`` (``fill="zero"``, the GTM default: a period with no
-    rows is a period with no bookings) or ``NaN`` (``fill="nan"``).
+    Timestamps are first bucketed into their containing period (see
+    :func:`_bucket_ds`), so no row is ever dropped by the reindex. Gaps get
+    ``y = 0.0`` (``fill="zero"``, the GTM default: a period with no rows is
+    a period with no bookings) or ``NaN`` (``fill="nan"``).
     """
     for col in (ID_COL, TIME_COL, TARGET_COL):
         if col not in df.columns:
@@ -103,22 +162,23 @@ def _regularize(df: pd.DataFrame, freq: str, fill: str) -> pd.DataFrame:
                 f"--freq requires a {col!r} column; map one with "
                 f"--id-col/--time-col/--target-col"
             )
-    if not pd.api.types.is_datetime64_any_dtype(df[TIME_COL]):
-        raise ValueError("--freq requires a datetime 'ds' column")
+    df = _bucket_ds(df, freq)  # idempotent: on-grid timestamps map to themselves
     frames = []
     for uid, g in df.groupby(ID_COL, sort=True):
         s = g.sort_values(TIME_COL).set_index(TIME_COL)[TARGET_COL]
         if s.index.duplicated().any():
             raise ValueError(
-                f"series {uid!r} has duplicate ds values; pass --agg to collapse "
-                f"them before --freq"
+                f"series {uid!r} has duplicate ds values in one {freq!r} period; "
+                f"pass --agg to collapse them before --freq"
             )
         grid = pd.date_range(s.index.min(), s.index.max(), freq=freq)
-        s = s.reindex(grid)
-        if s.notna().sum() == 0:
+        off_grid = s.index.difference(grid)
+        if len(off_grid) > 0:  # nothing may be dropped by the reindex below
             raise ValueError(
-                f"--freq {freq!r} does not align with the ds values of series {uid!r}"
+                f"--freq {freq!r} does not align with the ds values of series "
+                f"{uid!r}: {off_grid[0]} is not on the grid"
             )
+        s = s.reindex(grid)
         if fill == "zero":
             s = s.fillna(0.0)
         frames.append(
@@ -166,6 +226,11 @@ def _prepare_panel(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
         clobbered = [c for c in rename.values() if c in df.columns]
         df = df.drop(columns=clobbered).rename(columns=rename)
     df = _ensure_datetime_ds(df)
+    if args.freq:
+        # bucket BEFORE aggregating so --agg collapses whole periods, not
+        # exact timestamps: two deals closed on different days of one month
+        # are one monthly total, not a duplicate-ds error.
+        df = _bucket_ds(df, args.freq)
     if args.agg:
         df = _aggregate(df, args.agg)
     if args.freq:
@@ -272,7 +337,8 @@ def _add_panel_options(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--freq", default=None,
-        help="pandas frequency (e.g. MS, W-MON) to reindex each series to a regular grid",
+        help="pandas frequency (e.g. MS, W-MON) to reindex each series to a regular "
+        "grid; off-grid timestamps are bucketed into the period containing them",
     )
     p.add_argument(
         "--fill", choices=("zero", "nan"), default="zero",

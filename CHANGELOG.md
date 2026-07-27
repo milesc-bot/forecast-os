@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.9.0 (2026-07-27)
+
+Correctness release. An adversarial audit of the whole repository found 73
+confirmed defects; this ships the must-fix tier. The recurring theme is data
+that disappeared or came back wrong **without saying so**, so several calls
+that used to succeed quietly now fail loudly — see "Breaking" below.
+
+### Breaking — things that used to succeed and now raise
+
+- **Null keys are rejected by `validate_panel`.** A NaN `unique_id` or `ds`
+  passed validation and then vanished: pandas' `groupby` defaults to
+  `dropna=True`, so one blank id cell deleted an entire series from the
+  forecast with no error, and a null `ds` sorted to the end of its series where
+  it was mistaken for the latest observation, silently changing the point
+  forecast. `allow_missing` does not waive this — it concerns a missing
+  observation, not a row that cannot say what it is.
+- **`gtm.events.to_panel` rejects null dates and ids.** It was dropping those
+  rows: a four-row frame totalling 100.0 came back totalling 70.0. Null ids
+  were worse than dropped — `.astype(str)` turned them into a series literally
+  named `"nan"`.
+- **The CLI rejects undated rows under `--freq`/`--agg`** instead of discarding
+  them (exit code 2, naming the offending row labels). Off-grid timestamps are
+  now *bucketed* into their containing period rather than deleted; the
+  documented example was losing 96% of its revenue.
+- **Non-numeric value columns raise** in `connectors.base` instead of being
+  string-concatenated: two deals of $1,000 and $2,000 summed to `10002000.0`.
+- **`DealScorer` rejects a nullable target containing `pd.NA`** instead of
+  training a degenerate all-zero model that scored every deal at p=0.5.
+- **`pipeline_waterfall` rejects null amounts** that would break the
+  reconciliation identity (opening + movements == closing).
+- **`GARCH11.fit` raises on non-convergence** rather than returning parameters
+  that are not the MLE. It gained `converged_` and `opt_message_`.
+- **Forecast horizons are capped** at `core.base.MAX_HORIZON` (10,000) — see
+  0.8.1.
+
+### Fixed — silently wrong numbers
+
+- **`evaluate()` gave a ~6x wrong MASE/RMSSE on an unsorted panel.** Those
+  metrics scale on `mean(|y_t - y_{t-m}|)`, defined only on the chronologically
+  ordered series; `cross_validation` was already order-invariant, so the same
+  frame produced a correct `cv_df` and a wrong metric. Now order-invariant.
+- **Platt calibration made probabilities worse, and `calibrate=True` is the
+  default.** On a separable split the unpenalized slope ran to ~1e3 and pinned
+  every win probability to 0/1 — out-of-sample log loss 10x worse than
+  predicting the base rate. Now uses Platt (1999) smoothed targets, which make
+  the objective bounded under separation, fitted on cross-fitted out-of-fold
+  scores. Calibration is skipped on samples too small to estimate the map, and
+  says so with a warning rather than silently doing nothing.
+- **`weighted_pipeline(by=...)` dropped deals with a null segment label**, so
+  segments no longer summed to the ungrouped total. The null group is now
+  surfaced (with a warning naming the column, the count, and the dollars), so
+  segments reconcile.
+- **`KalmanForecaster` was not scale-equivariant**: hard-coded log-variance
+  bounds meant large- or small-magnitude series got bound-clamped parameters,
+  wrong point forecasts and miscalibrated intervals. It now fits a unit-scale
+  copy, as `arima`/`sarima` already did.
+- **`ShiftedBetaGeometric` anchored cohort age on `y[0]` rather than `ds`**,
+  shifting the whole retention curve when age-0 retention was below 1.0.
+- **Timezone-aware snapshots were written successfully but were permanently
+  unreadable** — `load()` and `history()` both raised `TypeError`.
+- **`AutoSelect()` crashed** on any series whose length fell in a narrow band
+  just above its CV span.
+
+### Notes
+
+`connectors.base` validates numeric text before stripping separators, so
+US-format `"1,000.50"` and accounting negatives `"(500)"` parse while
+ambiguous European `"1.000,50"` is rejected rather than silently read as
+`1.0005`.
+
+Every fix in this release carries a regression test naming the defect it
+prevents. 1561 tests pass.
+
 ## 0.8.1 (2026-07-27)
 
 Security and robustness fixes for the REST surface. Recommended upgrade for

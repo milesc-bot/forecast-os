@@ -15,6 +15,7 @@ Mappings are registered like models, so platform recipes are discoverable
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 
@@ -31,6 +32,48 @@ __all__ = [
     "list_mappings",
     "register_mapping",
 ]
+
+
+#: The accounting spelling of a negative amount: "(500)", "$(500)", "($500)".
+#: The captured body is validated like any other value before it is negated.
+_ACCOUNTING_NEG_RE = re.compile(r"^\s*([$€£¥]?\s*)\(\s*(.*?)\s*\)\s*$")
+
+
+def _numeric_values(values: pd.Series, mapping_name: str, column: str) -> pd.Series:
+    """Coerce a text-typed value column to float, or raise naming the offender.
+
+    Only file sources clean their records: a REST payload (HubSpot returns
+    every deal property as a JSON string) or a warehouse TEXT column arrives
+    here as text, and aggregating text CONCATENATES it — ``"1000"`` and
+    ``"2000"`` summed to 10002000.0 instead of 3000.0. Money formatting is
+    accepted so all four source types share one numeric contract, using the
+    CSV/Parquet cleaner's own pattern: a value is validated BEFORE its
+    separators are stripped, because stripping ``,`` unconditionally turns
+    the de-DE ``"1.000,50"`` into 1.0005 — a plausible answer a thousand
+    times too small. Anything that pattern does not recognise raises instead.
+    Blank strings (an unset property) are treated as missing, which the
+    skipna aggregations then ignore.
+    """
+    if pd.api.types.is_numeric_dtype(values):
+        return values
+    # local import: connectors.files imports this module at import time
+    from .files import _NUMERIC_TEXT_RE, _STRIP_RE
+
+    text = values.astype("string").str.strip()
+    text = text.where(text.str.len() > 0)  # "" is an unset value, not a number
+    body = text.str.replace(_ACCOUNTING_NEG_RE, r"\1\2", regex=True)
+    negative = text.str.match(_ACCOUNTING_NEG_RE).fillna(False)
+    bad = values[~(body.str.match(_NUMERIC_TEXT_RE).fillna(True))]
+    if len(bad) > 0:
+        raise DataContractError(
+            f"mapping {mapping_name!r} cannot aggregate value column {column!r}: "
+            f"{bad.iloc[0]!r} is not a number (dtype {values.dtype}). Expected "
+            "digits with an optional sign, currency symbol, ',' thousands "
+            "separators and a '.' decimal point. Map a numeric column or clean "
+            "the values before applying the mapping"
+        )
+    numbers = pd.to_numeric(body.str.replace(_STRIP_RE, "", regex=True))
+    return numbers.mask(negative, -numbers).astype(float)
 
 
 @dataclass(frozen=True)
@@ -64,7 +107,13 @@ class SchemaMapping:
     date_format: str | None = None
 
     def apply(self, records: pd.DataFrame, **overrides) -> pd.DataFrame:
-        """Rename, filter, and aggregate ``records`` into a contract panel."""
+        """Rename, filter, and aggregate ``records`` into a contract panel.
+
+        A text-typed ``value_col`` (REST payloads and warehouse TEXT columns
+        arrive as strings) is coerced to float before aggregating; values
+        that are not numbers raise :class:`DataContractError`. ``agg="count"``
+        counts rows, so it never reads the values and never coerces them.
+        """
         m = replace(self, **{k: v for k, v in overrides.items() if hasattr(self, k)})
         unknown = set(overrides) - set(self.__dataclass_fields__)
         if unknown:
@@ -96,6 +145,9 @@ class SchemaMapping:
             raise DataContractError(
                 f"mapping {m.name!r} matched no rows (filters: {m.filters})"
             )
+        if m.value_col is not None and m.agg != "count":
+            values = _numeric_values(out[m.value_col], m.name, m.value_col)
+            out = out.assign(**{m.value_col: values})
         id_cols = list(m.id_cols) if m.id_cols else None
         if id_cols is None:
             out = out.assign(_series=m.name)

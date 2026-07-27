@@ -10,8 +10,9 @@ import pandas as pd
 import pytest
 
 from forecast_os.connectors import mappings  # noqa: F401  (registers the recipes)
-from forecast_os.connectors.base import Source
+from forecast_os.connectors.base import Source, apply_mapping
 from forecast_os.connectors.files import CSVSource, ParquetSource, _clean_numeric_text
+from forecast_os.core.exceptions import DataContractError
 from forecast_os.core.types import ID_COL, TARGET_COL, TIME_COL
 
 
@@ -69,6 +70,103 @@ def test_csv_source_read_csv_kwargs_passed_through(tmp_path):
     assert list(records.columns) == ["date", "whatever"]
     panel = src.to_panel()
     assert list(panel[TARGET_COL]) == [2.0]
+
+
+# -- text-typed value columns (regression: strings were concatenated) ----------
+#
+# CSV/Parquet run _clean_numeric_text on fetch, but REST and SQL sources do
+# not: HubSpot's CRM API returns every deal property as a JSON string and a
+# warehouse TEXT column arrives the same way. Those frames reach
+# SchemaMapping.apply as text, where summing CONCATENATED it — two $1,000 /
+# $2,000 deals aggregated to 10002000.0 instead of 3000.0 — so the mapping
+# itself must coerce the value column before aggregating.
+
+
+@pytest.fixture
+def text_deals():
+    """HubSpot API-shaped records: every property value is a string."""
+    return pd.DataFrame(
+        {
+            "closedate": ["2026-01-05", "2026-01-20", "2026-02-14"],
+            "amount": ["1000", "2000", "500"],
+            "dealstage": ["closedwon", "closedwon", "closedwon"],
+        }
+    )
+
+
+def test_mapping_sums_text_typed_value_column(text_deals):
+    """String amounts must be summed, not concatenated ('1000'+'2000' = 3000)."""
+    panel = apply_mapping(text_deals, "hubspot_deals")
+    assert list(panel[TARGET_COL]) == [3000.0, 500.0]
+
+
+def test_mapping_means_text_typed_value_column(text_deals):
+    """agg='mean' on a text column raised a bare TypeError instead of averaging."""
+    panel = apply_mapping(text_deals, "hubspot_deals", agg="mean")
+    assert list(panel[TARGET_COL]) == [1500.0, 500.0]
+
+
+def test_mapping_strips_money_formatting_in_text_values(text_deals):
+    """A text value column shares the file sources' money-format contract."""
+    records = text_deals.assign(amount=["$1,234.50", "$765.50", "$2,500.00"])
+    panel = apply_mapping(records, "hubspot_deals")
+    assert list(panel[TARGET_COL]) == [2000.0, 2500.0]
+
+
+def test_mapping_rejects_non_numeric_value_column(text_deals):
+    """Genuinely non-numeric values must fail loudly, not produce a nonsense sum."""
+    records = text_deals.assign(amount=["1000", "twelve hundred", "500"])
+    with pytest.raises(DataContractError, match="twelve hundred"):
+        apply_mapping(records, "hubspot_deals")
+
+
+def test_mapping_treats_blank_text_values_as_missing(text_deals):
+    """An unset property comes back as ''; that is a missing value, not an error."""
+    records = text_deals.assign(amount=["1000", "", "500"])
+    panel = apply_mapping(records, "hubspot_deals")
+    # skipna, exactly as a NaN-valued row aggregates
+    assert list(panel[TARGET_COL]) == [1000.0, 500.0]
+
+
+def test_mapping_leaves_numeric_value_columns_alone(text_deals):
+    """Already-numeric frames (REST JSON numbers, float CSVs) are untouched."""
+    records = text_deals.assign(amount=[1000.5, 2000.25, 500.0])
+    panel = apply_mapping(records, "hubspot_deals")
+    assert list(panel[TARGET_COL]) == [3000.75, 500.0]
+
+
+def test_mapping_rejects_european_formatted_money(text_deals):
+    """'1.000,50' is one thousand and fifty cents, not 1.0005.
+
+    The text coercion stripped ',' from every value with no shape check, so a
+    de-DE/fr-FR export silently became 1000x too small (3.50 instead of
+    3500.50) where it used to fail loudly. ``files._clean_numeric_text``
+    validates against a money/number pattern before stripping and leaves
+    anything else alone; this must share that pattern rather than guess.
+    """
+    records = text_deals.assign(amount=["1.000,50", "2.500,00", "500"])
+    with pytest.raises(DataContractError, match=r"1\.000,50"):
+        apply_mapping(records, "hubspot_deals")
+
+
+def test_mapping_reads_accounting_negatives(text_deals):
+    """'(500)' is the Excel/accounting spelling of -500, not a parse error."""
+    records = text_deals.assign(amount=["(500)", "$(250.50)", "1,000"])
+    panel = apply_mapping(records, "hubspot_deals")
+    assert list(panel[TARGET_COL]) == [-750.5, 1000.0]
+
+
+def test_mapping_count_agg_does_not_require_numeric_values(text_deals):
+    """agg='count' counts rows, so a text value column is not an error.
+
+    to_panel's count branch is a dtype-agnostic non-null count, but the new
+    coercion ran unconditionally and rejected the stage labels it never
+    reads. Blank strings must keep counting too: '' is a value that was
+    present, and count asks how many rows there were.
+    """
+    records = text_deals.assign(amount=["won", "", "lost"])
+    panel = apply_mapping(records, "hubspot_deals", agg="count")
+    assert list(panel[TARGET_COL]) == [2.0, 1.0]
 
 
 # -- GA4 CSV end to end (regression: YYYYMMDD dates must not become 1970) ------

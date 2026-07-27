@@ -190,6 +190,246 @@ class TestValidation:
             pipeline_waterfall([1, 2, 3], _after(), STAGES, won_stage=WON, lost_stage=LOST)
 
 
+class TestNullAmounts:
+    """A null amount on an OPEN deal must be rejected, never reconciled away.
+
+    A NaN/pd.NA amount used to slip through ``_require_deals`` (which only
+    checked that the column was numeric) and then split the two code paths:
+    ``_open_total`` summed it as 0 via pandas' skipna, while ``_classify``
+    computed ``delta = amount_after - amount_before`` = NaN, which is neither
+    ``> 0`` nor ``< 0``, so the deal fell through to ``unchanged``/``advanced``
+    with amount 0.0. The bridge then failed to close (opening 100 + movements 0
+    != closing 300) with NO NaN anywhere in the output to signal it — the one
+    outcome a reconciliation tool must never produce. A missing amount on an
+    open deal is missing money: the waterfall cannot know whether it is 0 or
+    300, so it raises DataContractError naming the deal instead of guessing.
+
+    The rejection is scoped to the amounts the bridge actually reads. A CLOSED
+    deal's amount in the snapshot it is closed in is never read — ``_classify``
+    returns ``-(amount_before if open_before else 0)`` for won/lost/removed and
+    ``_open_total`` filters closed stages out of both anchors — so rejecting it
+    would refuse an input the waterfall answers exactly, which the class below
+    pins.
+    """
+
+    def test_null_amount_in_before_raises(self):
+        before = _before()
+        before.loc[before["opp_id"] == "D4", "amount"] = float("nan")
+        with pytest.raises(DataContractError, match=r"null amount.*'D4'"):
+            pipeline_waterfall(
+                before, _after(), STAGES, won_stage=WON, lost_stage=LOST
+            )
+
+    def test_null_amount_in_after_raises(self):
+        after = _after()
+        after.loc[after["opp_id"] == "D9", "amount"] = float("nan")
+        with pytest.raises(DataContractError, match=r"null amount.*'D9'"):
+            pipeline_waterfall(
+                _before(), after, STAGES, won_stage=WON, lost_stage=LOST
+            )
+
+    def test_nullable_integer_pd_na_amount_raises(self):
+        before = _before()
+        before["amount"] = pd.array(
+            [100, 200, 150, None, 120, 80, 500, 90], dtype="Int64"
+        )
+        with pytest.raises(DataContractError, match=r"null amount.*'D4'"):
+            pipeline_waterfall(
+                before, _after(), STAGES, won_stage=WON, lost_stage=LOST
+            )
+
+    def test_summary_also_raises_rather_than_reporting_a_broken_bridge(self):
+        # the exact repro: 100 -> 300 with the before amount missing used to
+        # return opening 100 / unchanged 0 / closing 300 and no NaN at all
+        before = pd.DataFrame(
+            {"opp_id": ["D1"], "amount": [float("nan")], "stage": ["propose"]}
+        )
+        after = pd.DataFrame(
+            {"opp_id": ["D1"], "amount": [300.0], "stage": ["propose"]}
+        )
+        with pytest.raises(DataContractError, match=r"null amount"):
+            waterfall_summary(before, after, STAGES, won_stage=WON, lost_stage=LOST)
+
+
+class TestNullAmountsOnClosedDealsAreAnswerable:
+    """A null amount the bridge never reads must not abort the bridge.
+
+    The null-amount guard was first written as a blanket "no NaN anywhere in
+    either snapshot" check, which over-rejected: the sign convention makes a
+    closed deal's amount in the snapshot where it is closed provably unread
+    (won/lost/removed contribute ``-amount_before``, and only when the deal was
+    OPEN before; ``_open_total`` excludes closed stages from both anchors). So
+    a CRM that blanks the amount when a deal is marked lost — an everyday
+    behaviour, and one the module docstring already accommodates by reporting
+    the BEFORE value for won/lost — made the whole bridge unrunnable even
+    though every number in it was exactly computable.
+
+    These cases must reconcile, with the same numbers a fully-populated
+    snapshot would give. The genuine bug stays fixed: a null on a deal that is
+    open in that snapshot (see :class:`TestNullAmounts`) still raises.
+    """
+
+    def test_deal_lost_in_after_with_a_blanked_amount_still_bridges(self):
+        before = pd.DataFrame(
+            {"opp_id": ["a", "b"], "amount": [100.0, 300.0], "stage": ["propose", "qualify"]}
+        )
+        after = pd.DataFrame(
+            {"opp_id": ["a", "b"], "amount": [float("nan"), 300.0], "stage": [LOST, "qualify"]}
+        )
+        summ = waterfall_summary(before, after, STAGES, won_stage=WON, lost_stage=LOST)
+        assert not summ.isna().any().any()
+        assert _cat(summ, "lost") == (1, -100.0)  # the BEFORE value left the pipeline
+        assert float(summ["amount"].iloc[0]) == 400.0
+        assert float(summ["amount"].iloc[-1]) == 300.0
+        assert float(summ["running_total"].iloc[-2]) == pytest.approx(300.0)
+
+    def test_deal_closed_won_in_both_snapshots_with_a_null_amount_still_bridges(self):
+        before = pd.DataFrame(
+            {"opp_id": ["a", "b"], "amount": [float("nan"), 300.0], "stage": [WON, "qualify"]}
+        )
+        after = pd.DataFrame(
+            {"opp_id": ["a", "b"], "amount": [float("nan"), 300.0], "stage": [WON, "qualify"]}
+        )
+        summ = waterfall_summary(before, after, STAGES, won_stage=WON, lost_stage=LOST)
+        assert not summ.isna().any().any()
+        # 'a' was already closed before, so it contributes nothing either side
+        assert _cat(summ, "won") == (1, 0.0)
+        assert float(summ["amount"].iloc[0]) == 300.0
+        assert float(summ["amount"].iloc[-1]) == 300.0
+
+    def test_deal_created_and_won_in_period_with_a_null_amount_still_bridges(self):
+        before = pd.DataFrame({"opp_id": ["b"], "amount": [300.0], "stage": ["qualify"]})
+        after = pd.DataFrame(
+            {"opp_id": ["a", "b"], "amount": [float("nan"), 300.0], "stage": [WON, "qualify"]}
+        )
+        summ = waterfall_summary(before, after, STAGES, won_stage=WON, lost_stage=LOST)
+        assert not summ.isna().any().any()
+        # never entered the open pipeline, so it moves the bridge by 0
+        assert _cat(summ, "won") == (1, 0.0)
+        assert float(summ["amount"].iloc[0]) == 300.0
+        assert float(summ["amount"].iloc[-1]) == 300.0
+
+    def test_null_on_a_closed_deal_matches_the_populated_answer_exactly(self):
+        # blanking the amount of a deal that is closed in BOTH snapshots must
+        # not change a single number in the bridge
+        populated = _before(), _after()
+        blanked_before, blanked_after = _before(), _after()
+        # D2 is won and D3 lost in `after`; blank their after amounts
+        blanked_after.loc[blanked_after["opp_id"].isin(["D2", "D3"]), "amount"] = float("nan")
+        kwargs = dict(close_col="close_date", won_stage=WON, lost_stage=LOST)
+        expected = waterfall_summary(*populated, STAGES, **kwargs)
+        got = waterfall_summary(blanked_before, blanked_after, STAGES, **kwargs)
+        pd.testing.assert_frame_equal(got, expected)
+
+    def test_nullable_integer_na_on_a_closed_deal_still_bridges(self):
+        # pd.NA in an Int64 column must survive the same narrowing (it reaches
+        # the float conversion in _index_deals rather than being pre-rejected)
+        before = pd.DataFrame({"opp_id": ["a", "b"], "stage": [WON, "qualify"]})
+        before["amount"] = pd.array([None, 300], dtype="Int64")
+        after = pd.DataFrame({"opp_id": ["a", "b"], "stage": [WON, "qualify"]})
+        after["amount"] = pd.array([None, 300], dtype="Int64")
+        summ = waterfall_summary(before, after, STAGES, won_stage=WON, lost_stage=LOST)
+        assert not summ.isna().any().any()
+        assert float(summ["amount"].iloc[-1]) == 300.0
+
+    def test_no_closed_stages_declared_means_every_amount_participates(self):
+        # with no won/lost stage there is no such thing as a closed deal, so
+        # the narrowing must not open a hole: every null is still rejected
+        before = pd.DataFrame({"opp_id": ["a"], "amount": [float("nan")], "stage": ["propose"]})
+        after = pd.DataFrame({"opp_id": ["a"], "amount": [300.0], "stage": ["propose"]})
+        with pytest.raises(DataContractError, match=r"null amount.*'a'"):
+            waterfall_summary(before, after, STAGES)
+
+
+def _random_snapshot(rng, ids, allow_null):
+    """A random deal-grain snapshot over ``ids`` (some rows dropped)."""
+    all_stages = [*STAGES, WON, LOST]
+    rows = []
+    for oid in ids:
+        if rng.random() < 0.15:  # deal absent from this snapshot
+            continue
+        amount = round(float(rng.uniform(10.0, 1000.0)), 2)
+        if allow_null and rng.random() < 0.15:
+            amount = float("nan")
+        rows.append(
+            {
+                "opp_id": oid,
+                "amount": amount,
+                "stage": all_stages[int(rng.integers(len(all_stages)))],
+            }
+        )
+    return pd.DataFrame(rows, columns=["opp_id", "amount", "stage"])
+
+
+def _has_open_null(frame):
+    """True when a null amount sits on a row the bridge actually reads."""
+    return bool((frame["amount"].isna() & ~frame["stage"].isin({WON, LOST})).any())
+
+
+class TestReconciliationProperty:
+    """The bridge identity holds for every input, or the input is rejected.
+
+    ``opening + sum(movements) == closing`` is the whole point of the waterfall,
+    so it is asserted over a spread of generated deal universes rather than one
+    hand-built fixture. Null amounts are deliberately in the generated space:
+    a null the bridge reads (one on an OPEN deal) must produce a loud
+    DataContractError, never a quietly non-reconciling frame (the MUST-9
+    regression). Nothing in between is an acceptable outcome.
+
+    The rejection is also pinned from the other side, which is what the
+    over-broad first version of the guard failed: a snapshot whose only nulls
+    sit on closed deals must still bridge, and it must bridge to the identity.
+    Accepting more inputs is only safe if the guarantee survives, so every
+    accepted scenario is checked for both reconciliation and NaN-freedom.
+    """
+
+    @pytest.mark.parametrize("allow_null", [False, True])
+    def test_identity_holds_or_raises(self, allow_null):
+        import numpy as np
+
+        rng = np.random.default_rng(20240727)
+        saw_reconciled = False
+        saw_rejected = False
+        saw_accepted_with_null = False
+        for _ in range(200):
+            ids = [f"D{i}" for i in range(int(rng.integers(1, 10)))]
+            before = _random_snapshot(rng, ids, allow_null)
+            after = _random_snapshot(rng, ids, allow_null)
+            reads_a_null = _has_open_null(before) or _has_open_null(after)
+            try:
+                summ = waterfall_summary(
+                    before, after, STAGES, won_stage=WON, lost_stage=LOST
+                )
+            except DataContractError:
+                # only a null the bridge reads may be rejected in this space
+                assert allow_null
+                assert reads_a_null
+                saw_rejected = True
+                continue
+
+            # ... and a null it reads is never accepted
+            assert not reads_a_null
+            assert not summ.isna().any().any()
+            if before["amount"].isna().any() or after["amount"].isna().any():
+                saw_accepted_with_null = True
+
+            opening = float(summ["amount"].iloc[0])
+            closing = float(summ["amount"].iloc[-1])
+            movements = summ.iloc[1:-1]
+            assert opening + float(movements["amount"].sum()) == pytest.approx(closing)
+            if len(movements):
+                # the running total after the final movement lands on closing
+                assert float(movements["running_total"].iloc[-1]) == pytest.approx(
+                    closing
+                )
+            saw_reconciled = True
+
+        assert saw_reconciled  # the generator produced real bridges
+        assert saw_rejected == allow_null  # and read-nulls when it was asked to
+        # nulls parked on closed deals reconcile rather than abort the bridge
+        assert saw_accepted_with_null == allow_null
+
+
 class TestWaterfallSummary:
     def test_bridge_anchors_and_running_total(self):
         before, after = _before(), _after()

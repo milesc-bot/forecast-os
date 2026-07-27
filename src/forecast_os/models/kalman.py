@@ -25,6 +25,29 @@ def _system(model: str) -> tuple[np.ndarray, np.ndarray]:
     return np.array([[1.0, 1.0], [0.0, 1.0]]), np.array([1.0, 0.0])
 
 
+def _series_scale(y: np.ndarray) -> float:
+    """Positive factor that carries the units of ``y``, used to fit at unit scale.
+
+    The Gaussian likelihood of a linear state-space model satisfies
+    ``nll(c*y; c**2 R, c**2 Q, c**2 P0) = nll(y; R, Q, P0) + (n - k)*log(c)``
+    (each retained prediction error contributes ``0.5*log(S)`` and :func:`_filter`
+    skips the first ``k`` of the ``n``), so the MLE is exactly equivariant in the
+    units of ``y`` — the offset does not depend on the parameters, so the argmin
+    is unchanged. The optimizer, though, searches *absolute* log-variances inside
+    a fixed box, which is not. Fitting ``y / scale`` and multiplying the variances
+    back by ``scale**2`` leaves the optimum
+    untouched — variances carry the square of the units, the state and the
+    one-step predictions carry them linearly — while giving the optimizer a
+    well-conditioned O(1) problem at any magnitude.
+    """
+    s = float(np.std(np.diff(y)))
+    if not np.isfinite(s) or s <= 0.0:  # constant first differences: use the level
+        s = float(np.std(y))
+    if not np.isfinite(s) or s <= 0.0:  # exactly constant series
+        s = float(np.max(np.abs(y)))
+    return s if np.isfinite(s) and s > 0.0 else 1.0
+
+
 def _filter(
     y: np.ndarray,
     F: np.ndarray,
@@ -77,27 +100,36 @@ class KalmanForecaster(PerSeriesForecaster):
     def _fit_series(self, y: np.ndarray) -> dict:
         F, H = _system(self.model)
         k = F.shape[0]
-        dy = np.diff(y)
-        base_var = max(float(np.var(dy)), 1e-8)
+        # Fit a unit-scale copy: the (-30, 30) log-variance box is then a box on
+        # the variance *ratios* to var(diff(y)), which is scale-free, instead of
+        # clamping R and Q on large- or small-magnitude series.
+        scale = _series_scale(y)
+        z = y / scale
+        base_var = max(float(np.var(np.diff(z))), 1e-8)
         if self.model == "local_level":
-            x0 = np.array([y[0]])
+            x0 = np.array([z[0]])
         else:
-            x0 = np.array([y[0], float(np.mean(np.diff(y[:10])))])
-        p0 = 1e4 * float(np.var(y))
+            x0 = np.array([z[0], float(np.mean(np.diff(z[:10])))])
+        p0 = 1e4 * float(np.var(z))
         P0 = (p0 if p0 > 0 else 1.0) * np.eye(k)
 
         def nll(logparams: np.ndarray) -> float:
-            return _filter(y, F, H, float(np.exp(logparams[0])), np.exp(logparams[1:]), x0, P0)[0]
+            return _filter(z, F, H, float(np.exp(logparams[0])), np.exp(logparams[1:]), x0, P0)[0]
 
         init = np.full(1 + k, np.log(base_var))
         res = optimize.minimize(nll, init, method="L-BFGS-B", bounds=[(-30.0, 30.0)] * (1 + k))
         r = float(np.exp(res.x[0]))
         qdiag = np.exp(res.x[1:])
-        _, preds, x_last, P_last = _filter(y, F, H, r, qdiag, x0, P0)
-        fitted = preds.copy()
+        _, preds, x_last, P_last = _filter(z, F, H, r, qdiag, x0, P0)
+        # Back to the units of y: states are linear in the scale, variances square.
+        fitted = preds * scale
         fitted[:k] = np.nan  # diffuse-prior warm-up
-        return {"fitted": fitted, "x_": x_last, "P_": P_last, "F_": F, "H_": H,
-                "Q_": np.diag(qdiag), "R_": r}
+        # ``scale * scale`` rather than ``scale ** 2``: float pow raises a bare
+        # OverflowError past ~1.3e154, while the product saturates to inf like
+        # every other quantity in the filter.
+        scale_sq = scale * scale
+        return {"fitted": fitted, "x_": x_last * scale, "P_": P_last * scale_sq,
+                "F_": F, "H_": H, "Q_": np.diag(qdiag) * scale_sq, "R_": r * scale_sq}
 
     def _predict_series(self, state: dict, h: int) -> np.ndarray:
         F, H = state["F_"], state["H_"]

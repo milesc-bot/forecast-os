@@ -4,8 +4,10 @@ Candidate models (instances or registry-name strings, resolved with
 :func:`get_model` lazily inside :meth:`fit`) are cross-validated on the
 panel and scored per series; each winning model is refitted on the full
 panel and :meth:`predict` stitches the winners' forecasts together. When
-the panel is too short for the CV span, scoring falls back to a single
-75/25 holdout per series.
+the panel is too short for walk-forward validation — it does not clear the
+CV span, or it clears it by so little that the first fold's training slice
+cannot fit the candidates and the 75/25 split would train on more rows —
+scoring falls back to a single 75/25 holdout per series.
 """
 
 from __future__ import annotations
@@ -31,6 +33,16 @@ _DEFAULT_CANDIDATES = ("naive", "drift", "ses", "holt", "theta", "auto_ets", "wi
 #: Non-seasonal members of the default pool when a season length m > 1 is
 #: resolved; seasonal SeasonalNaive/Theta/AutoETS instances are added to it.
 _SEASONAL_BASE_CANDIDATES = ("naive", "drift", "ses", "window_average")
+
+#: Rows a walk-forward training slice must have beyond the largest candidate
+#: ``min_train_size`` before cross-validation is preferred to the holdout. The
+#: margin is a proxy for one understated declaration: :class:`AutoETS` declares
+#: ``min_train_size = 3`` but its AICc screen needs ``n - k - 1 > 0``, so it
+#: cannot actually be fitted on three rows. It only biases the *choice* between
+#: two scoring schemes — a CV slice inside the margin is kept anyway unless the
+#: holdout is strictly wider (see :meth:`AutoSelect.fit`), so no panel is
+#: rejected for being one row short of it.
+_CV_TRAIN_MARGIN = 1
 
 #: Season length implied by the root of an inferred pandas frequency string
 #: (D->7, B->5, W->52, M/MS/ME->12, Q/QS/QE->4, H->24; anything else -> 1).
@@ -156,27 +168,49 @@ class AutoSelect(BaseForecaster):
             AutoETS(season_length=m),
         )
 
-    def fit(self, df: pd.DataFrame) -> AutoSelect:
-        df = validate_panel(df)
-        sizes = df.groupby(ID_COL)[TARGET_COL].size()
-        span = self.val_h * self.n_windows  # h + (n_windows - 1) * step_size, step = h
-        use_cv = int(sizes.min()) > span
-        # Shortest training slice any candidate will see (first CV fold, or the
-        # 75% holdout train); seasonal candidates and seasonal MASE scaling both
-        # need strictly more than m training rows.
-        if use_cv:
-            train_len = int((sizes - span).min())
-        else:
-            train_len = int((sizes - np.maximum(1, sizes // 4)).min())
+    def _resolve_pool(self, df: pd.DataFrame, train_len: int) -> tuple[int, int, list]:
+        """Season length, MASE seasonality and cloned candidates for a train slice.
 
+        Seasonal candidates and seasonal MASE scaling both need strictly more
+        than ``m`` training rows, so both depend on the shortest slice any
+        candidate will be fitted on.
+        """
         m = self._resolve_season_length(df)
         if m > 1 and train_len <= m and self.season_length == "auto":
             m = 1  # auto-inferred season doesn't fit the data; fall back
         scale_m = m if train_len > m else 1
-
         resolved = [
             get_model(c) if isinstance(c, str) else c.clone() for c in self._candidate_specs(m)
         ]
+        return m, scale_m, resolved
+
+    def fit(self, df: pd.DataFrame) -> AutoSelect:
+        df = validate_panel(df)
+        sizes = df.groupby(ID_COL)[TARGET_COL].size()
+        span = self.val_h * self.n_windows  # h + (n_windows - 1) * step_size, step = h
+        # Shortest training slice each scoring scheme would hand a candidate:
+        # the first CV fold trains on ``n - span`` rows, the holdout on the
+        # first 75%.
+        cv_train_len = int((sizes - span).min())
+        holdout_train_len = int((sizes - np.maximum(1, sizes // 4)).min())
+        use_cv = int(sizes.min()) > span
+        train_len = cv_train_len if use_cv else holdout_train_len
+        m, scale_m, resolved = self._resolve_pool(df, train_len)
+        if use_cv:
+            needed = max(int(mdl.min_train_size) for mdl in resolved) + _CV_TRAIN_MARGIN
+            if cv_train_len < needed and holdout_train_len > cv_train_len:
+                # ``n`` just above the span leaves a first fold too short to fit
+                # the pool on (n = span + 1 gave Drift a single row). That is
+                # "too short for CV" as much as n <= span is: fall back to the
+                # documented 75/25 holdout. The holdout is not always wider (it
+                # keeps ``n - n // 4`` rows against the fold's ``n - span``), so
+                # that has to be checked first: swapping a
+                # feasible CV fold for a *narrower* holdout would reject panels
+                # that fit (13 rows, val_h=1, n_windows=1, SeasonalNaive(12):
+                # the fold trains on 12 rows, the holdout on 10).
+                use_cv = False
+                train_len = holdout_train_len
+                m, scale_m, resolved = self._resolve_pool(df, train_len)
         names = [model.name for model in resolved]
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate candidate model names: {names}")

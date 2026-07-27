@@ -421,6 +421,97 @@ class TestNaNFillValue:
         pd.testing.assert_frame_equal(panel, validate_panel(panel))
 
 
+class TestNullKeysRejected:
+    """Regression: null date/id keys were SILENTLY DELETED from the panel.
+
+    ``work.groupby([unique_id, ds])`` uses pandas' default ``dropna=True``,
+    so a blank/NaT close date (the single most common CRM null: an open
+    deal) or a null id cell removed those rows from the output with no
+    warning — 4 rows totalling 100.0 in, 3 rows totalling 70.0 out. The id
+    path was worse than a drop in principle: ``.astype(str)`` on pandas 2+
+    keeps NA (so the row vanished the same way) and on any object column
+    that stringified it would have invented a bogus ``"nan"`` series.
+
+    A key is not a value: a row that cannot say WHICH series it belongs to
+    or WHEN it happened cannot be bucketed at all, so it is rejected loudly,
+    matching ``validate_panel``'s treatment of null ``unique_id``/``ds``.
+    Callers who genuinely want those rows gone must drop them explicitly.
+    """
+
+    def _open_deal(self, close):
+        """Three closed deals plus one open deal whose close date is ``close``."""
+        return pd.DataFrame(
+            {
+                "rep": ["ana", "ana", "ana", "ana"],
+                "close": ["2026-01-05", "2026-02-10", "2026-03-04", close],
+                "amount": [10.0, 20.0, 40.0, 30.0],
+            }
+        )
+
+    @pytest.mark.parametrize("blank", ["", None, pd.NaT, np.nan])
+    def test_null_or_blank_date_raises_instead_of_deleting_revenue(self, blank):
+        with pytest.raises(DataContractError, match=r"'close'.*1 row\(s\).*null"):
+            to_panel(self._open_deal(blank), id_cols="rep", date_col="close", value_col="amount")
+
+    def test_error_names_the_offending_rows(self):
+        records = self._open_deal(None)
+        with pytest.raises(DataContractError, match="3"):  # the offending row label
+            to_panel(records, id_cols="rep", date_col="close", value_col="amount")
+
+    def test_no_revenue_is_lost_once_the_null_row_is_dropped_explicitly(self):
+        records = self._open_deal(None)
+        kept = records.dropna(subset=["close"])
+        panel = to_panel(kept, id_cols="rep", date_col="close", value_col="amount")
+        assert panel[TARGET_COL].sum() == kept["amount"].sum() == 70.0
+
+    def test_clean_records_keep_every_dollar(self):
+        records = self._open_deal("2026-04-01")
+        panel = to_panel(records, id_cols="rep", date_col="close", value_col="amount")
+        assert panel[TARGET_COL].sum() == records["amount"].sum() == 100.0
+
+    def test_epoch_dates_with_a_null_raise_too(self):
+        # the date_unit path parses NaN -> NaT just as the string path does
+        records = pd.DataFrame(
+            {
+                "rep": ["a", "a"],
+                "created": [float(pd.Timestamp("2026-01-15").timestamp()), np.nan],
+                "amount": [10.0, 90.0],
+            }
+        )
+        with pytest.raises(DataContractError, match="null"):
+            to_panel(records, id_cols="rep", date_col="created", value_col="amount", date_unit="s")
+
+    @pytest.mark.parametrize("null", [None, np.nan, pd.NA])
+    def test_null_id_raises_instead_of_dropping_the_row(self, null):
+        records = pd.DataFrame(
+            {
+                "rep": ["ana", null],
+                "close": ["2026-01-05", "2026-01-09"],
+                "amount": [100.0, 50.0],
+            }
+        )
+        with pytest.raises(DataContractError, match=r"'rep'.*1 row\(s\).*null"):
+            to_panel(records, id_cols="rep", date_col="close", value_col="amount")
+
+    def test_null_in_any_id_level_raises(self):
+        records = _sfdc_export()
+        records.loc[2, "team"] = None
+        with pytest.raises(DataContractError, match="'team'"):
+            to_panel(
+                records, id_cols=["team", "rep"], date_col="close_date", value_col="amount"
+            )
+
+    def test_null_id_is_rejected_before_it_can_be_stringified(self):
+        """A null id must never reach ``.astype(str)`` and become ``"west/nan"``."""
+        records = _sfdc_export()
+        records["rep"] = records["rep"].astype(object)
+        records.loc[3, "rep"] = None
+        with pytest.raises(DataContractError, match="'rep'"):
+            to_panel(
+                records, id_cols=["team", "rep"], date_col="close_date", value_col="amount"
+            )
+
+
 class TestToPanelValidation:
     def test_missing_id_col_raises(self):
         with pytest.raises(DataContractError, match="missing"):

@@ -25,6 +25,14 @@ __all__ = ["to_panel"]
 
 _AGGS = ("sum", "mean", "count")
 _DATE_UNITS = ("s", "ms", "us")
+_MAX_LABELS = 5
+
+
+def _row_labels(mask: pd.Series) -> str:
+    """Render the index labels of the offending rows, truncated for readability."""
+    labels = mask.index[mask].tolist()
+    shown = ", ".join(repr(label) for label in labels[:_MAX_LABELS])
+    return shown + ", ..." if len(labels) > _MAX_LABELS else shown
 
 
 def _bucket_to_period_label(dates: pd.Series, freq: str) -> pd.Series:
@@ -87,7 +95,12 @@ def to_panel(
     Parameters
     ----------
     records : one row per event/opportunity; duplicate dates are legal.
+        Rows with a null key — a null/blank ``date_col`` (an open deal with
+        no close date) or a null value in any of ``id_cols`` — raise
+        :class:`DataContractError` rather than being dropped: they cannot be
+        bucketed, and silently deleting them would lose their value.
     id_cols : column name(s) identifying the series; joined by ``sep``.
+        Values must be non-null (see ``records``).
     date_col : event date column; parsed with ``pd.to_datetime`` using
         ``date_unit`` / ``date_format`` when given. Integer/float date
         columns REQUIRE one of the two hints — bare ``pd.to_datetime``
@@ -172,6 +185,29 @@ def to_panel(
         raise DataContractError(
             f"column {date_col!r} contains unparseable dates: {exc}"
         ) from exc
+
+    # A null key is not a missing value: the row cannot say WHEN it happened
+    # or WHICH series it belongs to, so it cannot be bucketed at all. Left
+    # alone it vanished silently — the groupby below defaults to dropna=True,
+    # so one blank close_date on an open deal deleted its whole amount from
+    # the panel. Reject it here, as validate_panel does for (unique_id, ds).
+    if dates.isna().any():
+        n_null = int(dates.isna().sum())
+        raise DataContractError(
+            f"column {date_col!r} has {n_null} row(s) with a null/blank date "
+            f"(row label(s) {_row_labels(dates.isna())}); their period is unknowable "
+            f"so they cannot be aggregated. Filter or impute them before calling "
+            f"to_panel — dropping them here would silently lose their value"
+        )
+    for col in id_cols:
+        nulls = records[col].isna()
+        if nulls.any():
+            raise DataContractError(
+                f"id column {col!r} has {int(nulls.sum())} row(s) with a null id "
+                f"(row label(s) {_row_labels(nulls)}); a null cannot name a series. "
+                f"Fill it with an explicit sentinel (e.g. 'unassigned') or drop "
+                f"those rows before calling to_panel"
+            )
 
     uid = records[id_cols[0]].astype(str)
     for col in id_cols[1:]:

@@ -51,6 +51,18 @@ so ``won``/``lost`` here show the pipeline REDUCTION (their ``before`` value),
 not the booked revenue. :func:`waterfall_summary` wraps the categories with
 opening/closing anchor rows and a running total, ready to render as a bridge.
 
+Because that identity is the point of the bridge, a null (``NaN``/``pd.NA``)
+``amount`` on a deal that is OPEN in either snapshot is a
+:class:`DataContractError`, not a zero: an amount that is merely missing has no
+defensible signed contribution, and imputing one would close the bridge on a
+number nobody supplied. Fill or drop those deals before bridging.
+
+A null on a deal that is already CLOSED in the snapshot it appears in is fine —
+the signs above never read it (won/lost/removed contribute the BEFORE value, and
+only for deals that were open before; the open-pipeline totals sum open stages
+only), so the bridge is still exactly computable. That covers the common CRM
+habit of blanking the amount when a deal is marked lost.
+
 The module is pure pandas — it touches neither disk nor pyarrow — so it is
 testable on hand-built frames independent of the :class:`SnapshotStore`.
 """
@@ -90,13 +102,24 @@ def _require_deals(
     amount_col: str,
     stage_col: str,
     close_col: str | None,
+    closed: set[Any],
 ) -> None:
     """Validate an opportunity snapshot, raising :class:`DataContractError`.
 
     Requires ``frame`` to be a DataFrame carrying the ``id_col``, ``amount_col``
     and ``stage_col`` columns (plus ``close_col`` when supplied), a numeric
-    amount column, and ``opp_id`` values unique within the snapshot. Empty
-    frames are allowed (a first-period ``before`` may hold no deals).
+    amount column that is non-null on every OPEN deal (stage not in ``closed``),
+    and ``opp_id`` values unique within the snapshot. Empty frames are allowed
+    (a first-period ``before`` may hold no deals).
+
+    Null amounts on open deals are rejected rather than imputed: the bridge is a
+    reconciliation, and a missing amount cannot be netted against its
+    counterpart without silently breaking the identity it exists to prove. A
+    null on a deal already CLOSED in this snapshot is left alone — the sign
+    convention never reads it (won/lost/removed contribute the deal's BEFORE
+    value, and only when it was open before, while the opening/closing anchors
+    sum open stages only), so rejecting it would refuse a bridge that is exactly
+    computable.
     """
     if not isinstance(frame, pd.DataFrame):
         raise DataContractError(
@@ -113,11 +136,23 @@ def _require_deals(
             f"deal contract is (opp_id, amount, stage) with an optional close date"
         )
     try:
-        pd.to_numeric(frame[amount_col])
+        amounts = pd.to_numeric(frame[amount_col])
     except (ValueError, TypeError) as exc:
         raise DataContractError(
             f"{name} opportunity snapshot column {amount_col!r} must be numeric: {exc}"
         ) from exc
+    # only an OPEN deal's amount feeds the bridge; a null on a deal already
+    # closed in this snapshot is never read, so it is not an error here
+    null_amount = amounts.isna() & ~frame[stage_col].isin(closed)
+    if null_amount.any():
+        first = frame.loc[null_amount, id_col].iloc[0]
+        raise DataContractError(
+            f"{name} opportunity snapshot has a null amount for {id_col} {first!r} "
+            f"({int(null_amount.sum())} of {len(frame)} rows); that deal is open in "
+            f"this snapshot, so its amount is part of the open-pipeline total and "
+            f"the waterfall cannot reconcile a missing one — fill or drop those "
+            f"deals before bridging"
+        )
     dup = frame[id_col].duplicated()
     if dup.any():
         first = frame.loc[dup, id_col].iloc[0]
@@ -213,7 +248,10 @@ def pipeline_waterfall(
 
     ``before`` and ``after`` are deal-grain opportunity tables (one row per
     ``opp_id``, with ``amount`` and ``stage`` columns and an optional
-    ``close_col`` close date). ``stages`` is the ordered list of OPEN funnel
+    ``close_col`` close date); their ``amount`` columns must be numeric, and
+    non-null on every deal whose stage is open (a null on a deal already closed
+    in that snapshot is never read, so it is allowed). ``stages`` is the ordered
+    list of OPEN funnel
     stages (index = pipeline progression); ``won_stage``/``lost_stage`` are the
     closed-stage names — a deal whose ``after`` stage equals one of them is
     categorized won/lost. Neither may appear inside ``stages``.
@@ -226,14 +264,14 @@ def pipeline_waterfall(
     the deal universe, so ``n_deals`` sums to the number of distinct deals and
     ``amount`` sums to ``closing_open_pipeline - opening_open_pipeline``.
     """
-    _require_deals(before, "before", id_col, amount_col, stage_col, close_col)
-    _require_deals(after, "after", id_col, amount_col, stage_col, close_col)
+    closed = {s for s in (won_stage, lost_stage) if s is not None}
+    _require_deals(before, "before", id_col, amount_col, stage_col, close_col, closed)
+    _require_deals(after, "after", id_col, amount_col, stage_col, close_col, closed)
     if stages is None or len(stages) == 0:
         raise DataContractError(
             "stages must be a non-empty ordered sequence of open-stage names"
         )
     stages = list(stages)
-    closed = {s for s in (won_stage, lost_stage) if s is not None}
     overlap = [s for s in stages if s in closed]
     if overlap:
         raise DataContractError(

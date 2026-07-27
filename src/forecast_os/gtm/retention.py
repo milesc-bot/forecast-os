@@ -12,7 +12,8 @@ recursion ``p_1 = alpha / (alpha + beta)``,
 ``S(t) = S(t-1) - p_t``. Parameters are estimated per cohort by maximum
 likelihood on the observed retention curve, with an empirical-Bayes-lite
 fallback: cohorts too short for a stable MLE borrow POOLED parameters
-fitted on the position-wise mean curve of all cohorts.
+fitted on the position-wise mean of the cohorts' scale-free (age-0
+normalized) curves.
 """
 
 from __future__ import annotations
@@ -55,6 +56,11 @@ def cohort_panel(
     A ``(unique_id, ds, y)`` panel with integer ``ds`` and ``y`` in [0, 1].
     Monotone-nonincreasing curves are NOT required (measurement noise
     happens), but out-of-range fractions raise :class:`DataContractError`.
+
+    ``period_col`` is passed through as the cohort AGE, and no age handling
+    is applied here: :class:`ShiftedBetaGeometric` additionally requires each
+    cohort's ages to be consecutive integers starting at 0 or 1, so index the
+    periods relative to each cohort's own acquisition period before calling.
     """
     if not isinstance(records, pd.DataFrame):
         raise DataContractError(
@@ -98,12 +104,21 @@ def _sbg_survival(alpha: float, beta: float, horizon: int) -> tuple[np.ndarray, 
     return p, s
 
 
-def _strip_leading_one(y: np.ndarray) -> tuple[np.ndarray, bool]:
-    """Split off an age-0 observation of 1.0 so values map to survival S(1..T)."""
+def _survival_curve(y: np.ndarray) -> np.ndarray:
+    """Rescale an age-anchored cohort curve to model survival ``S(1..T)``.
+
+    ``y[0]`` is the age-0 observation — the cohort's own size at acquisition,
+    which is 1.0 only when every acquired customer activates. It is the SCALE
+    the survival curve is measured against, not an ``S(1)`` observation, so
+    the remaining values are divided by it. Callers guarantee that ``y`` is
+    anchored at age 0 (see :meth:`ShiftedBetaGeometric.fit`) but NOT that
+    ``y[0]`` is positive or that the result lands in [0, 1]: a cohort that
+    nobody activated into divides by zero, and one whose retention rises out
+    of age 0 gives ratios above 1. Both callers screen for those cases
+    themselves rather than pretending this function cannot produce them.
+    """
     y = np.asarray(y, dtype=float)
-    if len(y) and y[0] >= 1.0 - _EPS:
-        return y[1:], True
-    return y, False
+    return y[1:] / y[0]
 
 
 def _sbg_mle(s_obs: np.ndarray) -> tuple[float, float, bool]:
@@ -160,17 +175,27 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
     [0, 1] by construction.
 
     Input convention: each series is a retention curve at consecutive
-    integer ages; a first value of 1.0 is treated as the age-0 anchor and
-    the remaining values as ``S(1..T)``. Values must be fractions in
-    [0, 1] — anything else raises at ``fit`` (this model is retention-only
-    by design and refuses generic panels).
+    integer ages, and ``ds`` — never the value at ``y[0]`` — is what says
+    which age an observation belongs to. A curve starts either at age 0,
+    whose value anchors it (1.0 when every acquired customer activates, less
+    when some churn before their first renewal; the model treats it as a
+    scale and fits ``y[1:] / y[0]`` as ``S(1..T)``), or at age 1, which
+    implies an age-0 anchor of 1.0. Any other first age raises at ``fit``:
+    the curve's position on the age axis would be a guess. Values must be
+    fractions in [0, 1] — anything else raises at ``fit`` (this model is
+    retention-only by design and refuses generic panels).
 
     Empirical-Bayes-lite pooling: ``fit`` first estimates POOLED parameters
-    on the position-wise mean curve across all cohorts, then fits each
-    cohort; a cohort with fewer than ``pooled_threshold`` observations, or
-    whose MLE fails, uses the pooled parameters instead (so even a 2-point
-    cohort forecasts sensibly). At least one series must still have
-    ``min_train_size`` observations for the pooled fit to mean anything.
+    on the position-wise mean of the cohorts' scale-free curves, then fits
+    each cohort; a cohort with fewer than ``pooled_threshold`` observations,
+    or whose MLE fails, or with no age-0 retention to measure survival
+    against, uses the pooled parameters instead (so even a 2-point or dead
+    cohort forecasts sensibly). Both ``pooled_threshold`` and
+    ``min_train_size`` count the rows the CALLER supplied — an age-0 anchor
+    this class supplies for an age-1 curve is bookkeeping, so identical data
+    is shrunk identically whichever age it is written from. At least one
+    series must still have ``min_train_size`` observations for the pooled fit
+    to mean anything.
     """
 
     min_train_size = 3
@@ -191,8 +216,10 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
                 f"forecast_os.gtm.cohort_panel."
             )
         # The sBG recursion indexes survival by integer age, so each cohort's
-        # ds must be consecutive integers: a gapped curve would silently map
-        # observations to the wrong ages.
+        # ds must be consecutive integers starting at the acquisition anchor:
+        # a gapped or floating curve would silently map observations to the
+        # wrong ages.
+        implied_anchor = []
         for uid, g in df.groupby(ID_COL, sort=True):
             ages = g[TIME_COL].to_numpy()
             if not (np.issubdtype(ages.dtype, np.number) and np.all(np.diff(ages) == 1)):
@@ -202,15 +229,43 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
                     f"Build the panel with forecast_os.gtm.cohort_panel and fill "
                     f"missing ages first."
                 )
+            first_age = ages[0]
+            if first_age != 0 and first_age != 1:
+                raise DataContractError(
+                    f"{self.name} reads 'ds' as the cohort age, so each curve must "
+                    f"start at age 0 (the acquisition anchor) or age 1 (which implies "
+                    f"an age-0 anchor of 1.0); cohort {uid!r} starts at age "
+                    f"{first_age}. If its ages are not measured from its own "
+                    f"acquisition period, re-index them so they are; if the cohort is "
+                    f"genuinely observed only from age {first_age} (earlier periods "
+                    f"missing), subtract {first_age} from its ages — sBG is closed "
+                    f"under left truncation, so the forecast is unchanged and only "
+                    f"cohort_params() shifts, reporting beta + {first_age} for beta."
+                )
+            if first_age == 1:
+                implied_anchor.append(uid)
+        # Both thresholds below count the rows the CALLER supplied, so a curve
+        # written from age 1 is treated exactly like the same curve written
+        # from age 0: the anchor materialized next is bookkeeping, not an
+        # observation.
+        n_obs = df.groupby(ID_COL, sort=True).size().to_dict()
         min_needed = self.min_train_size
-        lengths = df.groupby(ID_COL).size()
-        if int(lengths.max()) < min_needed:
+        if max(n_obs.values()) < min_needed:
             raise ForecastOSError(
                 f"{self.name} requires at least {min_needed} observations in at "
                 f"least one series to fit pooled parameters; longest series has "
-                f"{int(lengths.max())}"
+                f"{max(n_obs.values())}"
             )
+        df = self._materialize_implied_anchors(df, implied_anchor)
         self.pooled_params_ = self._fit_pooled(df)
+        # The base-class loop hands _fit_series the y array alone, so each
+        # cohort's caller-row count rides alongside it, lined up here against
+        # the same groupby(ID_COL, sort=True) over the same frame that the
+        # loop iterates — looked up by cohort, so materializing an anchor
+        # cannot re-order or re-pair the counts.
+        self._n_obs_ = iter(
+            [int(n_obs[uid]) for uid, _ in df.groupby(ID_COL, sort=True)]
+        )
         # Short cohorts are legal here because the pooled fallback covers them;
         # relax the per-series floor for the base-class loop, then restore it.
         self.min_train_size = 1
@@ -218,6 +273,15 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
             super().fit(df)
         finally:
             self.min_train_size = min_needed
+            self._n_obs_ = None
+        for uid in implied_anchor:
+            # Drop the synthetic anchor again so fitted_values() mirrors the
+            # panel the caller passed. Sigma is unaffected: the anchor row's
+            # fitted entry is the NaN warm-up slot, which the residual
+            # calculation already skips.
+            state = self._series_state[uid]
+            for key in ("fitted", "_y", "_ds"):
+                state[key] = state[key][1:]
         return self
 
     def cohort_params(self) -> pd.DataFrame:
@@ -236,11 +300,47 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
 
     # -- internals -----------------------------------------------------------
 
+    @staticmethod
+    def _materialize_implied_anchors(df: pd.DataFrame, uids: list) -> pd.DataFrame:
+        """Give age-1-starting cohorts their implied age-0 anchor row of 1.0.
+
+        A curve whose ``ds`` starts at 1 has no acquisition observation, so
+        full activation is implied. Materializing that anchor puts every
+        cohort on one code path — ``y[0]`` is always the age-0 scale — instead
+        of leaving the alignment to be guessed from the values, which is what
+        shifted whole curves in the first place. The synthetic rows are
+        stripped back out of the fitted state at the end of ``fit``.
+        """
+        if not uids:
+            return df
+        anchors = pd.DataFrame({ID_COL: uids, TIME_COL: 0, TARGET_COL: 1.0})
+        return validate_panel(pd.concat([df, anchors], ignore_index=True))
+
     def _fit_pooled(self, df: pd.DataFrame) -> tuple[float, float]:
-        curves = [
-            _strip_leading_one(g[TARGET_COL].to_numpy(dtype=float))[0]
-            for _, g in df.groupby(ID_COL, sort=True)
-        ]
+        """Pooled (alpha, beta) from the mean of the cohorts' scale-free curves.
+
+        Normalizing by each cohort's age-0 anchor keeps a cohort with 60%
+        activation from dragging the pooled curve down as though it churned
+        faster. The ratio is unbounded above, though, so cohorts whose
+        retention rises out of age 0 (trial conversion, a late first payment,
+        an age-0 snapshot taken before the period closed) contribute values
+        above 1 that are not survival probabilities and would dominate the
+        mean — one such cohort in twelve was measured moving the pooled
+        parameters from (1.0, 4.0) to (4.3, 39.7). Their age-0 value is not
+        the cohort's scale, so they cannot inform a survival prior and are
+        left out, as are cohorts with no age-0 retention to divide by; the
+        pooled curve is then in [0, 1] by construction. If that leaves nothing
+        usable the pooled fit has failed and (1.0, 1.0) is returned, the same
+        neutral fallback a failed MLE gets.
+        """
+        curves = []
+        for _, g in df.groupby(ID_COL, sort=True):
+            y = g[TARGET_COL].to_numpy(dtype=float)
+            if y[0] <= _EPS:
+                continue
+            curve = _survival_curve(y)
+            if curve.size and np.all(curve <= 1.0 + _EPS):
+                curves.append(curve)
         max_len = max((len(c) for c in curves), default=0)
         if max_len < 1:
             return 1.0, 1.0
@@ -252,28 +352,34 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
         return (alpha, beta) if ok else (1.0, 1.0)
 
     def _fit_series(self, y: np.ndarray) -> dict:
-        s_obs, stripped = _strip_leading_one(y)
-        horizon = len(s_obs)
-        pooled = len(y) < self.pooled_threshold or horizon < 2
+        # fit() guarantees every cohort now starts at age 0, so y[0] is the
+        # anchor and T is the last age — the whole curve's alignment comes
+        # from ds, never from whether y[0] happens to reach 1.0.
+        horizon = len(y) - 1
+        pending = getattr(self, "_n_obs_", None)
+        n_obs = len(y) if pending is None else next(pending, len(y))
+        # A cohort nobody activated into has no scale to measure survival
+        # against, which makes its shape unlearnable but not its forecast: it
+        # borrows the pooled shape and carries its own last value forward,
+        # exactly like a cohort whose MLE fails.
+        pooled = float(y[0]) <= _EPS or n_obs < self.pooled_threshold or horizon < 2
         if not pooled:
-            alpha, beta, ok = _sbg_mle(s_obs)
+            alpha, beta, ok = _sbg_mle(_survival_curve(y))
             pooled = not ok
         if pooled:
             alpha, beta = self.pooled_params_
         _, s = _sbg_survival(alpha, beta, horizon)
-        sobs_full = np.concatenate([[1.0], s_obs])
-        # one-step-ahead conditional fits: carry last observed survival forward
-        # by the model's period-over-period retention ratio
-        fitted = sobs_full[:-1] * (s[1:] / np.maximum(s[:-1], 1e-12))
-        if stripped:
-            fitted = np.concatenate([[np.nan], fitted])
+        # one-step-ahead conditional fits in the cohort's own units (the age-0
+        # scale cancels): carry last observed retention forward by the model's
+        # period-over-period retention ratio. Age 0 has no predecessor.
+        fitted = np.concatenate([[np.nan], y[:-1] * (s[1:] / np.maximum(s[:-1], 1e-12))])
         return {
             "fitted": fitted,
             "alpha_": alpha,
             "beta_": beta,
             "pooled_": pooled,
             "T_": horizon,
-            "s_last_": float(sobs_full[-1]),
+            "s_last_": float(y[-1]),
         }
 
     def _predict_series(self, state: dict, h: int) -> np.ndarray:

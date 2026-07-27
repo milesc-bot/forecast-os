@@ -57,6 +57,24 @@ def validate_panel(df: pd.DataFrame, allow_missing: bool = False) -> pd.DataFram
                 f"column 'ds' must be datetime-like or numeric: {exc}"
             ) from exc
 
+    # Null keys are rejected up front, and never waived by allow_missing (which
+    # concerns a missing observation, not a row that fails to say what it is).
+    # A null key is not a missing value — it is a row that cannot be placed.
+    # Left alone it disappears silently: pandas' groupby defaults to
+    # dropna=True, so a single blank id cell deletes an entire series from the
+    # output with no error, and a null ds sorts to the end and is then mistaken
+    # for the most recent observation.
+    for col, requirement in (
+        (ID_COL, "every row must name the series it belongs to"),
+        (TIME_COL, "every row must carry a timestamp"),
+    ):
+        n_null = int(out[col].isna().sum())
+        if n_null:
+            raise DataContractError(
+                f"column {col!r} contains {n_null} null value(s); {requirement}. "
+                f"Drop or repair those rows before validating."
+            )
+
     out = out.sort_values([ID_COL, TIME_COL], kind="stable").reset_index(drop=True)
 
     dup = out.duplicated([ID_COL, TIME_COL])

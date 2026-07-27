@@ -197,6 +197,9 @@ _SCALED_METRICS: dict[str, Callable] = {"mase": mase, "rmsse": rmsse}
 _INTERVAL_METRICS = ("coverage", "winkler", "pinball", "crps")
 
 _META_COLS = {ID_COL, TIME_COL, TARGET_COL, "cutoff"}
+# Stand-in for a series absent from train_df: _naive_scale raises on it, which
+# is the same error the old per-series .loc lookup produced for a missing id.
+_NO_TRAIN = np.empty(0, dtype=float)
 
 
 def _model_columns(cv_df: pd.DataFrame) -> list[str]:
@@ -250,6 +253,32 @@ def _score_crps(g: pd.DataFrame, col: str, levels: list[int]) -> float:
     return float(np.mean(terms))
 
 
+def _train_series_by_id(train_df: pd.DataFrame, scaled: list[str]) -> dict:
+    """Per-series training values in chronological order, keyed by ``unique_id``.
+
+    mase/rmsse scale on ``mean(|y_t - y_{t-m}|)``, a quantity that is only
+    defined on the chronologically ordered series, so ``train_df`` is sorted
+    here rather than trusted to arrive sorted: a shuffled panel is legitimate
+    under the library's own contract (``validate_panel`` sorts it, and
+    ``cross_validation`` is order-invariant) and used to yield a silently wrong
+    scale — the same frame giving a correct ``cv_df`` and a 6x-wrong MASE.
+    """
+    for col in (ID_COL, TARGET_COL):
+        if col not in train_df.columns:
+            raise ValueError(f"train_df is missing required column {col!r}")
+    if TIME_COL not in train_df.columns:
+        raise ValueError(
+            f"train_df is missing required column {TIME_COL!r}; scaled metrics "
+            f"{sorted(scaled)} scale on the chronologically ordered training "
+            f"series, so each series must be sortable in time"
+        )
+    ordered = train_df.sort_values([ID_COL, TIME_COL], kind="stable")
+    return {
+        uid: g[TARGET_COL].to_numpy(float)
+        for uid, g in ordered.groupby(ID_COL, sort=False)
+    }
+
+
 def evaluate(
     cv_df: pd.DataFrame,
     metrics: Iterable[str] = ("mae", "rmse", "smape"),
@@ -261,7 +290,9 @@ def evaluate(
 
     ``cv_df`` must have columns ``unique_id, ds, cutoff, y`` plus one column
     per model. Scaled metrics (mase/rmsse) require ``train_df`` (the panel the
-    models were cross-validated on) for the naive scaling term.
+    models were cross-validated on) for the naive scaling term; it must carry
+    ``unique_id``, ``ds`` and ``y``, and is sorted by ``(unique_id, ds)`` here,
+    so the scores do not depend on the row order it arrives in.
 
     ``by=None`` (the default) pools all cutoffs into one score per series.
     ``by="cutoff"`` scores every ``(unique_id, cutoff)`` group separately —
@@ -323,13 +354,15 @@ def evaluate(
             for (uid, cutoff), g in cv_df.groupby([ID_COL, "cutoff"], sort=True)
         ]
 
+    train_by_id: dict = {}
+    if train_df is not None and any(m in _SCALED_METRICS for m in metrics):
+        train_by_id = _train_series_by_id(
+            train_df, [m for m in metrics if m in _SCALED_METRICS]
+        )
+
     rows = []
     for meta, g in groups:
-        y_train = None
-        if train_df is not None:
-            y_train = train_df.loc[
-                train_df[ID_COL] == meta[ID_COL], TARGET_COL
-            ].to_numpy(float)
+        y_train = train_by_id.get(meta[ID_COL], _NO_TRAIN)
         for metric in metrics:
             if metric == "crps":
                 row: dict = {**meta, "metric": "crps"}

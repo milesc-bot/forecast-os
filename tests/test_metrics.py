@@ -285,6 +285,66 @@ def test_evaluate_mase_with_train_df():
     assert row["m1"].iloc[0] == pytest.approx(0.5)
 
 
+def _train_frame():
+    """Two interleaved series whose naive scale is 1.0 when read in ds order."""
+    return pd.DataFrame(
+        {
+            "unique_id": ["a", "b"] * 5,
+            "ds": np.repeat(pd.date_range("2024-01-01", periods=5), 2),
+            "y": [1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0, 5.0, 50.0],
+        }
+    )
+
+
+@pytest.mark.parametrize("metric, expected", [("mase", 0.5), ("rmsse", 0.5)])
+def test_evaluate_scaled_metrics_are_order_invariant(metric, expected):
+    """evaluate() read train_df in whatever order the caller passed it, so the
+    same panel shuffled produced a silently different MASE/RMSSE (the audit
+    measured mase 1.038 sorted vs 0.165 for the identical rows shuffled, with
+    no warning). MASE/RMSSE scale on ``mean(|y_t - y_{t-m}|)``, which is only
+    defined on the chronologically ordered series, so the sorted value is the
+    only correct one. An unsorted panel is legitimate under the library's own
+    contract — validate_panel sorts it, and cross_validation is already
+    order-invariant — so the same frame must not yield a correct cv_df and a
+    wrong metric.
+    """
+    train = _train_frame()
+    shuffled = train.sample(frac=1.0, random_state=7)
+    assert not shuffled.index.equals(train.index), "fixture must actually be reordered"
+
+    sorted_res = evaluate(_cv_frame(), metrics=(metric,), train_df=train, seasonality=1)
+    shuffled_res = evaluate(
+        _cv_frame(), metrics=(metric,), train_df=shuffled, seasonality=1
+    )
+
+    # series 'a' is 1..5 in ds order -> naive scale 1.0 -> the metric is the
+    # plain mae/rmse of the forecast, 0.5 for model m1.
+    row = sorted_res[(sorted_res["unique_id"] == "a") & (sorted_res["metric"] == metric)]
+    assert row["m1"].iloc[0] == pytest.approx(expected)
+    pd.testing.assert_frame_equal(shuffled_res, sorted_res)
+
+
+def test_evaluate_scaled_metrics_reject_train_df_without_ds():
+    """Sorting train_df needs a 'ds' column. Silently falling back to caller
+    order is what produced the wrong scale in the first place, so a train_df
+    with no time column must be rejected by name rather than tolerated.
+    """
+    train = _train_frame().drop(columns=["ds"])
+    with pytest.raises(ValueError, match="missing required column 'ds'"):
+        evaluate(_cv_frame(), metrics=("mase",), train_df=train, seasonality=1)
+
+
+def test_evaluate_ignores_train_df_shape_when_no_scaled_metric_requested():
+    """train_df is only consumed by mase/rmsse, so passing a ds-less frame
+    alongside point metrics stays accepted — the new ordering contract must not
+    break callers that hand evaluate() a train_df it never reads.
+    """
+    train = _train_frame().drop(columns=["ds"])
+    res = evaluate(_cv_frame(), metrics=("mae",), train_df=train)
+    row = res[(res["unique_id"] == "a") & (res["metric"] == "mae")]
+    assert row["m1"].iloc[0] == pytest.approx(0.5)
+
+
 def test_evaluate_unknown_metric_raises():
     with pytest.raises(ValueError, match="unknown metric"):
         evaluate(_cv_frame(), metrics=("banana",))

@@ -1,6 +1,8 @@
 """Tests for deal-level win-probability scoring and the probabilistic
 pipeline forecast (gtm.opportunities)."""
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -8,7 +10,7 @@ from scipy import stats
 from scipy.special import expit
 
 from forecast_os.core.exceptions import DataContractError, ForecastOSError, NotFittedError
-from forecast_os.gtm.opportunities import DealScorer, weighted_pipeline
+from forecast_os.gtm.opportunities import DealScorer, _fit_platt, weighted_pipeline
 
 Z80 = float(stats.norm.ppf(0.9))
 
@@ -147,6 +149,236 @@ class TestDealScorerValidation:
         deals["won"] = True
         with pytest.raises(DataContractError):
             DealScorer().fit(deals)
+
+    @pytest.mark.parametrize("dtype", ["boolean", "Int64", "Float64"])
+    def test_nullable_target_with_pd_na_raises(self, dtype):
+        """A pandas nullable target holding pd.NA must be rejected, not trained on.
+
+        v0.8.0 dispatched on ``is_bool_dtype``, which is True for the nullable
+        "boolean" extension dtype, and that branch converted straight to float
+        with no finite check — turning pd.NA into a silent NaN. Every
+        likelihood term then evaluated to NaN, L-BFGS-B never left x0, and fit
+        SUCCEEDED with all-zero coefficients: a null model that scores every
+        deal at p = 0.5, which weighted_pipeline happily reports as half the
+        pipeline with an interval and no error anywhere. One deal not yet
+        closed is a routine CRM shape, so this has to fail the same way the
+        plain-float branch already did.
+        """
+        deals = make_deals(n=200, seed=1)
+        deals["won"] = deals["won"].astype(dtype)
+        deals.loc[0, "won"] = pd.NA
+        with pytest.raises(DataContractError, match="won"):
+            DealScorer(calibrate=False, seed=0).fit(deals)
+
+    def test_nullable_target_without_na_still_accepted(self):
+        """The NA guard must not reject a clean nullable column."""
+        deals = make_deals(n=400, seed=1)
+        plain = DealScorer(calibrate=False, seed=0).fit(deals)
+        deals["won"] = deals["won"].astype("boolean")
+        nullable = DealScorer(calibrate=False, seed=0).fit(deals)
+        np.testing.assert_allclose(
+            plain.coef_.to_numpy(), nullable.coef_.to_numpy()
+        )
+
+
+class TestCalibrationRegressions:
+    """Regressions for the Platt calibrator (v0.8.0 audit MUST-4).
+
+    v0.8.0 fit the calibrator against hard 0/1 targets on a single ~25%
+    held-out split. On a separable split that objective has no finite maximum
+    — the slope ran away to 1e3+ and pinned every win probability to 0 or 1 —
+    so the DEFAULT ``calibrate=True`` made out-of-sample probabilities
+    dramatically WORSE than ``calibrate=False``, and the pipeline intervals it
+    fed were absurdly tight. The fix is Platt (1999)'s smoothed targets, which
+    make the objective bounded under separation, plus cross-fitted scores and
+    a minimum sample size so the map is estimated on real signal.
+    """
+
+    def test_separable_scores_do_not_blow_up_the_slope(self):
+        """Perfectly separable held-out scores must still give a finite, mild map.
+
+        With hard 0/1 targets this exact input returned a = 16.1 (and much
+        larger on real fits) because the likelihood is unbounded when a
+        threshold separates the classes. Smoothed targets are strictly inside
+        (0, 1), so the loss diverges as a -> inf and the optimum is finite.
+        """
+        z = np.array([-2.0, -1.0, -0.5, 1.0, 2.0])
+        y = np.array([0.0, 0.0, 0.0, 1.0, 1.0])
+        a, b = _fit_platt(z, y)
+        assert 0.0 < a < 5.0
+        assert abs(b) < 5.0
+        # and the resulting probabilities are not pinned to the boundary
+        p = expit(a * z + b)
+        assert p.min() > 0.01 and p.max() < 0.99
+
+    @pytest.mark.parametrize("n,seed", [(100, 25), (100, 16), (100, 35)])
+    def test_calibration_never_pins_probabilities_to_zero_or_one(self, n, seed):
+        """A fitted scorer must not report near-certain probabilities for everyone.
+
+        Under v0.8.0 these three fits produced _calib_a of 729, 302 and 77, so
+        predict_proba collapsed to a 0/1 step function and out-of-sample log
+        loss hit 5-6 nats (against 0.68 for simply predicting the base rate).
+        Roughly one fit in twelve at n=100 landed here, so this was not an
+        exotic corner.
+        """
+        scorer = DealScorer(calibrate=True, seed=0).fit(make_deals(n=n, seed=seed))
+        assert scorer.calibrated_ is True  # the map really was fitted
+        assert 0.0 < scorer._calib_a < 10.0
+        p = scorer.predict_proba(make_deals(n=400, seed=77, closed=False)).to_numpy()
+        # a genuine spread of probabilities, not a 0/1 step function
+        assert float(np.mean((p > 0.05) & (p < 0.95))) > 0.5
+
+    def test_calibrate_true_is_not_worse_than_calibrate_false_at_small_n(self):
+        """The acceptance criterion: calibration must never degrade log loss.
+
+        In v0.8.0, calibrate=True averaged ~1.8 nats of out-of-sample log loss
+        at n=40 against ~0.46 for calibrate=False — four times worse than the
+        setting it is supposed to improve on, and worse than predicting the
+        base rate. When either outcome is too rare to estimate the map,
+        calibration is skipped outright and the two settings must agree
+        EXACTLY; otherwise the cross-fitted map must not cost more than a
+        rounding error, and no single fit may blow up.
+
+        (v0.9.0: the n < 100 half of the skip rule was removed — see
+        ``test_calibration_runs_below_one_hundred_deals`` — so n=80 now
+        calibrates and only the per-class floor keeps n=40 on the identity.)
+        """
+        test = make_deals(n=4000, seed=999)
+        y_test = test["won"].to_numpy()
+        base_ll = _log_loss(y_test, np.full(len(test), float(test["won"].mean())))
+
+        for seed in (39, 11, 21):
+            train = make_deals(n=40, seed=seed)  # < 20 of the rarer outcome
+            with pytest.warns(UserWarning, match="calibrate=True"):
+                cal = DealScorer(calibrate=True, seed=0).fit(train)
+            unc = DealScorer(calibrate=False, seed=0).fit(train)
+            assert cal.calibrated_ is False  # too few losses to calibrate
+            np.testing.assert_allclose(
+                cal.predict_proba(test).to_numpy(),
+                unc.predict_proba(test).to_numpy(),
+            )
+
+        cal_lls, unc_lls = [], []
+        for seed in range(1, 41):
+            train = make_deals(n=100, seed=seed)
+            cal = DealScorer(calibrate=True, seed=0).fit(train)
+            unc = DealScorer(calibrate=False, seed=0).fit(train)
+            cal_lls.append(_log_loss(y_test, cal.predict_proba(test).to_numpy()))
+            unc_lls.append(_log_loss(y_test, unc.predict_proba(test).to_numpy()))
+        mean_cal, mean_unc = float(np.mean(cal_lls)), float(np.mean(unc_lls))
+        # calibration is at worst a rounding error, never a regression, and
+        # both settings comfortably beat the constant base rate
+        assert mean_cal < mean_unc * 1.01
+        assert mean_cal < base_ll - 0.02
+        # v0.8.0's worst fit over this same sweep was 6.40 nats, ~10x the
+        # base rate; nothing may come remotely close to that now
+        assert max(cal_lls) < 0.55
+
+    def test_calibrated_flag_reports_whether_the_map_was_fitted(self):
+        """calibrated_ must tell the truth about the small-sample fallback."""
+        with pytest.warns(UserWarning, match="calibrate=True"):
+            small = DealScorer(calibrate=True, seed=0).fit(make_deals(n=40, seed=1))
+        assert small.calibrated_ is False
+        big = DealScorer(calibrate=True, seed=0).fit(make_deals(n=1000, seed=1))
+        assert big.calibrated_ is True
+        assert big._calib_a != 1.0
+
+    def test_calibration_runs_below_one_hundred_deals(self):
+        """The n >= 100 calibration gate forfeited real accuracy; it is gone.
+
+        The gate was introduced with the smoothed targets and cross-fitting
+        that actually fixed the runaway slope, on the claim that below 100
+        deals "the map is pure noise". Measurement does not support that. The
+        map below 100 is a mild rescaling (fitted slope in [0.7, 1.5] at the
+        default l2), and whenever the logistic is genuinely over-shrunk — the
+        documented effect of raising l2, and precisely what post-hoc Platt
+        scaling exists to repair — the gate silently forfeited 5-30% of
+        out-of-sample log loss. It was also a cliff rather than a taper: fitting
+        on 99 vs 100 of the same deals moved individual win probabilities by up
+        to 0.26, and per-segment scorers either side of the line calibrated
+        differently within one forecast.
+
+        The per-class floor is kept: it is what stops a two-parameter map from
+        being fitted on a handful of minority-class points, and it measured
+        neutral. So at n=80 with plenty of both outcomes, calibration must run
+        and must help when there is miscalibration to correct.
+        """
+        train = make_deals(n=80, seed=39)
+        test = make_deals(n=4000, seed=999)
+        y_test = test["won"].to_numpy()
+
+        cal = DealScorer(calibrate=True, l2=10.0, seed=0).fit(train)
+        unc = DealScorer(calibrate=False, l2=10.0, seed=0).fit(train)
+        assert cal.calibrated_ is True
+        assert 0.0 < cal._calib_a < 10.0  # a mild rescaling, not a runaway slope
+        ll_cal = _log_loss(y_test, cal.predict_proba(test).to_numpy())
+        ll_unc = _log_loss(y_test, unc.predict_proba(test).to_numpy())
+        assert ll_cal < ll_unc
+
+        # and no cliff at the old threshold: 99 vs 100 deals agree closely
+        p99 = DealScorer(calibrate=True, l2=10.0, seed=0).fit(
+            make_deals(n=100, seed=39).iloc[:99]
+        ).predict_proba(test).to_numpy()
+        p100 = DealScorer(calibrate=True, l2=10.0, seed=0).fit(
+            make_deals(n=100, seed=39)
+        ).predict_proba(test).to_numpy()
+        assert float(np.max(np.abs(p99 - p100))) < 0.1
+
+    def test_skipped_calibration_warns_and_a_real_calibration_does_not(self):
+        """calibrate=True that cannot be honoured must say so, not go quiet.
+
+        Previously a user who passed calibrate=True (the DEFAULT) below the
+        threshold got no signal at all: zero warnings, and the only trace was
+        calibrated_=False among ten public attributes. This codebase already
+        warns for exactly this shape elsewhere — mstl.py drops unestimable
+        seasonal periods with a warning, base.py drops unsupported exogenous
+        columns with one — and the calibration skip must match.
+        """
+        train = make_deals(n=30, seed=1)  # only 11 losses: below the class floor
+        with pytest.warns(UserWarning, match="ignoring calibrate=True") as rec:
+            scorer = DealScorer(calibrate=True, seed=0).fit(train)
+        assert scorer.calibrated_ is False
+        msg = str(rec[0].message)
+        assert "19 won" in msg and "11 lost" in msg  # names what was short
+        assert "calibrated_ = False" in msg  # names the attribute to check
+
+        # calibrate=False is an explicit choice, not a thwarted request
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            DealScorer(calibrate=False, seed=0).fit(train)
+            big = DealScorer(calibrate=True, seed=0).fit(make_deals(n=1000, seed=1))
+        assert big.calibrated_ is True
+
+    def test_calibration_no_longer_costs_training_data(self):
+        """With calibration on, the logistic is still fit on every deal.
+
+        v0.8.0 threw away 25% of the training deals to hold out a calibration
+        split, so calibrate=True and calibrate=False produced different
+        coefficients from the same data for no benefit. Cross-fitting supplies
+        honest out-of-fold scores without withholding anything, so the
+        coefficients now match exactly and only the (a, b) map differs.
+        """
+        deals = make_deals(n=1000, seed=3)
+        cal = DealScorer(calibrate=True, seed=0).fit(deals)
+        unc = DealScorer(calibrate=False, seed=0).fit(deals)
+        np.testing.assert_allclose(cal.coef_.to_numpy(), unc.coef_.to_numpy())
+        assert cal.intercept_ == pytest.approx(unc.intercept_)
+
+    def test_calibrated_pipeline_interval_is_not_absurdly_tight(self):
+        """The runaway slope collapsed the pipeline band to nothing.
+
+        With p pinned at 0/1 the Bernoulli variance p(1-p) is ~0 everywhere, so
+        weighted_pipeline reported an 80% interval 0.016% wide that did not
+        contain the realized booked amount. The band must stay wide enough to
+        be honest about deal-level uncertainty.
+        """
+        train = make_deals(n=100, seed=25)  # _calib_a was 729 under v0.8.0
+        open_deals = make_deals(n=300, seed=8, closed=False)
+        scorer = DealScorer(calibrate=True, seed=0).fit(train)
+        res = weighted_pipeline(open_deals, scorer=scorer, level=80)
+        expected = float(res["expected"].iloc[0])
+        width = float(res["hi-80"].iloc[0] - res["lo-80"].iloc[0])
+        assert width / expected > 0.05
 
 
 class TestWeightedPipeline:
@@ -299,6 +531,127 @@ class TestWeightedPipelineValidation:
         open_deals = pd.DataFrame({"opp_id": [1], "amount": [100.0]})
         with pytest.raises(ForecastOSError, match="region"):
             weighted_pipeline(open_deals, proba=[0.5], by="region")
+
+
+class TestSegmentsReconcileToTotal:
+    """Regressions for null segment keys (v0.8.0 audit MUST-6).
+
+    ``work.groupby(keys)`` inherited pandas' default ``dropna=True``, so every
+    deal with a null ``by`` value vanished from the output: the segments no
+    longer summed to the ungrouped total, silently and by an unbounded amount.
+    An unassigned region/territory is an everyday CRM state, so this hit real
+    forecasts.
+
+    v0.9.0: the first fix raised on any null label, which restored the
+    invariant by refusing to forecast an ordinary CRM export at all — and left
+    the ``dropna=False`` added in the same change unreachable. The null-keyed
+    deals are now KEPT as their own unlabelled segment (which is what makes the
+    partition exact) and warned about. Segments must partition the whole; that
+    is the invariant every test here pins.
+    """
+
+    OPEN = pd.DataFrame(
+        {
+            "opp_id": [1, 2, 3],
+            "amount": [100.0, 200.0, 300.0],
+            "region": ["A", None, "B"],
+        }
+    )
+    PROBA = np.array([0.5, 1.0, 0.5])
+
+    def _segments(self, deals, proba, by):
+        with pytest.warns(UserWarning, match="null segment label"):
+            return weighted_pipeline(deals, proba=proba, by=by)
+
+    def test_null_segment_key_is_kept_as_its_own_segment(self):
+        """The dropped $200 deal was the most certain in the pipeline (p=1.0)."""
+        segments = self._segments(self.OPEN, self.PROBA, "region")
+        total = weighted_pipeline(self.OPEN, proba=self.PROBA)
+        assert segments["expected"].sum() == pytest.approx(
+            float(total["expected"].iloc[0])
+        )
+        assert int(segments["n_deals"].sum()) == int(total["n_deals"].iloc[0]) == 3
+        # the unlabelled deal is visible in the output with its own expected $
+        unlabelled = segments[segments["region"].isna()]
+        assert len(unlabelled) == 1
+        assert float(unlabelled["expected"].iloc[0]) == pytest.approx(200.0)
+
+    def test_null_segment_warning_names_the_column_and_the_amount_at_stake(self):
+        with pytest.warns(UserWarning) as rec:
+            weighted_pipeline(self.OPEN, proba=self.PROBA, by="region")
+        msg = str(rec[0].message)
+        assert "region" in msg
+        assert "1 null" in msg
+        assert "200" in msg  # the expected pipeline that used to vanish
+
+    def test_nan_float_segment_key_also_reconciles(self):
+        deals = pd.DataFrame(
+            {"opp_id": [1, 2], "amount": [100.0, 200.0], "tier": [1.0, np.nan]}
+        )
+        segments = self._segments(deals, [0.5, 0.5], "tier")
+        assert segments["expected"].sum() == pytest.approx(150.0)
+        assert int(segments["n_deals"].sum()) == 2
+
+    def test_null_in_any_of_several_by_columns_still_reconciles(self):
+        deals = pd.DataFrame(
+            {
+                "opp_id": [1, 2],
+                "amount": [100.0, 200.0],
+                "region": ["A", "B"],
+                "product": ["x", None],
+            }
+        )
+        with pytest.warns(UserWarning, match="product"):
+            segments = weighted_pipeline(deals, proba=[0.5, 0.5], by=["region", "product"])
+        assert segments["expected"].sum() == pytest.approx(150.0)
+        assert int(segments["n_deals"].sum()) == 2
+
+    def test_categorical_by_column_with_a_null_label_works(self):
+        """A CRM export read with dtype='category' is the common case, and the
+        old error told the user to run a fillna that raises TypeError on it.
+
+        There is no advice to follow now — the frame just forecasts — but the
+        categorical path still has to reconcile, since ``to_numpy()`` on a
+        Categorical is what feeds the groupby.
+        """
+        deals = pd.DataFrame(
+            {
+                "opp_id": [1, 2, 3],
+                "amount": [100.0, 200.0, 300.0],
+                "region": pd.Categorical(["A", "B", None]),
+            }
+        )
+        segments = self._segments(deals, [0.5, 0.5, 0.5], "region")
+        total = weighted_pipeline(deals, proba=[0.5, 0.5, 0.5])
+        assert segments["expected"].sum() == pytest.approx(
+            float(total["expected"].iloc[0])
+        )
+        assert int(segments["n_deals"].sum()) == 3
+        assert segments["region"].isna().sum() == 1
+
+    def test_fully_labelled_frame_warns_about_nothing(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            weighted_pipeline(
+                self.OPEN.assign(region=["A", "C", "B"]), proba=self.PROBA, by="region"
+            )
+
+    def test_reconciliation_invariant_holds_once_nulls_are_labelled(self):
+        """The invariant the bug broke: segments sum to the ungrouped total.
+
+        The offending frame reconciles exactly as soon as the null label is
+        filled, including the previously vanishing deal — so no deal and no
+        dollar is lost anywhere in the grouping path.
+        """
+        filled = self.OPEN.copy()
+        filled["region"] = filled["region"].fillna("unassigned")
+        segments = weighted_pipeline(filled, proba=self.PROBA, by="region")
+        total = weighted_pipeline(filled, proba=self.PROBA)
+        assert segments["expected"].sum() == pytest.approx(
+            float(total["expected"].iloc[0])
+        )
+        assert int(segments["n_deals"].sum()) == int(total["n_deals"].iloc[0]) == 3
+        assert set(segments["region"]) == {"A", "B", "unassigned"}
 
 
 def test_weighted_pipeline_interval_stays_within_attainable_support():

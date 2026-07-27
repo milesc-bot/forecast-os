@@ -8,6 +8,10 @@ append-only: re-snapshotting the same ``(as_of, kind)`` writes a
 numerically suffixed sibling file and the manifest keeps every version, so
 the store is a faithful week-over-week and forecast-accuracy audit trail.
 
+Round-trips are dtype-stable: the ``ds`` resolution recorded at write time is
+re-applied on load, and a timezone-aware ``ds`` comes back with its timezone
+intact (the store never localizes, converts, or drops it).
+
 Reading and writing parquet needs a pandas parquet engine; pyarrow is the
 optional ``[snapshots]`` extra. Importing this module always succeeds; the
 guard fires at :class:`SnapshotStore` construction, raising ``ImportError``
@@ -96,7 +100,9 @@ class SnapshotStore:
 
         Parquet promotes second-resolution timestamps to milliseconds, so the
         original unit is stored in the manifest and re-applied on load, keeping
-        round-trips dtype-stable.
+        round-trips dtype-stable. Only the RESOLUTION is restored: a tz-aware
+        ``ds`` keeps its timezone (it is never dropped or converted to UTC), and
+        an entry written before ``ds_unit`` was recorded is left untouched.
         """
         unit = entry.get("ds_unit")
         if (
@@ -104,7 +110,9 @@ class SnapshotStore:
             and TIME_COL in frame.columns
             and pd.api.types.is_datetime64_any_dtype(frame[TIME_COL])
         ):
-            frame[TIME_COL] = frame[TIME_COL].astype(f"datetime64[{unit}]")
+            # unit-only, so it is tz-preserving; astype to a bare
+            # datetime64[<unit>] would refuse a tz-aware column outright
+            frame[TIME_COL] = frame[TIME_COL].dt.as_unit(unit)
         return frame
 
     def _write_manifest(self, entries: list[dict[str, Any]]) -> None:

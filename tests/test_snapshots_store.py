@@ -195,3 +195,78 @@ def test_second_resolution_ds_round_trips_dtype_stable(tmp_path):
     loaded = store.load(kind="panel")
     assert loaded["ds"].dtype == panel["ds"].dtype  # [s] preserved, not promoted to [ms]
     pd.testing.assert_frame_equal(loaded, panel)
+
+
+class TestTimezoneAwareDs:
+    """A tz-aware ``ds`` must survive the write/read round trip.
+
+    ``validate_panel`` accepts a tz-aware ``ds`` and ``snapshot()`` wrote the
+    parquet file happily, but ``_restore_ds_unit`` re-applied the recorded
+    resolution with ``astype("datetime64[<unit>]")`` — a tz-aware -> tz-naive
+    cast pandas refuses — so ``load()``/``history()`` raised ``TypeError`` and
+    the data the store had accepted was permanently unreadable through every
+    store API. One tz-aware snapshot also broke ``history()`` for the whole
+    kind. The restore is now unit-only (``dt.as_unit``), which is tz-preserving:
+    the resolution is still pinned, and the timezone is carried through
+    untouched rather than being dropped or silently converted to UTC.
+    """
+
+    @staticmethod
+    def _tz_panel(tz):
+        ds = pd.to_datetime(["2024-01-01", "2024-02-01"]).tz_localize(tz)
+        return pd.DataFrame({"unique_id": ["a", "a"], "ds": ds, "y": [1.0, 2.0]})
+
+    @pytest.mark.parametrize("tz", ["UTC", "US/Eastern"])
+    def test_tz_aware_panel_round_trips_through_load(self, tmp_path, tz):
+        store = SnapshotStore(tmp_path)
+        panel = self._tz_panel(tz)
+        store.snapshot(panel, as_of="2024-02-15", kind="panel")
+
+        loaded = store.load(kind="panel")
+        assert loaded["ds"].dtype == panel["ds"].dtype  # unit AND tz preserved
+        pd.testing.assert_frame_equal(loaded, validate_panel(panel))
+
+    def test_tz_aware_forecast_round_trips_through_history(self, tmp_path):
+        store = SnapshotStore(tmp_path)
+        ds = pd.to_datetime(["2024-03-01", "2024-04-01"]).tz_localize("UTC")
+        forecast = pd.DataFrame({"unique_id": ["a", "a"], "ds": ds, "yhat": [5.0, 6.0]})
+        store.snapshot(forecast, as_of="2024-02-15", kind="forecast")
+
+        hist = store.history(kind="forecast")
+        assert len(hist) == 2
+        assert hist["ds"].dtype == forecast["ds"].dtype
+        assert list(hist["ds"]) == list(ds)
+
+    def test_tz_aware_second_resolution_keeps_both_unit_and_tz(self, tmp_path):
+        store = SnapshotStore(tmp_path)
+        ds = pd.DatetimeIndex(["2026-01-05", "2026-01-12"]).as_unit("s")
+        ds = ds.tz_localize("US/Eastern")
+        panel = pd.DataFrame({"unique_id": "s", "ds": ds, "y": [1.0, 2.0]})
+        store.snapshot(panel, as_of="2026-01-12", kind="panel")
+
+        loaded = store.load(kind="panel")
+        assert loaded["ds"].dt.unit == "s"  # not promoted to [ms] by parquet
+        assert str(loaded["ds"].dt.tz) == "US/Eastern"
+
+
+def test_manifest_without_ds_unit_still_loads(tmp_path):
+    """Snapshots written before ``ds_unit`` existed must still be readable.
+
+    ``_restore_ds_unit`` is a no-op when the manifest entry carries no
+    ``ds_unit`` key; this pins that backward compatibility so a store on disk
+    from an older release keeps loading after the tz fix.
+    """
+    import json
+
+    store = SnapshotStore(tmp_path)
+    store.snapshot(_panel([1, 2, 3, 4]), as_of="2024-02-15")
+
+    manifest_path = tmp_path / "manifest.json"
+    entries = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry in entries:
+        entry.pop("ds_unit", None)
+    manifest_path.write_text(json.dumps(entries), encoding="utf-8")
+
+    loaded = store.load()
+    assert set(loaded["y"]) == {1.0, 2.0, 3.0, 4.0}
+    assert pd.api.types.is_datetime64_any_dtype(loaded["ds"])

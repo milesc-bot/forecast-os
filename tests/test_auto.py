@@ -16,6 +16,8 @@ from forecast_os.core.registry import register
 from forecast_os.core.types import ID_COL, TIME_COL, to_panel
 from forecast_os.datasets.synthetic import generate_returns, generate_series
 from forecast_os.models.auto import AutoSelect
+from forecast_os.models.baselines import SeasonalNaive
+from forecast_os.models.ml import RidgeLag
 
 
 class _LastDummy(PerSeriesForecaster):
@@ -292,3 +294,124 @@ def test_perfectly_periodic_series_picks_seasonal_winner():
     assert sel.best_models_["s1"] == "SeasonalNaive"
     pred = sel.predict(7)["yhat"].to_numpy()
     np.testing.assert_allclose(pred, np.tile(pattern, 2)[80 - 77 : 80 - 77 + 7], atol=1e-9)
+
+
+# --- v0.9.0 verifier regressions ------------------------------------------
+
+
+def _monthly_panel(lengths: dict[str, int]) -> pd.DataFrame:
+    """Panel of monthly series with the given per-series lengths."""
+    rng = np.random.default_rng(7)
+    frames = [
+        pd.DataFrame(
+            {
+                ID_COL: uid,
+                TIME_COL: pd.date_range("2020-01-31", periods=n, freq="ME"),
+                "y": 100.0 + np.arange(n) + rng.normal(0, 0.5, n),
+            }
+        )
+        for uid, n in lengths.items()
+    ]
+    return pd.concat(frames, ignore_index=True)
+
+
+@pytest.mark.parametrize("val_h,n_windows", [(12, 2), (6, 2), (4, 3)])
+@pytest.mark.parametrize("offset", [0, 1, 2, 3, 4, 5])
+def test_default_pool_fits_across_the_cv_span_boundary(val_h, n_windows, offset):
+    """Series just longer than the CV span must fit, not crash.
+
+    Through v0.8.0 ``use_cv`` was ``sizes.min() > span``, which only guarantees
+    cross_validation()'s own precondition. It never checked that the first
+    fold's training slice (``n - span`` rows) was long enough for the
+    candidates, so for ``n`` in ``span+1 .. span+3`` the pool was fitted on 1-3
+    rows and Drift/Holt/AutoETS raised -- e.g. ``AutoSelect().fit`` on 25
+    monthly points died with "Drift requires at least 2 observations per
+    series; series 's1' has 1". The module contract is a 75/25 holdout fallback
+    whenever the panel is too short for CV, and "too short" has to include a
+    first fold the candidates cannot be fitted on.
+    """
+    n = val_h * n_windows + offset
+    df = _monthly_panel({"s1": n})
+    sel = AutoSelect(val_h=val_h, n_windows=n_windows).fit(df)
+    assert sel.best_models_["s1"]
+    assert len(sel.predict(3)) == 3
+
+
+def test_one_short_series_does_not_poison_a_long_panel():
+    """A single short series must not break the whole panel's fit.
+
+    ``sizes.min()`` is a panel-wide reduction, so before the fix a 3-series
+    panel of lengths [120, 120, 25] chose CV for everyone and then died on the
+    25-row series with a message naming 1 observation -- unactionable for a user
+    whose shortest series has 25 rows.
+    """
+    df = _monthly_panel({"a": 120, "b": 120, "c": 25})
+    sel = AutoSelect().fit(df)
+    assert set(sel.best_models_) == {"a", "b", "c"}
+    assert set(sel.predict(3)[ID_COL]) == {"a", "b", "c"}
+
+
+def test_cv_span_boundary_falls_back_to_the_documented_holdout(monkeypatch):
+    """The boundary band scores on the 75/25 holdout, not on a 1-row CV fold."""
+    captured = _spy_evaluate(monkeypatch)
+    df = _monthly_panel({"s1": 25})  # span = 24 -> first CV fold would train on 1 row
+    AutoSelect().fit(df)
+    train_df = captured["train_df"]
+    assert (train_df.groupby(ID_COL).size() == 25 - 25 // 4).all()  # holdout split, not n - span
+
+
+def test_cv_still_used_once_the_first_fold_can_fit_the_pool(monkeypatch):
+    """CV must not be abandoned wholesale: it still runs as soon as it is sound."""
+    captured = _spy_evaluate(monkeypatch)
+    df = _monthly_panel({"s1": 28})  # span = 24 -> first fold trains on 4 rows
+    AutoSelect().fit(df)
+    assert (captured["train_df"].groupby(ID_COL).size() == 4).all()
+
+
+def _daily_seasonal_panel(n: int) -> pd.DataFrame:
+    t = np.arange(n)
+    return pd.DataFrame(
+        {
+            ID_COL: "s1",
+            TIME_COL: pd.date_range("2020-01-05", periods=n, freq="D"),
+            "y": 100.0 + 0.2 * t + 5 * np.sin(2 * np.pi * t / 12),
+        }
+    )
+
+
+@pytest.mark.parametrize("n,val_h,n_windows", [(13, 1, 1), (14, 2, 1), (14, 1, 2)])
+def test_feasible_cv_is_not_swapped_for_a_narrower_holdout(n, val_h, n_windows):
+    """The short-panel fallback must only fire when the holdout is actually wider.
+
+    The ``_CV_TRAIN_MARGIN`` gate abandoned CV whenever the first fold trained on
+    fewer than ``max(min_train_size) + 1`` rows, and jumped to a 75/25 holdout
+    that nothing revalidated. But ``holdout_train_len = n - n // 4`` is *smaller*
+    than ``cv_train_len = n - span`` whenever ``n // 4 > span``, so a feasible CV
+    was traded for an infeasible holdout: 13 daily rows with
+    ``season_length=12`` fold-train on exactly 12 rows -- SeasonalNaive's
+    declared minimum -- while the holdout keeps only 10, and the fit raised
+    "SeasonalNaive requires at least 12 observations per series". A fix for a
+    crash must not crash on data that fitted before, so the fallback is now
+    conditional on the holdout keeping more training rows.
+    """
+    sel = AutoSelect(val_h=val_h, n_windows=n_windows, season_length=12)
+    sel.fit(_daily_seasonal_panel(n))
+    assert sel.best_models_["s1"]
+    assert len(sel.predict(3)) == 3
+
+
+@pytest.mark.parametrize("candidate", [SeasonalNaive(season_length=176), RidgeLag(lags=166)])
+def test_wide_candidate_keeps_cv_when_the_holdout_is_too_narrow(candidate, monkeypatch):
+    """Same regression on long panels: a hungry candidate plus a wide CV window.
+
+    200 rows with ``val_h=12, n_windows=2`` train the first fold on 176 rows,
+    which is exactly what ``SeasonalNaive(176)``/``RidgeLag(166)`` need; the
+    75/25 holdout keeps only 150 and cannot fit either. The margin sent both to
+    the holdout and the fit raised. CV must be kept here -- and it must really be
+    CV, not a silently widened holdout.
+    """
+    captured = _spy_evaluate(monkeypatch)
+    sel = AutoSelect(candidates=["naive", candidate], val_h=12, n_windows=2)
+    sel.fit(_daily_seasonal_panel(200))
+    assert (captured["train_df"].groupby(ID_COL).size() == 176).all()
+    assert sel.best_models_["s1"]

@@ -11,9 +11,9 @@ NOT registry ``BaseForecaster`` models.
 :class:`DealScorer` is a calibrated logistic win-probability model. It fits an
 L2-regularized logistic regression on standardized numeric features by
 maximum penalized likelihood (L-BFGS-B with an analytic gradient — no
-scikit-learn), then optionally Platt-scales the scores on a held-out split so
-the predicted probabilities are reliable (a monotone scale-and-shift
-calibration).
+scikit-learn), then optionally Platt-scales the scores against cross-fitted
+out-of-fold predictions so the predicted probabilities are reliable (a
+monotone scale-and-shift calibration).
 
 :func:`weighted_pipeline` turns those per-deal win probabilities into the
 number a revenue leader actually asks for: the probabilistic pipeline
@@ -27,6 +27,8 @@ number that a flat "stage times a fixed win-rate" weighting cannot give.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -39,6 +41,26 @@ __all__ = ["DealScorer", "weighted_pipeline"]
 
 _PROB_EPS = 1e-12
 _EXCLUDED_AUTO = ("opp_id", "amount")
+
+# A Platt map has two free parameters fitted on out-of-fold scores, so it needs
+# a workable number of BOTH outcomes: with fewer than this many of the rarer
+# class the two parameters are estimated on a handful of points and the map is
+# not worth its variance, so calibration is skipped and the identity is used
+# instead. See _fit_core.
+#
+# There is deliberately no minimum on the total deal count. An earlier n >= 100
+# floor was measured (120 seeds per cell, out-of-sample log loss against a
+# 4000-deal test frame) and did not carry its weight: at the default l2 = 1 it
+# bought 0.5-1.2% of mean log loss at n = 60..99, while at l2 >= 5 — a
+# documented knob whose whole effect is to over-shrink and under-confidence the
+# logistic, which is exactly what post-hoc Platt scaling repairs — it COST
+# 4-30%. It was also a cliff: fitting on 99 vs 100 of the same deals moved
+# individual win probabilities by up to 0.26. The bounded (smoothed-target)
+# objective and cross-fitting are what removed the runaway slope this constant
+# was introduced alongside; the ungated worst case over that sweep is 0.69 nats
+# against a 0.68 base rate, not the 6.4 the floor was written to prevent.
+_CALIB_MIN_PER_CLASS = 20
+_CALIB_FOLDS = 5
 
 
 def _neg_log_likelihood(params: np.ndarray, X: np.ndarray, y: np.ndarray, l2: float):
@@ -75,20 +97,39 @@ def _fit_logistic(X: np.ndarray, y: np.ndarray, l2: float) -> tuple[np.ndarray, 
     return res.x[:-1], float(res.x[-1])
 
 
-def _fit_platt(z: np.ndarray, y: np.ndarray) -> tuple[float, float]:
-    """Fit a monotone Platt calibrator ``p = sigmoid(a z + b)`` on held-out scores.
+def _platt_targets(y: np.ndarray) -> np.ndarray:
+    """Platt (1999) smoothed calibration targets for a 0/1 label vector.
 
-    Minimizes the calibration NLL over ``(a, b)`` with ``a`` bounded strictly
-    positive so the mapping stays monotone increasing (reliability-improving
-    rather than rank-altering). A non-finite or degenerate solution falls back
-    to the identity ``(1, 0)``.
+    Wins map to ``(N+ + 1) / (N+ + 2)`` and losses to ``1 / (N- + 2)`` rather
+    than to a hard 1 and 0. This is what keeps the calibration objective
+    BOUNDED: against hard 0/1 targets a separable score vector has no finite
+    maximum-likelihood ``(a, b)`` — the slope runs away until the optimizer's
+    own convergence test stops it, pinning every probability to 0 or 1. Against
+    targets strictly inside (0, 1) the loss diverges as ``a -> inf``, so the
+    optimum is finite and the fitted map stays a mild rescaling.
     """
+    n_pos = float(np.count_nonzero(y > 0.5))
+    n_neg = float(y.shape[0] - n_pos)
+    return np.where(y > 0.5, (n_pos + 1.0) / (n_pos + 2.0), 1.0 / (n_neg + 2.0))
+
+
+def _fit_platt(z: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """Fit a monotone Platt calibrator ``p = sigmoid(a z + b)`` on out-of-sample scores.
+
+    Minimizes the calibration NLL against :func:`_platt_targets`' smoothed
+    labels over ``(a, b)``, with ``a`` bounded strictly positive so the mapping
+    stays monotone increasing (reliability-improving rather than rank-altering)
+    and no upper bound needed — the smoothed targets already make the objective
+    coercive in ``a``. A non-finite or degenerate solution falls back to the
+    identity ``(1, 0)``.
+    """
+    t = _platt_targets(y)
 
     def obj(params: np.ndarray):
         a, b = params
         zz = a * z + b
-        nll = float(np.sum(np.logaddexp(0.0, zz) - y * zz))
-        resid = expit(zz) - y
+        nll = float(np.sum(np.logaddexp(0.0, zz) - t * zz))
+        resid = expit(zz) - t
         return nll, np.array([float(resid @ z), float(np.sum(resid))])
 
     res = minimize(
@@ -99,6 +140,37 @@ def _fit_platt(z: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     if not (np.isfinite(a) and np.isfinite(b)) or a <= 0.0:
         return 1.0, 0.0
     return a, b
+
+
+def _out_of_fold_scores(
+    X: np.ndarray, y: np.ndarray, l2: float, rng: np.random.Generator, n_folds: int
+) -> np.ndarray | None:
+    """Cross-fitted logistic scores: every deal's coefficients come from a model
+    that never saw it.
+
+    Splits the deals into ``n_folds`` random folds, fits the logistic on the
+    other folds, and scores the held-out one — so all ``n`` deals contribute an
+    honest out-of-sample score to the calibrator instead of a single 25% split
+    contributing ``n / 4``. Returns ``None`` when any fold's training subset is
+    single-class, in which case the caller skips calibration.
+
+    The COEFFICIENTS are strictly out-of-fold; the standardization is not. ``X``
+    arrives already centred and scaled on all ``n`` rows (see :meth:`fit`), so
+    each fold model sees features whose scale was computed with the held-out
+    rows included. That is a mild, well-known leak, unchanged from the earlier
+    single-split calibrator, and negligible for O(n) statistics — but it is the
+    reason this says "coefficients" rather than "nothing".
+    """
+    n = y.shape[0]
+    z = np.empty(n, dtype=float)
+    for fold in np.array_split(rng.permutation(n), n_folds):
+        mask = np.ones(n, dtype=bool)
+        mask[fold] = False
+        if len(np.unique(y[mask])) < 2:
+            return None
+        w, b = _fit_logistic(X[mask], y[mask], l2)
+        z[fold] = X[fold] @ w + b
+    return z
 
 
 class DealScorer:
@@ -112,11 +184,14 @@ class DealScorer:
         ``features`` argument passed to :meth:`fit` overrides this one.
     l2 : L2 penalty strength on the standardized weights (the intercept is
         never penalized). Larger values shrink coefficients toward zero.
-    calibrate : when True, hold out a random split of the training deals,
-        fit the logistic on the remainder, and Platt-scale its scores on the
-        held-out split so predicted probabilities are calibrated. When False
-        the logistic is fit on all deals with no post-hoc calibration.
-    seed : seed for the calibration split (``np.random.default_rng``).
+    calibrate : when True, score every training deal out-of-fold (5-fold
+        cross-fitting) and Platt-scale those honest scores so predicted
+        probabilities are calibrated. The reported logistic is fit on all
+        deals either way — calibration costs no training data — and is
+        skipped, with a warning, when either outcome is too rare to estimate
+        a two-parameter map (see ``calibrated_``). When False no post-hoc
+        calibration is applied at all.
+    seed : seed for the cross-fitting folds (``np.random.default_rng``).
 
     Attributes set by :meth:`fit`
     -----------------------------
@@ -126,9 +201,11 @@ class DealScorer:
         win log-odds.
     intercept_ : float intercept on the standardized scale.
     feature_names_ : the ordered feature columns used.
-    calibrated_ : whether Platt calibration was actually applied (it falls
-        back to the identity when the sample is too small or a split is
-        single-class).
+    calibrated_ : whether Platt calibration was actually applied. It falls
+        back to the identity map — leaving the logistic's own probabilities
+        untouched — when there are fewer than 20 of either outcome, or when a
+        cross-fitting fold is single-class. Both fallbacks warn when
+        ``calibrate`` is True; there is no minimum on the total deal count.
     """
 
     def __init__(
@@ -222,33 +299,50 @@ class DealScorer:
     def _fit_core(
         self, X: np.ndarray, y: np.ndarray
     ) -> tuple[np.ndarray, float, float, float, bool]:
-        """Fit the logistic and (optionally) a held-out Platt calibrator.
+        """Fit the logistic on all deals and (optionally) a cross-fitted Platt map.
 
-        With calibration the logistic is fit on a random ~75% split and the
-        calibrator on the held-out ~25%, so the calibrator never sees scores
-        from deals it was trained on. When the sample is too small or either
-        split is single-class, calibration is skipped and the logistic is fit
-        on all deals with an identity calibrator.
+        The reported logistic is ALWAYS fit on every deal — calibration costs
+        no training data. The calibrator is fit on cross-fitted (out-of-fold)
+        scores, so it sees an honest out-of-sample score for every deal without
+        any of them being withheld from the final model.
+
+        Calibration is skipped — identity map, ``calibrated_ = False`` — when
+        either outcome has fewer than ``_CALIB_MIN_PER_CLASS`` deals, or if any
+        fold's training subset turns out single-class. Both skips warn when the
+        caller asked for calibration, since ``calibrate=True`` is the default
+        and a silently uncalibrated scorer is indistinguishable from a
+        calibrated one at the call site.
         """
-        n = X.shape[0]
         rng = np.random.default_rng(self.seed)
-        if self.calibrate and n >= 20:
-            perm = rng.permutation(n)
-            n_hold = max(int(round(0.25 * n)), 1)
-            hold_idx, train_idx = perm[:n_hold], perm[n_hold:]
-            both = y[train_idx]
-            held = y[hold_idx]
-            if (
-                len(np.unique(both)) == 2
-                and len(np.unique(held)) == 2
-                and len(hold_idx) >= 4
-            ):
-                w, b = _fit_logistic(X[train_idx], y[train_idx], self.l2)
-                z_hold = X[hold_idx] @ w + b
-                cal_a, cal_b = _fit_platt(z_hold, y[hold_idx])
-                return w, b, cal_a, cal_b, True
         w, b = _fit_logistic(X, y, self.l2)
-        return w, b, 1.0, 0.0, False
+        if not self.calibrate:
+            return w, b, 1.0, 0.0, False
+        n = int(y.shape[0])
+        n_pos = int(np.count_nonzero(y > 0.5))
+        n_neg = n - n_pos
+        if min(n_pos, n_neg) < _CALIB_MIN_PER_CLASS:
+            warnings.warn(
+                f"ignoring calibrate=True: {n} closed deal(s) ({n_pos} won / "
+                f"{n_neg} lost) is too few to fit a Platt map, which needs at "
+                f"least {_CALIB_MIN_PER_CLASS} of each outcome; the logistic's "
+                f"own probabilities are returned (calibrated_ = False)",
+                UserWarning,
+                stacklevel=3,
+            )
+            return w, b, 1.0, 0.0, False
+        z_oof = _out_of_fold_scores(X, y, self.l2, rng, _CALIB_FOLDS)
+        if z_oof is None:
+            warnings.warn(
+                "ignoring calibrate=True: a cross-fitting fold's training "
+                "subset was single-class, so no out-of-fold scores could be "
+                "produced; the logistic's own probabilities are returned "
+                "(calibrated_ = False)",
+                UserWarning,
+                stacklevel=3,
+            )
+            return w, b, 1.0, 0.0, False
+        cal_a, cal_b = _fit_platt(z_oof, y)
+        return w, b, cal_a, cal_b, True
 
     def _extract_target(self, deals: pd.DataFrame, target: str) -> np.ndarray:
         if target not in deals.columns:
@@ -257,26 +351,37 @@ class DealScorer:
                 f"must carry a boolean win label"
             )
         col = deals[target]
-        if pd.api.types.is_bool_dtype(col):
-            y = col.to_numpy(dtype=float)
-        elif pd.api.types.is_numeric_dtype(col):
-            y = col.to_numpy(dtype=float)
-            if not np.isfinite(y).all():
-                raise DataContractError(
-                    f"target column {target!r} contains NaN/inf; every closed "
-                    f"deal must have a definite win/loss label"
-                )
+        is_bool = pd.api.types.is_bool_dtype(col)
+        if not (is_bool or pd.api.types.is_numeric_dtype(col)):
+            raise DataContractError(
+                f"target column {target!r} must be boolean or 0/1, got dtype "
+                f"{col.dtype}"
+            )
+        # Missingness is checked BEFORE the dtype dispatch and before the
+        # float conversion: pandas' nullable dtypes ("boolean", "Int64",
+        # "Float64") are bool/numeric by is_*_dtype but carry pd.NA, which
+        # converts to a silent NaN. An unlabelled deal must never train the
+        # model — a NaN label poisons every likelihood term and yields an
+        # all-zero "null model" that scores every deal at p = 0.5.
+        n_null = int(col.isna().sum())
+        if n_null:
+            raise DataContractError(
+                f"target column {target!r} contains {n_null} NaN/NA value(s); "
+                f"every closed deal must have a definite win/loss label"
+            )
+        y = col.to_numpy(dtype=float)
+        if not np.isfinite(y).all():
+            raise DataContractError(
+                f"target column {target!r} contains NaN/inf; every closed "
+                f"deal must have a definite win/loss label"
+            )
+        if not is_bool:
             uniq = set(np.unique(y).tolist())
             if not uniq.issubset({0.0, 1.0}):
                 raise DataContractError(
                     f"target column {target!r} must be boolean or 0/1; got "
                     f"values {sorted(uniq)[:5]}"
                 )
-        else:
-            raise DataContractError(
-                f"target column {target!r} must be boolean or 0/1, got dtype "
-                f"{col.dtype}"
-            )
         if len(np.unique(y)) < 2:
             raise DataContractError(
                 f"target column {target!r} has a single class; a scorer needs "
@@ -373,6 +478,12 @@ def weighted_pipeline(
         precedence over ``scorer``. Exactly one of ``scorer``/``proba`` is
         required.
     by : segment column(s) to group by; ``None`` returns a single total row.
+        The returned segments always partition ``open_deals`` exactly — their
+        ``expected`` and ``n_deals`` sum to the ungrouped totals. Deals with a
+        null segment label are therefore kept, as their own NaN-keyed row, and
+        warned about; they are never silently dropped. Relabel them beforehand
+        if you want them named (on a ``category`` dtype that means
+        ``add_categories`` first, or ``.astype(object)``).
     amount_col : the deal-value column (default ``"amount"``).
     level : confidence level in (0, 100) for the interval columns
         ``lo-{level}``/``hi-{level}``; ``None`` omits them.
@@ -420,9 +531,29 @@ def weighted_pipeline(
             raise ForecastOSError(
                 f"open_deals is missing grouping column(s) {missing}"
             )
+        # pandas' groupby drops null keys by default, which would delete those
+        # deals from the output entirely: the segments would no longer sum to
+        # the ungrouped total, silently and by an unbounded amount. An
+        # unassigned region/owner/territory is an everyday CRM state, though, so
+        # the fix is to KEEP those deals (dropna=False below) as their own
+        # null-keyed segment — which restores the partition exactly — and warn,
+        # rather than to refuse the frame.
+        for c in keys:
+            null_mask = open_deals[c].isna().to_numpy()
+            n_null = int(null_mask.sum())
+            if n_null:
+                lost = float(work["_pa"].to_numpy()[null_mask].sum())
+                warnings.warn(
+                    f"grouping column {c!r} has {n_null} null segment label(s) "
+                    f"covering {lost:,.2f} of expected pipeline; they are "
+                    f"reported as one unlabelled (NaN-keyed) segment so the "
+                    f"segments still sum to the ungrouped total",
+                    UserWarning,
+                    stacklevel=2,
+                )
         for c in keys:
             work[c] = open_deals[c].to_numpy()
-        grouped = work.groupby(keys, sort=True)
+        grouped = work.groupby(keys, sort=True, dropna=False)
         agg = grouped.agg(
             expected=("_pa", "sum"), _variance=("_var", "sum"), _total=("_amt", "sum")
         )

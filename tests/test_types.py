@@ -1,5 +1,7 @@
 """Tests for the panel data contract (core.types)."""
 
+import io
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -202,3 +204,52 @@ def test_future_ds_continues_after_last():
         assert (out > last).all()
         assert out.is_monotonic_increasing
         assert len(out) == 5
+
+
+class TestNullKeysAreRejected:
+    """A null key is not a missing value — it is a row that cannot be placed.
+
+    ``y`` NaNs were rejected loudly while a null ``unique_id`` or ``ds`` passed
+    validation and then vanished downstream: pandas' groupby defaults to
+    ``dropna=True``, so one blank id cell deleted an entire series from the
+    forecast with no error and no warning, and a null ``ds`` sorted to the end
+    of the series where it was mistaken for the latest observation, silently
+    changing the point forecast.
+    """
+
+    def test_null_unique_id_raises(self):
+        df = pd.DataFrame(
+            {"unique_id": ["a", None, "b"], "ds": [1, 2, 3], "y": [1.0, 2.0, 3.0]}
+        )
+        with pytest.raises(DataContractError, match="'unique_id' contains 1 null"):
+            validate_panel(df)
+
+    def test_blank_id_cell_from_csv_raises(self):
+        csv = "unique_id,ds,y\na,2024-01-01,1\n,2024-01-02,2\nb,2024-01-03,3\n"
+        with pytest.raises(DataContractError, match="'unique_id' contains 1 null"):
+            validate_panel(pd.read_csv(io.StringIO(csv)))
+
+    def test_nat_ds_raises(self):
+        csv = "unique_id,ds,y\na,2024-01-01,1\na,,2\na,2024-01-03,3\n"
+        with pytest.raises(DataContractError, match="'ds' contains 1 null"):
+            validate_panel(pd.read_csv(io.StringIO(csv), parse_dates=["ds"]))
+
+    def test_numeric_nan_ds_raises(self):
+        """The silent-wrong-forecast case: NaN sorts last and looks like the latest."""
+        df = pd.DataFrame(
+            {"unique_id": "a", "ds": [0.0, 1.0, np.nan, 3.0], "y": [1.0, 2.0, 3.0, 4.0]}
+        )
+        with pytest.raises(DataContractError, match="'ds' contains 1 null"):
+            validate_panel(df)
+
+    def test_allow_missing_does_not_waive_null_keys(self):
+        """allow_missing concerns a missing observation, not an unplaceable row."""
+        df = pd.DataFrame(
+            {"unique_id": ["a", None], "ds": [1, 2], "y": [1.0, 2.0]}
+        )
+        with pytest.raises(DataContractError, match="'unique_id' contains"):
+            validate_panel(df, allow_missing=True)
+
+    def test_clean_panel_is_unaffected(self):
+        df = pd.DataFrame({"unique_id": "a", "ds": [1, 2, 3], "y": [1.0, 2.0, 3.0]})
+        assert len(validate_panel(df)) == 3
