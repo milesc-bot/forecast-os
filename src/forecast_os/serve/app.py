@@ -83,12 +83,18 @@ if _HAS_FASTAPI:
     class PreviewRequest(BaseModel):
         """Body for ``POST /preview`` — mirrors :func:`preview_panel`.
 
-        Provide exactly one of ``records`` (inline row dicts) or ``csv_path``
-        (a CSV path read from the **server's** filesystem, not the client's).
+        Rows are supplied inline via ``records``. The underlying
+        :func:`preview_panel` also accepts a server-side ``csv_path``, but that
+        parameter is deliberately **not** exposed over HTTP: it was handed
+        straight to ``pandas.read_csv``, which accepts URLs as readily as paths,
+        making an unauthenticated request able to read any file the server
+        process can reach, drive outbound requests to arbitrary hosts with the
+        response reflected back to the caller, and allocate unbounded memory
+        decompressing a remote archive before any validation ran. The MCP
+        surface, which is local and trusted, keeps the affordance.
         """
 
         records: list[dict[str, Any]] | None = None
-        csv_path: str | None = None
         mapping: str | None = None
         freq: str | None = None
         agg: str | None = None
@@ -183,7 +189,6 @@ def create_app() -> FastAPI:
     @app.post("/preview")
     def preview(body: PreviewRequest) -> dict[str, Any]:
         return preview_panel(
-            csv_path=body.csv_path,
             records=body.records,
             mapping=body.mapping,
             **_preview_overrides(body.freq, body.agg),

@@ -46,6 +46,14 @@ from .types import (
     validate_panel,
 )
 
+#: Largest forecast horizon any model will accept in :meth:`BaseForecaster.predict`.
+#: The horizon sizes the output array before anything else runs, so an unbounded ``h``
+#: lets a single small request allocate without limit — over the REST surface one
+#: ~650-byte body was measured getting the server process OOM-killed at 4.5 GB. The cap
+#: is deliberately far above any real forecasting need; it exists to bound allocation,
+#: not to express a modeling opinion.
+MAX_HORIZON = 10_000
+
 
 class IgnoredCovariatesWarning(UserWarning):
     """Numeric covariate columns were ignored by a model without exog support."""
@@ -392,8 +400,8 @@ class PerSeriesForecaster(BaseForecaster):
         ``X_df`` is ignored with an :class:`IgnoredCovariatesWarning`.
         """
         self._check_is_fitted()
-        if not isinstance(h, (int, np.integer)) or h < 1:
-            raise ValueError(f"h must be a positive integer, got {h!r}")
+        if not isinstance(h, (int, np.integer)) or not 1 <= h <= MAX_HORIZON:
+            raise ValueError(f"h must be an integer in [1, {MAX_HORIZON}], got {h!r}")
         levels = _check_level(level)
         features = getattr(self, "_exog_features", [])
         x_future: dict[Any, np.ndarray] | None = None

@@ -314,3 +314,43 @@ def test_malformed_body_returns_400_error_envelope():
     assert r.status_code == 400
     body = r.json()
     assert "error" in body and "invalid request body" in body["error"]
+
+
+class TestPreviewDoesNotReadServerSidePaths:
+    """``csv_path`` must not be reachable over HTTP.
+
+    It was passed straight to ``pandas.read_csv``, which treats a URL as
+    readily as a path. An unauthenticated request could therefore read any
+    file the server process could reach, make the server issue outbound
+    requests to an arbitrary host *with the fetched body reflected back in the
+    200 response*, and allocate unbounded memory decompressing a remote
+    archive — all before any panel validation ran.
+    """
+
+    def test_url_is_not_fetched(self, client, monkeypatch):
+        import pandas as pd
+
+        attempted = []
+
+        def spy(*args, **kwargs):  # pragma: no cover - must never run
+            attempted.append(args[0] if args else None)
+            raise AssertionError(f"read_csv reached the network/filesystem: {args!r}")
+
+        monkeypatch.setattr(pd, "read_csv", spy)
+        resp = client.post("/preview", json={"csv_path": "http://169.254.169.254/latest/meta-data"})
+        assert resp.status_code == 400
+        assert attempted == []
+
+    def test_local_path_is_not_read(self, client):
+        resp = client.post("/preview", json={"csv_path": "/etc/passwd"})
+        assert resp.status_code == 400
+        assert "passwd" not in resp.text
+
+    def test_inline_records_still_work(self, client, _panel_records=None):
+        rows = [
+            {"unique_id": "a", "ds": "2024-01-01", "y": 1.0},
+            {"unique_id": "a", "ds": "2024-01-02", "y": 2.0},
+        ]
+        resp = client.post("/preview", json={"records": rows})
+        assert resp.status_code == 200
+        assert resp.json()["rows"] == 2

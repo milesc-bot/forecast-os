@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 import forecast_os  # noqa: F401  (imports register all built-in models)
-from forecast_os.core.base import BaseForecaster
+from forecast_os.core.base import MAX_HORIZON, BaseForecaster
 from forecast_os.core.registry import _REGISTRY, get_model
 from forecast_os.core.types import ID_COL, TIME_COL
 from forecast_os.datasets.synthetic import generate_series
@@ -138,3 +138,36 @@ def test_registered_model_save_load_roundtrip(name, tmp_path):
 
     assert type(loaded) is type(model)
     pd.testing.assert_frame_equal(loaded.predict(H, level=[80]), expected)
+
+
+class TestHorizonIsBounded:
+    """``h`` sizes the output array before anything else runs.
+
+    Unbounded, one small request allocates without limit — over the REST
+    surface a ~650-byte body was measured getting the server process
+    OOM-killed at 4.5 GB, because ``np.full(h, ...)`` runs before any
+    downstream validation.
+    """
+
+    @staticmethod
+    def _fitted():
+        return get_model("naive").fit(_contract_panel())
+
+    def test_horizon_at_the_cap_is_accepted(self):
+        pred = self._fitted().predict(MAX_HORIZON)
+        # h is the per-series horizon, so the frame holds h rows for each id.
+        assert (pred.groupby(ID_COL).size() == MAX_HORIZON).all()
+
+    @pytest.mark.parametrize("bad_h", [MAX_HORIZON + 1, 1_000_000, 10**12])
+    def test_horizon_beyond_the_cap_is_rejected(self, bad_h):
+        with pytest.raises(ValueError, match="h must be an integer"):
+            self._fitted().predict(bad_h)
+
+    def test_rejection_happens_before_allocation(self):
+        """A 1e12 horizon must raise, not attempt an 8 TB fill."""
+        import time
+
+        start = time.monotonic()
+        with pytest.raises(ValueError):
+            self._fitted().predict(10**12)
+        assert time.monotonic() - start < 1.0

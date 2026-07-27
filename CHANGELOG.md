@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.8.1 (2026-07-27)
+
+Security and robustness fixes for the REST surface. Recommended upgrade for
+anyone running `forecast-os-serve`; no API changes for library or MCP users.
+
+- **`POST /preview` no longer accepts `csv_path`.** The field was passed
+  straight to `pandas.read_csv`, which resolves URLs as readily as paths, so
+  an unauthenticated request could read any file the server process could
+  reach, make the server issue outbound requests to an arbitrary host *with
+  the fetched body reflected back in the response*, and allocate unbounded
+  memory decompressing a remote archive — all before any panel validation ran.
+  The field was never documented or tested as part of the REST API; inline
+  `records` is unaffected. The MCP surface, which is local and trusted, keeps
+  the server-side path affordance.
+- **Forecast horizons are bounded** by `core.base.MAX_HORIZON` (10,000). `h`
+  sizes the output array before anything else runs, so an unbounded horizon let
+  a single ~650-byte request allocate without limit — enough to get the server
+  process OOM-killed. The cap sits in `BaseForecaster.predict`, so it protects
+  the REST routes, the MCP tools, and direct library callers alike, and it
+  fires before allocation. It is far above any real forecasting need.
+
+Both were found by an adversarial audit of the whole repository and are
+reproduced by regression tests (`tests/test_serve.py`, `tests/test_contract.py`).
+
 ## 0.8.0 (2026-07-27)
 
 Seasonality: multiplicative seasonal ARIMA and multiple-seasonality
