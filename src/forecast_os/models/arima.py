@@ -34,6 +34,26 @@ def _css_residuals(w: np.ndarray, c: float, phi: np.ndarray, theta: np.ndarray) 
     return u
 
 
+def _css_scale(w: np.ndarray) -> float:
+    """Positive factor that makes the CSS objective free of the units of ``y``.
+
+    L-BFGS-B tests convergence on the *absolute* projected gradient, but the CSS
+    objective is a sum of squared residuals, so its gradient scales as the square
+    of the units of ``y``. Fitting a series measured in millionths therefore
+    stopped at the starting point and reported success. Dividing ``w`` by this
+    scale before optimizing leaves the optimum untouched — the residuals are
+    linear in ``(w, c)`` at fixed coefficients, so ``phi``/``theta`` are
+    invariant and ``c`` simply scales back — while giving the optimizer a
+    well-conditioned O(1) problem at any magnitude.
+    """
+    if len(w) == 0:
+        return 1.0
+    s = float(np.std(w))
+    if not np.isfinite(s) or s <= 0.0:  # constant series: fall back to its level
+        s = float(np.max(np.abs(w)))
+    return s if np.isfinite(s) and s > 0.0 else 1.0
+
+
 def _fit_css(y: np.ndarray, order: tuple[int, int, int], include_mean: bool) -> dict:
     """Fit one series by CSS; returns the per-series state dict."""
     p, d, q = order
@@ -41,6 +61,8 @@ def _fit_css(y: np.ndarray, order: tuple[int, int, int], include_mean: bool) -> 
     lasts = [float(np.diff(y, n=i)[-1]) for i in range(d)]
     m = max(p, q)
     use_c = include_mean and d == 0
+    scale = _css_scale(w)
+    w_fit = w / scale
 
     def unpack(params: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         i = 1 if use_c else 0
@@ -49,10 +71,10 @@ def _fit_css(y: np.ndarray, order: tuple[int, int, int], include_mean: bool) -> 
 
     def objective(params: np.ndarray) -> float:
         c, phi, theta = unpack(params)
-        e = _css_residuals(w, c, phi, theta)
+        e = _css_residuals(w_fit, c, phi, theta)
         return float(np.sum(e[m:] ** 2))
 
-    x0: list[float] = [float(np.mean(w))] if use_c else []
+    x0: list[float] = [float(np.mean(w_fit))] if use_c else []
     bounds: list[tuple[float | None, float | None]] = [(None, None)] if use_c else []
     x0 += [0.0] * (p + q)
     bounds += [(-_COEF_BOUND, _COEF_BOUND)] * (p + q)
@@ -60,6 +82,7 @@ def _fit_css(y: np.ndarray, order: tuple[int, int, int], include_mean: bool) -> 
     if x0:
         res = optimize.minimize(objective, np.asarray(x0), method="L-BFGS-B", bounds=bounds)
         c, phi, theta = unpack(res.x)
+        c *= scale  # the intercept carries the units; the coefficients do not
         converged = bool(res.success)
     else:
         c, phi, theta = 0.0, np.zeros(0), np.zeros(0)

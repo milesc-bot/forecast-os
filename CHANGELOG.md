@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.8.0 (2026-07-27)
+
+Seasonality: multiplicative seasonal ARIMA and multiple-seasonality
+decomposition, closing the last modeling gap on the roadmap. The registry
+goes from 21 to 24 models. Core dependencies are unchanged (numpy / pandas /
+scipy) — no statsmodels.
+
+- **`sarima` / `auto_sarima`**: SARIMA(p,d,q)(P,D,Q)ₘ estimated by conditional
+  sum of squares. The seasonal and non-seasonal lag polynomials are convolved
+  into equivalent long AR/MA polynomials, so only the `p+q+P+Q` structural
+  coefficients are optimized and the multiplicative constraint stays exact;
+  the existing CSS estimator and ψ-weight interval theory then apply unchanged.
+  Forecast standard errors integrate the ψ sequence through the same
+  `(1−B)ᵈ(1−Bᵐ)ᴰ` operator used to difference the data. `auto_sarima` picks `D`
+  by seasonal strength, `d` by the variance heuristic on the seasonally
+  differenced series, and `(p,q,P,Q)` by AICc. With `m=1` or
+  `seasonal_order=(0,0,0)` it reduces bit-exactly to `arima`.
+- **`mstl` + `stl_decompose`**: additive multi-seasonal decomposition by
+  iterative backfitting — one seasonal component per period plus trend and
+  remainder — forecast by adding cyclically-extended seasonals back onto any
+  registry base model (default `auto_ets`). Handles weekly *and* yearly
+  seasonality in one model. `robust=True` uses cycle-subseries medians.
+
+Fixes from the adversarial verification pass:
+
+- **The CSS fit is now equivariant in the units of `y`.** L-BFGS-B tests
+  convergence on the *absolute* projected gradient, but the CSS objective's
+  gradient scales as the square of the units — so a series measured in
+  millionths stopped at the all-zero starting point and reported
+  `converged=True` (observed at λ=1e-4: all coefficients exactly 0, SSE 64%
+  worse). The series is now fitted on a unit-scale copy and the intercept
+  scaled back, which leaves the optimum untouched (residuals are linear in
+  `(w, c)` at fixed coefficients) while giving the optimizer an O(1) problem
+  at any magnitude. Applies to `arima`/`auto_arima` as well, which shared the
+  defect. Together with the AICc fix below, `auto_sarima` order selection is
+  now invariant across λ ∈ [1e-2, 1e2] on every series tested (was 12/12
+  flipping).
+- **AICc order selection is now scale invariant.** Candidates were scored on
+  differing sample sizes (each model's own warm-up), and `n·log(sse/n)` shifts
+  by `2n·log(λ)` under a rescaling of `y` — so changing the units of a series
+  flipped the selected order (measured: 21% worse holdout MAE, differing in
+  40/40 replications). All candidates are now scored on a common window.
+- **Seasonal strength is now robust.** Cycle-subseries means and variances have
+  a 0% breakdown point, so a single outlier drove `Fs` from 0.963 to 0.600,
+  flipping `D` from 1 to 0 on a strongly seasonal series and tripling holdout
+  error. Now uses cycle-subseries medians and a MAD-based scale.
+- **MSTL honors its base model's data requirement.** The base was fitted
+  through `_fit_series`, bypassing the `min_train_size` guard, so a heavier
+  base silently returned all-NaN forecasts with no error; a base failing on its
+  own terms leaked a raw `AttributeError`. Both now raise `ForecastOSError`.
+- **A seasonal period needs two full cycles to be estimated.** At one cycle each
+  cycle-subseries cell holds a single point, so the component memorizes noise
+  and the intervals collapse — a nominal 95% interval was measured covering 9%.
+  Periods without two cycles are dropped with a warning, as over-long ones
+  already were.
+- **The terminal's season setting reaches the new models.** It was matched only
+  against `season_length`, so `sarima`/`auto_sarima` (which take `m`) and
+  `mstl` (which takes `periods`) silently stayed on their class defaults.
+
 ## 0.7.1 (2026-07-24)
 
 Packaging: first PyPI release. The distribution is published as

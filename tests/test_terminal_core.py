@@ -180,6 +180,19 @@ class TestModelParams:
     def test_none_season_length_passes_nothing(self, settings):
         assert engine_bridge.model_params("theta", settings) == {}
 
+    def test_season_maps_onto_the_name_each_model_uses(self, settings):
+        """sarima spells it ``m`` and mstl spells it ``periods``.
+
+        Matching only on ``season_length`` silently left those three on their
+        class defaults, so a workspace set to a weekly season still forecast
+        daily data with m=12.
+        """
+        settings["season_length"] = 7
+        assert engine_bridge.model_params("sarima", settings) == {"m": 7}
+        assert engine_bridge.model_params("auto_sarima", settings) == {"m": 7}
+        assert engine_bridge.model_params("mstl", settings) == {"periods": 7}
+        assert engine_bridge.model_params("seasonal_naive", settings) == {"season_length": 7}
+
 
 class TestDashboardRows:
     def test_shape_and_columns(self, demo, settings):

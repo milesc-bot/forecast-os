@@ -66,17 +66,24 @@ _SPARK_NAN = "·"
 def model_params(model: str, settings: dict) -> dict:
     """Constructor params for registry ``model`` implied by workspace ``settings``.
 
-    Currently that is ``season_length`` alone, passed through only when it is
+    Currently that is the workspace season alone, passed through only when it is
     set and the model's constructor accepts it — so ``naive`` stays
     parameterless while ``theta``/``auto_ets``/``seasonal_naive``/``ridge_lag``
     pick the season up.
+
+    Models spell that parameter differently: ``sarima``/``auto_sarima`` take
+    ``m`` and ``mstl`` takes ``periods``. Matching only on ``season_length``
+    silently left those three on their class defaults (``m=12`` on daily data),
+    so the workspace setting is mapped onto whichever name the model uses.
     """
     season_length = settings.get("season_length")
     if season_length is None:
         return {}
     probe = get_model(model)  # constructors only store attributes; cheap
-    if "season_length" in inspect.signature(type(probe).__init__).parameters:
-        return {"season_length": int(season_length)}
+    accepted = inspect.signature(type(probe).__init__).parameters
+    for name in ("season_length", "m", "periods"):
+        if name in accepted:
+            return {name: int(season_length)}
     return {}
 
 

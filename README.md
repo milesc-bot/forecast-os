@@ -359,6 +359,8 @@ forecast-os simulate --s0 100 --mu 0.0004 --sigma 0.012 --h 252 --paths 5000
 | `auto_ets` | statistical | Picks the best ETS variant by AICc |
 | `theta` | statistical | The M3-winning Theta method with deseasonalization |
 | `arima`, `auto_arima` | statistical | ARIMA(p,d,q) via CSS; auto orders by AICc, ψ-weight intervals; exogenous drivers (regression with ARIMA errors) |
+| `sarima`, `auto_sarima` | statistical | SARIMA(p,d,q)(P,D,Q)ₘ multiplicative seasonal ARIMA; auto `D` by seasonal strength, orders by AICc |
+| `mstl` | statistical | Multiple seasonality (e.g. weekly *and* yearly) by iterative decomposition + any base model |
 | `kalman` | statistical | Local level / local linear trend state space, MLE, exact interval growth |
 | `ridge_lag` | ml | Ridge autoregression on lags + Fourier terms, recursive multi-step |
 | `croston`, `tsb` | statistical | Intermittent-demand models for lumpy series (sparse enterprise bookings) |
@@ -408,15 +410,15 @@ That's the whole integration: it now appears in `list_models()`, works in
 
 ## Roadmap
 
-The v0.1→v0.6 roadmap is complete: forecasting engine → probabilistic
+The v0.1→v0.8 roadmap is complete: forecasting engine → probabilistic
 evaluation → GTM domain layer → data connectors + MCP → terminal console →
 snapshot history, driver-based ARIMA, foundation-model adapter, and REST
-serving. What's next:
+serving → deal-grain analytics and opportunity-movement waterfalls →
+seasonal ARIMA and multiple seasonality. What's next:
 
-- Opportunity-level movement (created / advanced / slipped / won / lost)
-  pipeline waterfalls on top of the snapshot store
-- Seasonal ARIMA (SARIMA) and multiple seasonality (MSTL)
 - Terminal: settings editor and saved views
+- Exogenous drivers for SARIMA (regression with seasonal-ARIMA errors)
+- Multiplicative decomposition for MSTL
 
 ## Acknowledgments
 

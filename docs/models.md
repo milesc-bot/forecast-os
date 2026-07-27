@@ -42,11 +42,59 @@ Strong on trending business data at a fraction of ARIMA's cost.
 the differencing, and intervals use the ψ-weight (MA(∞)) representation, so uncertainty
 grows correctly with horizon. `auto_arima` picks `d` by a variance-minimization
 heuristic and (p,q) by AICc grid search. Use for autocorrelation-driven series without
-strong seasonality (seasonal ARIMA is on the roadmap).
+strong seasonality — when the series *is* seasonal, reach for `sarima` below.
 
 Note: like R's `arima`, `include_mean` applies only when `d == 0` — a differenced
 model has no drift constant (its forecast is trend-free by construction);
 `auto_arima` can still capture drift-like behavior through AR structure.
+
+## Seasonal ARIMA
+
+`sarima` fits SARIMA(p,d,q)(P,D,Q)_m — the multiplicative seasonal extension of ARIMA:
+
+```
+φ(B) Φ(Bᵐ) (1−B)ᵈ (1−Bᵐ)ᴰ y_t = c + θ(B) Θ(Bᵐ) e_t
+```
+
+The seasonal and non-seasonal lag polynomials are convolved into equivalent long
+AR/MA polynomials, so the same CSS estimator and ψ-weight interval theory as `arima`
+apply unchanged — only the structural coefficients `(p+q+P+Q)` are optimized, which
+keeps the multiplicative constraint exact rather than approximating it with a long
+unrestricted ARMA. Forecast standard errors integrate the ψ sequence through the same
+`(1−B)ᵈ(1−Bᵐ)ᴰ` operator used to difference the data.
+
+`auto_sarima` chooses `D` by seasonal strength, `d` by the variance heuristic applied
+to the *seasonally differenced* series, then searches `(p,q,P,Q)` by AICc. Set `m` to
+the seasonal period (12 monthly, 4 quarterly, 7 daily-with-weekly-cycle). With
+`m=1` or `seasonal_order=(0,0,0)` it reduces exactly to `arima`.
+
+Use for a single strong, stable seasonality. For *multiple* seasonal periods
+(weekly *and* yearly), use `mstl`.
+
+## MSTL (multiple seasonality)
+
+`mstl` handles more than one seasonal period at once. `stl_decompose` splits the
+series additively into a trend, one seasonal component per period, and a remainder
+by iterative backfitting: each seasonal is estimated as a cycle-subseries average of
+the series minus the trend and minus the *other* seasonals, then mean-centered; the
+trend is re-estimated as a centered moving average of the deseasonalized series.
+`robust=True` uses medians instead of means, which resists outliers.
+
+The model forecasts by fitting any registry model (`base_model`, default `auto_ets`)
+to the deseasonalized series and adding each seasonal component back, extended
+cyclically from its last full cycle:
+
+```python
+from forecast_os import MSTL, stl_decompose
+
+MSTL(periods=[7, 365], base_model="theta").fit(panel).predict(28)
+res = stl_decompose(y, periods=[7, 365])   # res.trend, res.seasonal[7], res.remainder
+```
+
+Decomposition is additive only. Periods too long for the series are dropped with a
+warning rather than failing, so `periods=[7, 365]` still forecasts weekly on a year
+of data. Prediction intervals come from the base model and treat the seasonal
+components as deterministic, so they do not include seasonal-estimation uncertainty.
 
 ## Kalman filter
 

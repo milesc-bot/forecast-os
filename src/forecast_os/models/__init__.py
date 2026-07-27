@@ -9,6 +9,8 @@ from .hierarchy import HierarchicalReconciler, aggregate_panel
 from .intermittent import TSB, Croston
 from .kalman import KalmanForecaster
 from .ml import RidgeLag
+from .mstl import MSTL, STLResult, stl_decompose
+from .sarima import SARIMA, AutoSARIMA
 from .theta import Theta
 
 __all__ = [
@@ -27,6 +29,11 @@ __all__ = [
     "Theta",
     "ARIMA",
     "AutoARIMA",
+    "SARIMA",
+    "AutoSARIMA",
+    "MSTL",
+    "STLResult",
+    "stl_decompose",
     "KalmanForecaster",
     "RidgeLag",
     "Ensemble",

@@ -7,7 +7,7 @@ from forecast_os.core.exceptions import ForecastOSError, NotFittedError
 from forecast_os.core.registry import get_model, list_models
 from forecast_os.core.types import to_panel
 from forecast_os.datasets.synthetic import generate_series
-from forecast_os.models.arima import ARIMA, AutoARIMA
+from forecast_os.models.arima import ARIMA, AutoARIMA, _fit_css
 
 H = 8
 
@@ -182,3 +182,53 @@ class TestAutoARIMA:
         for col in ("yhat", "lo-80", "hi-80"):
             assert np.isfinite(pred[col]).all()
         assert (pred["lo-80"] <= pred["hi-80"]).all()
+
+
+class TestScaleEquivariance:
+    """The CSS fit must not depend on the units the series is measured in.
+
+    L-BFGS-B tests convergence on the absolute projected gradient, but the CSS
+    objective's gradient scales as the square of the units of ``y``. Before
+    ``_css_scale``, a series measured in millionths stopped at the all-zero
+    starting point and still reported ``converged=True``.
+    """
+
+    @staticmethod
+    def _ar1(n=300, phi=0.6, seed=0):
+        rng = np.random.default_rng(seed)
+        innov = rng.normal(size=n)
+        y = np.zeros(n)
+        for i in range(n):
+            y[i] = phi * (y[i - 1] if i else 0.0) + innov[i]
+        return y
+
+    @pytest.mark.parametrize("lam", [1e-6, 1e-4, 1e-2, 1e2, 1e6])
+    def test_css_coefficients_are_invariant_to_units(self, lam):
+        y = self._ar1()
+        ref = _fit_css(y, (1, 0, 1), True)
+        got = _fit_css(y * lam, (1, 0, 1), True)
+        assert np.allclose(got["phi"], ref["phi"], atol=1e-4)
+        assert np.allclose(got["theta"], ref["theta"], atol=1e-4)
+        assert np.isclose(got["c"], ref["c"] * lam, rtol=1e-4, atol=1e-12 * lam)
+        assert np.isclose(got["sse"] / lam**2, ref["sse"], rtol=1e-4)
+
+    def test_tiny_series_does_not_collapse_to_the_zero_start(self):
+        """The regression: at 1e-4 the fit returned exactly the x0 it started from."""
+        y = self._ar1() * 1e-4
+        state = _fit_css(y, (1, 0, 1), True)
+        assert abs(float(state["phi"][0])) > 0.1, "coefficients collapsed to the zero start"
+
+    def test_forecasts_scale_with_the_series(self):
+        y = self._ar1()
+        base = ARIMA(order=(1, 0, 1)).fit(to_panel(y)).predict(6)["yhat"].to_numpy()
+        for lam in (1e-5, 1e5):
+            scaled = ARIMA(order=(1, 0, 1)).fit(to_panel(y * lam)).predict(6)["yhat"].to_numpy()
+            assert np.allclose(scaled, base * lam, rtol=1e-4)
+
+    def test_constant_series_still_fits(self):
+        """std(w) == 0 must fall back to a finite scale rather than divide by zero."""
+        for level in (0.0, 5.0, -3.0, 1e8):
+            state = _fit_css(np.full(60, level), (1, 0, 0), True)
+            assert np.isfinite(state["c"])
+            assert np.isfinite(state["sse"])
+            assert np.isfinite(state["phi"]).all()
