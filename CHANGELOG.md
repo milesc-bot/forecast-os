@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.10.3 (2026-07-28)
+
+Closes the last tier of the repository audit — the should-fix and nit findings
+left after 0.10.0. Mostly documentation accuracy, with two changes that move
+numbers. Those are first.
+
+### Numbers that change
+
+- **Strategy backtests annualize intraday, multi-unit and business-anchored
+  panels correctly.** `_infer_periods` matched only bare unit roots, so any
+  frequency pandas infers with a multiple or an unlisted unit silently fell
+  back to 252 — wrong in both directions:
+
+  | panel | before | after | effect on Sharpe / annualized vol |
+  |---|---|---|---|
+  | `4h` | 252 | 1512 | was understated ~59% |
+  | `15min` | 252 | 24192 | was understated ~90% |
+  | `2D` | 252 | 126 | was overstated 2x |
+  | `BME` | 252 | 12 | was **overstated 4.6x** |
+  | `BYE` | 252 | 1 | was **overstated 15.9x** |
+
+  Single-unit frequencies already in the table (`D`, `h`, `W`, `ME`, `QE`,
+  `YE`, `B`) are unchanged, as are numeric and irregular `ds`. If you were
+  relying on the old figure, pass `periods=` explicitly. Note the intraday
+  rates are a deliberate convention — a 24-hour day crossed with a 252-day
+  trading year — which suits a crypto/FX tape but not a 6.5-hour equity
+  session; `_PERIODS_BY_FREQ` documents the alternatives.
+
+- **`pinball_loss` excludes NaN rows instead of returning `nan`.** One NaN in
+  `y` or `q_pred` poisoned the whole score, while the module docstring promised
+  exclusion and `coverage`/`winkler_score` already did it. NaN-free results are
+  bit-identical. Note the number still need not match `evaluate`'s `"pinball"`:
+  that path drops a row when any of `y`, the point forecast or either bound is
+  NaN — a joint rule this function cannot see — so they agree when the NaN is
+  in `y` and may differ when it is in a bound.
+
+### Fixed
+
+- A `workspace.json` whose `sources[i].overrides` is not a JSON object now
+  raises `ForecastOSError` naming the file, index and type, instead of a bare
+  `TypeError` out of the TUI's mount. Falsy values (`[]`, `0`, `""`, `false`)
+  still mean "absent", as they always have — `[]` is what several JSON
+  encoders emit for an empty map.
+- A non-integral setting in `workspace.json` (`1e999`, which is standard JSON
+  and parses to `inf`) raised a raw `OverflowError` past the same guard. Now
+  named.
+- `StrategyBacktester(periods=...)` reports a clear error for `nan`, `inf` and
+  non-numeric strings rather than leaking `cannot convert float NaN to integer`
+  or an `OverflowError`. Everything that constructed before still constructs,
+  with the same value.
+- `Differencer.inverse_transform` on a frame with no `ds` column raises
+  `ForecastOSError` rather than `KeyError('ds')`. The rejection set is
+  unchanged.
+
+### Documentation accuracy
+
+Twenty-odd docstrings, comments and error messages that described behaviour the
+code did not have. The ones worth calling out because someone could have relied
+on them:
+
+- `preprocessing/fiscal.py` named `ValueError` as the DST-at-midnight contract.
+  That holds on pandas 3 (zoneinfo) but not pandas 2 (pytz raises
+  `NonExistentTimeError`, which is not a `ValueError`). Now states both.
+- `models/hierarchy.py` claimed `bottom_up` **and** `top_down` interval bounds
+  are additive. Only `bottom_up` is; `top_down`'s leaf bands are `prop * total`
+  rather than the member's own columns.
+- `models/ml.py` claimed RidgeLag's bounds go `nan` seven rows ahead of `yhat`.
+  They go *infinite* at roughly half the horizon and `nan` on the same row.
+- `mcp/server.py`'s boolean guard claimed protection the MCP wire does not
+  have: FastMCP coerces a JSON boolean to `int` before the tool body runs, so
+  the guard covers direct Python callers and, via `_StrictInt`, REST.
+- `docs/serving.md` said the REST and MCP surfaces "never drift". They do, once
+  deliberately: `POST /preview` does not accept `csv_path`, because over HTTP
+  that parameter was an SSRF and arbitrary-file read (fixed in 0.8.1).
+
 ## 0.10.2 (2026-07-28)
 
 Release-process hardening. No library code changes — the public API, behaviour
