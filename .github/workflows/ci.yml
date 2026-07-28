@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable so the release workflow can gate publication on this exact matrix.
+  # A PyPI version can never be reused, so publishing must not start until the
+  # full matrix — including the oldest supported pandas — has gone green.
+  workflow_call:
 
 jobs:
   test:

@@ -62,6 +62,26 @@ python scripts/generate_figures.py
 The script is deterministic (seeded simulated data) and writes a light and a
 dark variant per figure; the README serves the matching one via `<picture>`.
 
+## Cutting a release
+
+Publication is irreversible — a PyPI version number can never be reused — so
+run the release gate before tagging:
+
+```bash
+python scripts/check_release.py
+```
+
+It builds a throwaway venv per supported pandas line (the `>=2,<3` floor and
+current 3.x), installs the working tree into each, and runs the full suite.
+Your dev venv holds exactly one pandas, so a change that is correct on one line
+and broken on the other passes every other local check — `pytest`, `ruff`, and
+any amount of review. That is how v0.10.0 shipped a `groupby(dropna=False)` call
+that pandas 3 accepts and pandas 2 rejects, and needed a same-day 0.10.1.
+
+Tagging `v*` triggers `.github/workflows/release.yml`, which now runs the full
+CI matrix first and publishes only if it passes. The local gate is the faster
+feedback loop; CI is the backstop.
+
 ## Pull requests
 
 - One logical change per PR.

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.10.2 (2026-07-28)
+
+Release-process hardening. No library code changes — the public API, behaviour
+and numbers are identical to 0.10.1.
+
+0.10.0 was published to PyPI by a tag, and the test matrix that would have
+caught its pandas 2.x break ran *afterwards*. Two changes close that gap:
+
+- **Publication now waits for the full CI matrix.** `ci.yml` is callable
+  (`workflow_call`), and `release.yml` runs it as a required job before the
+  build-and-publish step. A tag whose matrix fails no longer reaches PyPI —
+  where a version number can never be reused or corrected in place.
+- **`scripts/check_release.py` runs the suite against every supported pandas
+  line before you tag.** A developer venv carries one pandas, so a change
+  correct on pandas 3 and broken on pandas 2 passes `pytest`, `ruff` and code
+  review alike; only a second interpreter can see it. The script builds a
+  throwaway venv per line (`pandas>=2,<3` and `pandas>=3`), installs the working
+  tree with the optional extras, and runs everything. Verified against the
+  0.10.0 defect: the broken code passes 30/30 on pandas 3.0.5 and fails 3 tests
+  on pandas 2.2.3.
+
+`CONTRIBUTING.md` documents the gate under "Cutting a release".
+
 ## 0.10.1 (2026-07-28)
 
 Fixes a pandas-version incompatibility shipped in 0.10.0. Anyone on pandas 2.x —

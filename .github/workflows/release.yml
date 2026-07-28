@@ -9,7 +9,19 @@ permissions:
   id-token: write   # PyPI trusted publishing (OIDC)
 
 jobs:
+  # Publication is irreversible — a PyPI version number can never be reused — so
+  # the full test matrix runs BEFORE the build, not alongside it. v0.10.0 was
+  # published by this workflow and only then failed CI on the oldest supported
+  # pandas, which required a same-day 0.10.1 to correct.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    # Read-only: the tests need no write access, and this workflow holds
+    # contents:write and id-token:write for the publish step below.
+    permissions:
+      contents: read
+
   build-and-publish:
+    needs: ci
     runs-on: ubuntu-latest
     environment: pypi
     steps:
