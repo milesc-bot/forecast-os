@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.10.1 (2026-07-28)
+
+Fixes a pandas-version incompatibility shipped in 0.10.0. Anyone on pandas 2.x —
+which is every supported install below pandas 3 — should upgrade.
+
+- **`detect_anomalies(by=...)` raised `ValueError: Categorical categories cannot
+  be null` on pandas 2.x** whenever the grouping column contained a null. The
+  0.10.0 fix for silently-unscanned null segments used
+  `groupby(..., dropna=False)`, which pandas 2.x rejects for a key column
+  holding nulls (with either `sort` setting); pandas 3 accepts it. Grouping now
+  runs on factorized codes with `use_na_sentinel=False`, which gives null its
+  own bucket on every supported pandas. Null keys remain their own segment and
+  still sort last.
+
+The full suite is now run against both pandas 2.2.3 and pandas 3.x before
+release, not just the locally installed version — which is what let this reach a
+tag. `requires-python >= 3.10` and `pandas >= 2.0` are unchanged.
+
 ## 0.10.0 (2026-07-27)
 
 Correctness release, part two. v0.9.0 shipped the must-fix tier of a

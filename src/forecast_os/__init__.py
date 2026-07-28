@@ -29,7 +29,7 @@ from .models import *  # noqa: F401,F403  (registers built-in models, re-exports
 from .models import __all__ as _models_all
 from .uncertainty import ConformalForecaster
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 __all__ = [
     "__version__",

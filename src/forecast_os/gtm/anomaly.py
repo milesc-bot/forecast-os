@@ -195,11 +195,24 @@ def detect_anomalies(
     if by is None:
         groups: list[tuple[object, pd.DataFrame]] = [(None, df)]
     else:
-        # dropna=False: pandas' default would discard every row with a null
-        # segment key, leaving that whole segment unscanned and reporting an
-        # ordinary-looking empty result — while the same function hard-errors
-        # on a NaN in the VALUE column. Null keys get their own segment.
-        groups = list(df.groupby(by, sort=True, dropna=False))
+        # Null segment keys get their own segment: pandas' default dropna=True
+        # would discard every row with a null key, leaving that whole segment
+        # unscanned and reporting an ordinary-looking empty result — while the
+        # same function hard-errors on a NaN in the VALUE column.
+        #
+        # This groups on factorized codes rather than passing dropna=False,
+        # because pandas 2.x raises "Categorical categories cannot be null" for
+        # groupby(dropna=False) as soon as the key column holds a null (with
+        # either sort setting). Factorizing with use_na_sentinel=False gives
+        # null its own code on every supported pandas; the original label is
+        # restored below, and nulls sort last as groupby would place them.
+        codes, uniques = pd.factorize(df[by], use_na_sentinel=False)
+        null_codes = [i for i in range(len(uniques)) if pd.isna(uniques[i])]
+        real_codes = sorted(
+            (i for i in range(len(uniques)) if not pd.isna(uniques[i])),
+            key=lambda i: uniques[i],
+        )
+        groups = [(uniques[i], df[codes == i]) for i in real_codes + null_codes]
 
     frames = []
     for key, group in groups:
