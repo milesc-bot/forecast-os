@@ -723,6 +723,56 @@ def test_coverage_excludes_nan_rows():
     assert coverage([1, 9, np.nan], [0, 0, 0], [3, 3, 3]) == pytest.approx(0.5)
 
 
+def test_pinball_loss_excludes_nan_rows():
+    """pinball_loss() propagated NaN instead of excluding the unscoreable row.
+
+    The module docstring promises the interval metrics (coverage, winkler,
+    pinball, WIS) *exclude* rows whose inputs are NaN and return nan only when
+    no row is scoreable. coverage()/winkler_score() do that via
+    _scoreable_interval_rows, and evaluate()'s "pinball" gets it from
+    _score_interval's dropna — but the exported pinball_loss took a plain
+    np.mean, so one NaN actual or one NaN quantile forecast poisoned the whole
+    score to nan. Drop the unscoreable rows and score the rest; scores for
+    NaN-free input are unchanged.
+    """
+    # NaN-free input is unaffected
+    assert pinball_loss([2, 1], [1, 2], q=0.9) == pytest.approx(0.5)
+    # one unscoreable row is dropped, not propagated
+    assert pinball_loss([2, np.nan], [1, 1], q=0.9) == pytest.approx(0.9)
+    assert pinball_loss([2, 1], [1, np.nan], q=0.9) == pytest.approx(0.9)
+    # nan only when nothing is scoreable
+    assert np.isnan(pinball_loss([np.nan, np.nan], [1.0, 2.0], q=0.9))
+    # dropping the row is equivalent to never having passed it
+    assert pinball_loss([2, np.nan, 1], [1, 5.0, 2], q=0.9) == pytest.approx(
+        pinball_loss([2, 1], [1, 2], q=0.9)
+    )
+    # ...and that really is what evaluate() computes for a NaN in y. Only the
+    # NaN-in-y case is asserted: _score_interval drops a row when ANY of y, the
+    # point forecast or either bound is NaN, so the two can legitimately differ
+    # when a bound is the NaN. The docstring says so; this pins the case where
+    # they must agree.
+    frame = pd.DataFrame(
+        {
+            "unique_id": "a",
+            "ds": pd.date_range("2020-01-01", periods=3),
+            "y": [2.0, np.nan, 1.0],
+            "M": [1.0, 5.0, 2.0],
+            "M-lo-80": [0.0, 4.0, 1.0],
+            "M-hi-80": [3.0, 6.0, 3.0],
+        }
+    )
+    res = evaluate(frame, metrics=("pinball",))
+    assert list(res["metric"]) == ["pinball-80"]
+    # evaluate's pinball-80 averages both tails: q=0.1 against lo, q=0.9
+    # against hi. Row 1 is dropped by both paths, so scoring the surviving two
+    # rows directly must reproduce it exactly.
+    expected = 0.5 * (
+        pinball_loss([2.0, 1.0], [0.0, 1.0], q=0.1)
+        + pinball_loss([2.0, 1.0], [3.0, 3.0], q=0.9)
+    )
+    assert res["M"].iloc[0] == pytest.approx(expected)
+
+
 def test_winkler_score_excludes_nan_rows():
     """winkler_score() had the identical NaN-swallowing bug.
 

@@ -161,11 +161,27 @@ def rmsse(y, yhat, y_train, m: int = 1) -> float:
 
 
 def pinball_loss(y, q_pred, q: float) -> float:
-    """Quantile (pinball) loss for quantile forecast ``q_pred`` at level ``q``."""
+    """Quantile (pinball) loss for quantile forecast ``q_pred`` at level ``q``.
+
+    Rows where ``y`` or ``q_pred`` is NaN are excluded rather than poisoning
+    the mean; ``nan`` is returned when no row is scoreable. Infinite values are
+    kept and scored, the same exclusion policy as :func:`coverage` and
+    :func:`winkler_score`.
+
+    The policy matches :func:`evaluate`'s ``"pinball"``; the *number* need not.
+    ``_score_interval`` drops a row when any of ``y``, the point forecast or
+    either interval bound is NaN — a joint four-column rule — whereas this
+    function sees only its two arguments. The two therefore agree exactly when
+    the NaN is in ``y``, and can differ when a row is scoreable here but
+    dropped there because one of its bounds is NaN.
+    """
     if not 0 < q < 1:
         raise ValueError(f"q must be in (0, 1), got {q}")
     y, q_pred = _align(y, q_pred)
-    diff = y - q_pred
+    ok = ~(np.isnan(y) | np.isnan(q_pred))
+    if not ok.any():
+        return float("nan")
+    diff = y[ok] - q_pred[ok]
     return float(np.mean(np.maximum(q * diff, (q - 1) * diff)))
 
 

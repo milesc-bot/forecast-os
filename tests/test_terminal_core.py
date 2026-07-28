@@ -399,6 +399,55 @@ class TestWorkspaceTypeValidation:
         for key, value in settings.items():
             assert ws.settings[key] == value
 
+    @pytest.mark.parametrize(
+        "overrides",
+        ["freq=W", 5, ["freq", "W"], [["freq", "W"]], True],
+    )
+    def test_non_object_source_overrides_raises_named_error(self, tmp_path, overrides):
+        """A non-object ``sources[i].overrides`` must fail in load(), not in dict().
+
+        What went wrong: _require_dicts checked that each element of
+        ``sources`` was a JSON object, but the nested ``overrides`` value was
+        never checked — load() did ``dict(src.get("overrides") or {})``
+        straight up. A hand-edited ``"overrides": "freq=W"`` therefore raised a
+        bare ``ValueError: dictionary update sequence element #0 has length 1``
+        (or ``TypeError: 'int' object is not iterable``) out of the app's
+        mount, since ``terminal.app.main`` catches only ForecastOSError. That
+        contradicts load()'s own docstring promise of "better a named error
+        here than a traceback out of the app's mount".
+
+        Right behaviour: raise ForecastOSError naming the file, the source
+        index and the offending type, the same way the sibling container
+        checks do, so main() renders a clean one-line ``forecast-os-tui: ...``
+        exit. ``[["freq", "W"]]`` is included because ``dict()`` happened to
+        accept a pair sequence and silently built a mapping the user never
+        wrote; ``[]``/``0``-style falsy junk was silently swallowed into ``{}``
+        — both are still not JSON objects, and the module already refuses
+        falsy wrong types at the top level (``{"sources": ""}``).
+        """
+        (tmp_path / "workspace.json").write_text(
+            json.dumps({"sources": [{"path": "a.csv"}, {"overrides": overrides}]})
+        )
+        with pytest.raises(ForecastOSError, match=r"sources\[1\]\.overrides"):
+            Workspace.load(home=tmp_path)
+
+    # Falsy non-objects are pinned here, not in the raising test above: the
+    # pre-guard code was ``dict(value or {})``, so [] / 0 / "" / False all
+    # loaded as {} and never raised. Rejecting them would stop a workspace that
+    # works today from opening — and `[]` is what several JSON encoders emit
+    # for an empty map.
+    @pytest.mark.parametrize(
+        "overrides", [{"freq": "W"}, {}, None, [], 0, 0.0, "", False]
+    )
+    def test_object_or_absent_source_overrides_still_load(self, tmp_path, overrides):
+        """The guard must not reject shapes load() has always accepted."""
+        (tmp_path / "workspace.json").write_text(
+            json.dumps({"sources": [{"path": "a.csv", "overrides": overrides}, {}]})
+        )
+        ws = Workspace.load(home=tmp_path)
+        assert ws.sources[0]["overrides"] == (overrides or {})
+        assert ws.sources[1]["overrides"] == {}
+
     def test_valid_partial_file_still_merges(self, tmp_path):
         (tmp_path / "workspace.json").write_text(
             json.dumps({"settings": {"h": 12}, "watch": ["west/alice"]})

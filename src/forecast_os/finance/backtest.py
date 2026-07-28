@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.frequencies import to_offset
 from scipy import stats
 
 from ..core.base import BaseForecaster
@@ -37,10 +38,12 @@ _META_COLS = {ID_COL, TIME_COL, TARGET_COL, "cutoff"}
 _SIZINGS = ("binary", "proportional", "kelly")
 _SIGMA_EPS = 1e-12
 
-#: Periods per year implied by the root of an inferred pandas frequency string.
-#: Daily and business-daily both map to the 252 trading-day convention, which is
-#: also the fallback for any step this table does not cover (numeric ``ds``,
-#: irregular datetimes), preserving the historical default.
+#: Periods per year implied by the *base unit* of an inferred pandas frequency
+#: string; a multi-unit step like ``"4h"`` divides its unit's rate by the
+#: multiple. Daily and business-daily both map to the 252 trading-day
+#: convention, which is also the fallback for any step this table does not
+#: cover (numeric ``ds``, irregular datetimes, sub-hourly units), preserving the
+#: historical default.
 _PERIODS_BY_FREQ = {
     "D": 252,
     "B": 252,
@@ -57,12 +60,28 @@ _PERIODS_BY_FREQ = {
     "A": 1,
     "h": 24 * 252,
     "H": 24 * 252,
+    # Sub-hourly, on the same 24*252 trading-year convention as "h". Without
+    # these a 15-minute panel fell back to 252 and understated annualized vol
+    # ~10x; a 1-minute panel ~38x.
+    "min": 24 * 252 * 60,
+    "T": 24 * 252 * 60,
+    "s": 24 * 252 * 3600,
+    "S": 24 * 252 * 3600,
+    # Business-anchored month/quarter/year ends. These were the worse case:
+    # falling back to 252 OVERSTATED a BME panel's Sharpe 4.6x and a BYE
+    # panel's 15.9x, because the true rate is 12 and 1.
+    "BME": 12, "BMS": 12, "BM": 12,
+    "BQE": 4, "BQS": 4, "BQ": 4,
+    "BYE": 1, "BYS": 1, "BA": 1, "BY": 1,
 }
 _DEFAULT_PERIODS = 252
 
 
 def _infer_periods(df: pd.DataFrame) -> int:
     """Periods per year implied by the panel's modal per-series time step.
+
+    The step's multiple counts: ``"4h"`` bars occur a quarter as often as
+    ``"h"`` bars, so the base unit's rate is divided by ``to_offset(freq).n``.
 
     Expects a frame that has already been through
     :func:`~forecast_os.core.types.validate_panel`: ``ds`` may legally arrive
@@ -75,7 +94,14 @@ def _infer_periods(df: pd.DataFrame) -> int:
     modal = Counter(steps).most_common(1)[0][0]
     if not isinstance(modal, str):
         return _DEFAULT_PERIODS
-    return _PERIODS_BY_FREQ.get(modal.split("-")[0], _DEFAULT_PERIODS)
+    try:
+        offset = to_offset(modal)
+    except ValueError:  # pragma: no cover - infer_freq only returns parseable strings
+        return _PERIODS_BY_FREQ.get(modal.split("-")[0], _DEFAULT_PERIODS)
+    base = _PERIODS_BY_FREQ.get(offset.name.split("-")[0])
+    if base is None:
+        return _DEFAULT_PERIODS
+    return max(1, round(base / (abs(offset.n) or 1)))
 
 
 @dataclass
@@ -130,11 +156,16 @@ class StrategyBacktester:
     ``periods`` is the periods-per-year used to annualize annualized_return,
     sharpe, sortino, annualized_vol and calmar. Left as ``None`` it is inferred
     from the (validated) panel's modal time step (daily/business-daily 252,
-    weekly 52, monthly 12, quarterly 4, yearly 1, hourly 24*252), falls back to
-    252 for numeric or irregular ``ds``, and is then divided by :meth:`run`'s
-    ``step_size`` so it describes the strategy's own return series rather than
-    the panel's bar spacing. The resolved value is reported on
-    :attr:`BacktestResult.periods`.
+    weekly 52, monthly 12, quarterly 4, yearly 1, and 24*252 per hour down to
+    seconds, business-anchored month/quarter/year ends included), divided by the
+    step's multiple where it has one (``"4h"`` -> 1512, ``"2W"`` -> 26) and
+    rounded to at least 1 — so steps coarser than a year (``"2YE"``, ``"3QS"``)
+    all annualize as 1. It falls back to 252 for numeric ``ds``, irregular
+    datetimes and any unit outside that list, and is then divided by
+    :meth:`run`'s ``step_size`` so it describes the strategy's own return series
+    rather than the panel's bar spacing. The resolved value is reported on
+    :attr:`BacktestResult.periods`; pass ``periods`` explicitly whenever the
+    inferred convention does not match your bars.
     """
 
     def __init__(

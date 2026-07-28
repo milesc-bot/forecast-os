@@ -523,3 +523,55 @@ def test_inferred_periods_account_for_step_size():
     assert res.summary.iloc[0]["annualized_return"] == pytest.approx(ann(strat, periods=50))
     # step_size=1 is unchanged
     assert StrategyBacktester(ConstForecaster()).run(df, test_size=40).periods == 252
+
+
+def test_inferred_periods_honor_the_frequency_multiple():
+    """Multi-unit frequencies must annualize off the *step*, not the base unit.
+
+    Regression: inference looked the inferred frequency string up in a table
+    keyed by bare unit roots, so only single-unit steps ever matched. A 4-hour
+    bar panel — which ``pd.infer_freq`` resolves cleanly to ``"4h"``, so neither
+    numeric nor irregular ``ds`` — missed ``"h"`` and silently took the 252
+    fallback instead of 24*252/4 = 1512, understating annualized_vol by 59%
+    (and 15-minute bars by ~90%). ``"2D"``/``"2W"`` were wrong the other way:
+    they inherited the *full* daily/weekly rate rather than half of it. The
+    multiple is available as ``to_offset(freq).n``, and periods-per-year is
+    simply the base unit's rate divided by it.
+    """
+    import pandas as pd
+
+    from forecast_os.finance.backtest import _infer_periods
+
+    def panel(freq):
+        return pd.DataFrame(
+            {ID_COL: "asset-0", "ds": pd.date_range("2020-01-01", periods=60, freq=freq), "y": 0.01}
+        )
+
+    assert _infer_periods(panel("4h")) == 1512  # 24 * 252 / 4
+    assert _infer_periods(panel("2h")) == 3024
+    assert _infer_periods(panel("2D")) == 126  # 252 / 2
+    assert _infer_periods(panel("2W")) == 26  # 52 / 2, anchor suffix ignored
+    assert _infer_periods(panel("2ME")) == 6
+    # single-unit steps and the documented fallbacks are unchanged
+    assert _infer_periods(panel("h")) == 6048
+    assert _infer_periods(panel("D")) == 252
+    assert _infer_periods(panel("ME")) == 12
+    assert _infer_periods(panel("W")) == 52
+    # Sub-hourly and business-anchored units are in the table too: falling back
+    # to 252 understated a 15-minute panel's annualized vol ~10x and OVERSTATED
+    # a business-month-end panel's Sharpe ~4.6x.
+    assert _infer_periods(panel("15min")) == 24 * 252 * 4  # 24*252*60 / 15
+    assert _infer_periods(panel("min")) == 24 * 252 * 60
+    assert _infer_periods(panel("BME")) == 12
+    assert _infer_periods(panel("BQE")) == 4
+    assert _infer_periods(panel("BYE")) == 1
+
+
+def test_intraday_panel_reports_the_multiplied_periods_end_to_end():
+    """``BacktestResult.periods`` must carry the multiple-aware rate."""
+    import pandas as pd
+
+    df = _daily_panel(pd.date_range("2020-01-01", periods=200, freq="4h"))
+    res = StrategyBacktester(ConstForecaster()).run(df, test_size=12)
+    assert res.periods == 1512
+    assert res.summary.iloc[0]["annualized_vol"] == pytest.approx(0.0, abs=1e-9)

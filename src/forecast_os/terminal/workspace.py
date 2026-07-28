@@ -82,6 +82,28 @@ def _require_dicts(items, key: str, target: Path) -> list[dict]:
     return out
 
 
+def _require_mapping(value, label: str, target: Path) -> dict:
+    """Validate a nested field is a JSON object; return it as a fresh dict.
+
+    Any *falsy* value — a missing key, ``None``, ``{}``, ``[]``, ``0``, ``""``,
+    ``false`` — means "absent" and gives ``{}``, as it always has: the previous
+    code was ``dict(value or {})``, whose ``or`` swallowed every one of them.
+    Rejecting those would break workspaces that load today, and ``[]`` in
+    particular is what several JSON encoders emit for an empty map.
+
+    Truthy non-objects are refused here rather than inside ``dict()``, which
+    raises a bare ``TypeError``/``ValueError`` that escapes the app's mount.
+    That includes pair sequences like ``[["freq", "W"]]``, which ``dict()``
+    silently coerced into a mapping the user never wrote.
+    """
+    if value and not isinstance(value, dict):
+        raise ForecastOSError(
+            f"workspace file {target}: {label} must be a JSON object, "
+            f"got {type(value).__name__}"
+        )
+    return dict(value or {})
+
+
 def _require_usable_settings(settings: dict, target: Path) -> dict:
     """Check the known settings hold values the console can actually use.
 
@@ -112,8 +134,12 @@ def _require_usable_settings(settings: dict, target: Path) -> dict:
             ok = not isinstance(value, bool)
             if ok:
                 try:
+                    # OverflowError, not just TypeError/ValueError: 1e999 is
+                    # standard JSON that json.loads parses to inf, and
+                    # int(inf) raises OverflowError — which escaped this guard
+                    # as a raw traceback out of the app's mount.
                     int(value)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     ok = False
         if not ok:
             expected = "a string" if kind is str else "an integer"
@@ -192,8 +218,14 @@ class Workspace:
         settings = _require(raw, "settings", dict, target)
         alerts = _require_dicts(_require(raw, "alerts", list, target), "alerts", target)
         ws.sources = [
-            {**_SOURCE_DEFAULTS, **src, "overrides": dict(src.get("overrides") or {})}
-            for src in sources
+            {
+                **_SOURCE_DEFAULTS,
+                **src,
+                "overrides": _require_mapping(
+                    src.get("overrides"), f"sources[{i}].overrides", target
+                ),
+            }
+            for i, src in enumerate(sources)
         ]
         ws.watch = [str(uid) for uid in watch or []]
         ws.settings = _require_usable_settings(
