@@ -19,11 +19,18 @@ Two methods share one flag rule (``|score| >= threshold``):
     (``IQR / 1.349``). Less sensitive to one wild point contaminating the
     window than the mean/std z-score.
 
-Zero-variance history is handled deliberately: when the trailing window is
-perfectly flat (deviation unit ``0``) a *material* change scores ``+/-inf`` (a
-level shift off a flat baseline is infinitely many sigmas — flagged), while no
-change scores ``0`` (not flagged). The first ``window`` points of each series
-lack a full trailing window and are never flagged.
+Zero-variance history is handled deliberately: when the deviation unit comes
+out ``0`` a *material* change scores ``+/-inf`` (a level shift off a
+zero-spread baseline is infinitely many sigmas — flagged, at the top severity
+band), while no change scores ``0`` (not flagged). What "zero spread" means
+differs by method, and ``"iqr"`` is the looser of the two: ``"zscore"`` needs a
+*perfectly flat* window, whereas ``"iqr"`` only needs a flat interquartile
+*core*, so a window like ``[10, 10, 10, 10, 10, 1000]`` has ``IQR == 0`` and any
+subsequent move off 10 — however small — scores ``inf``. That is the robust
+estimator behaving as specified (the wild point is deliberately ignored), but
+it does mean ``"iqr"`` flags off majority-constant windows that ``"zscore"``
+lets pass. The first ``window`` points of each series lack a full trailing
+window and are never flagged.
 """
 
 from __future__ import annotations
@@ -116,7 +123,11 @@ def detect_anomalies(
     value_col : str, default ``"y"``
         Column holding the numeric series value.
     by : hashable or None, default ``"unique_id"``
-        Segment column to group by; each group is scanned independently. Pass
+        Segment column to group by; each group is scanned independently. Rows
+        whose segment label is null are scanned as their own (NaN-keyed)
+        segment rather than dropped — an unassigned owner/team/region is an
+        everyday CRM state, and silently leaving those rows unmonitored would
+        return a clean-looking empty result for a segment nobody checked. Pass
         ``None`` to treat the whole frame as a single series (the output then
         omits the segment column).
     method : {"zscore", "iqr"}, default ``"zscore"``
@@ -184,7 +195,11 @@ def detect_anomalies(
     if by is None:
         groups: list[tuple[object, pd.DataFrame]] = [(None, df)]
     else:
-        groups = list(df.groupby(by, sort=True))
+        # dropna=False: pandas' default would discard every row with a null
+        # segment key, leaving that whole segment unscanned and reporting an
+        # ordinary-looking empty result — while the same function hard-errors
+        # on a NaN in the VALUE column. Null keys get their own segment.
+        groups = list(df.groupby(by, sort=True, dropna=False))
 
     frames = []
     for key, group in groups:
@@ -211,8 +226,18 @@ def detect_anomalies(
 
     if frames:
         return pd.concat(frames, ignore_index=True)[out_cols]
-    empty = {
-        c: pd.Series(dtype="float64" if c in _FLOAT_COLS else "object")
-        for c in out_cols
-    }
+    # An empty result has to carry the SAME 'ds' dtype a flagged one would, or
+    # pd.concat-ing per-segment results downgrades the column to object and
+    # costs the caller the .dt accessor. Taking it from the input also keeps an
+    # integer-age panel (as retention uses) integer rather than forcing it to
+    # datetime; the computed columns keep their float64.
+    empty = {}
+    for c in out_cols:
+        if c in _FLOAT_COLS:
+            dtype: object = "float64"
+        elif c == TIME_COL:
+            dtype = df[TIME_COL].dtype
+        else:
+            dtype = "object"
+        empty[c] = pd.Series(dtype=dtype)
     return pd.DataFrame(empty)

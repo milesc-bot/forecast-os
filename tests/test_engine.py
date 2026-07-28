@@ -198,6 +198,22 @@ def test_compare_all_models_failing_raises():
         ForecastEngine().compare(df, h=4, n_windows=2, models=["_test_engine_broken"])
 
 
+def test_compare_empty_metrics_raises_value_error_not_key_error():
+    """compare(metrics=[]) must fail cleanly, not with a bare pandas KeyError.
+
+    What went wrong: an empty metric list produced a score frame with no
+    'metric' column, so ``list(dict.fromkeys(scores["metric"]))`` raised
+    ``KeyError: 'metric'``. On the library path that is an opaque traceback;
+    through the CLI (``--metrics ""`` or ``--metrics ,``) it escaped main()'s
+    ``(ForecastOSError, ValueError, OSError, ImportError)`` handler entirely
+    and printed a pandas traceback with exit status 1, breaking the CLI
+    module docstring's promise of ``error: ...`` on stderr and exit 2.
+    """
+    df = _make_panel(length=30)
+    with pytest.raises(ValueError, match="no metrics"):
+        ForecastEngine().compare(df, h=4, n_windows=2, metrics=[], models=[_ConstA()])
+
+
 def test_compare_board_index_uses_registry_name_not_inherited():
     _register_dummies()
     df = _make_panel(const=5.0, length=40)
@@ -208,6 +224,40 @@ def test_compare_board_index_uses_registry_name_not_inherited():
     # _ConstA is registered -> registry name; _ConstB merely inherits the class
     # attribute and must keep its own model name (no duplicate index labels)
     assert sorted(board.index) == ["_ConstB", "_test_engine_const"]
+
+
+def test_compare_distinct_parameterizations_keep_distinct_labels():
+    """Two parameterizations of one registered class must not share a label.
+
+    What went wrong: ``_display_name`` mapped every resolved model onto its
+    class's registry name, so ``_ConstA(value=1, alias="const_low")`` and
+    ``_ConstA(value=99, alias="const_high")`` both landed on
+    ``'_test_engine_const'``. The board came back with a non-unique index
+    carrying genuinely different scores, ``board.loc['_test_engine_const']``
+    returned two rows, and compare()'s documented promise that "an index entry
+    can be fed straight back into forecast()" resolved to the default-parameter
+    model rather than the winner. ``alias`` is the only supported way to
+    compare two parameterizations of one class (``_resolve`` rejects two
+    ``(name, params)`` specs of the same model as duplicates), and
+    ``cross_validation`` already keys its columns on ``model.name``.
+
+    Right behaviour: when a registry name is claimed by more than one resolved
+    model, those models keep their own ``model.name`` (the alias); an
+    unambiguous registry name is still used, so existing boards are unchanged.
+    """
+    _register_dummies()
+    df = _make_panel(const=5.0, length=40)
+    low = _ConstA(value=1.0)
+    low.alias = "const_low"
+    high = _ConstA(value=99.0)
+    high.alias = "const_high"
+    board = ForecastEngine().compare(
+        df, h=4, n_windows=2, metrics=("mae",), models=[low, high, _ConstB()]
+    )
+    assert board.index.is_unique
+    assert sorted(board.index) == ["_ConstB", "const_high", "const_low"]
+    # and the scores really are distinct, i.e. the collapse was lossy
+    assert board.loc["const_low", "mae"] != board.loc["const_high", "mae"]
 
 
 # -- parameterized model specs ---------------------------------------------------
@@ -244,6 +294,80 @@ def test_engine_rejects_malformed_spec():
     df = _make_panel()
     with pytest.raises(ValueError, match="resolve model spec"):
         ForecastEngine().forecast(df, h=2, models=[("ridge_lag", 6)])
+
+
+# -- covariate panels: forecast() must be able to run what compare() ranked ------
+
+
+def _exog_panel(n=60, n_series=2, seed=3):
+    """Panel with a numeric ``spend`` driver that y depends on."""
+    rng = np.random.default_rng(seed)
+    frames = []
+    for i in range(n_series):
+        spend = 50.0 + rng.normal(0, 5.0, n)
+        y = 10.0 + 0.4 * np.arange(n) + 2.0 * spend + rng.normal(0, 1.0, n)
+        frames.append(
+            pd.DataFrame(
+                {
+                    "unique_id": f"s{i}",
+                    "ds": pd.date_range("2020-01-01", periods=n, freq="MS"),
+                    "y": y,
+                    "spend": spend,
+                }
+            )
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+def _future_x(panel, h, freq="MS"):
+    """Known future covariate rows: h periods past each series' last ds."""
+    frames = []
+    for uid, g in panel.groupby("unique_id", sort=True):
+        last = g["ds"].max()
+        future = pd.date_range(last, periods=h + 1, freq=freq)[1:]
+        frames.append(
+            pd.DataFrame({"unique_id": uid, "ds": future, "spend": [50.0] * h})
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_forecast_threads_known_future_covariates():
+    """forecast() must be able to run the exog models compare() ranks.
+
+    What went wrong: on a covariate panel, ``cross_validation`` (and so
+    ``compare``) fits exog-capable models and predicts with an X_df built
+    from the held-out rows — the documented known-future-inputs convention.
+    But ``ForecastEngine.forecast`` had no ``X_df`` parameter at all and just
+    called ``model.clone().fit(df).predict(h, level=level)``, so the winning
+    model raised "predict() requires X_df with h future rows per series".
+    compare()'s docstring promises an index entry "can be fed straight back
+    into forecast()", and on covariate panels it could not be.
+    """
+    panel = _exog_panel()
+    h = 4
+    out = ForecastEngine().forecast(
+        panel, h=h, models=[("ridge_lag", {"lags": 6})], X_df=_future_x(panel, h)
+    )
+    assert len(out) == 2 * h
+    assert np.isfinite(out["RidgeLag"]).all()
+
+
+def test_forecast_without_x_df_unchanged_for_plain_models():
+    """X_df defaults to None and non-exog panels/models are untouched."""
+    df = _make_panel(length=30)
+    out = ForecastEngine().forecast(df, h=3, models=[("ridge_lag", {"lags": 6})])
+    assert len(out) == 2 * 3
+
+
+def test_forecast_ignores_x_df_for_models_that_cannot_use_it():
+    """A model that never consumed covariates must not be handed X_df."""
+    panel = _exog_panel()
+    h = 3
+    out = ForecastEngine().forecast(
+        panel, h=h, models=[_ConstA()], X_df=_future_x(panel, h)
+    )
+    assert len(out) == 2 * h
+    assert (out["_ConstA"] == 5.0).all()
 
 
 # -- ForecastEngine.compare with interval metrics --------------------------------

@@ -16,6 +16,7 @@ from forecast_os.core.exceptions import ForecastOSError
 from forecast_os.core.registry import get_model
 from forecast_os.core.types import ID_COL, TIME_COL
 from forecast_os.datasets.synthetic import generate_series
+from forecast_os.models.baselines import Naive
 from forecast_os.models.ml import RidgeLag
 
 H = 6
@@ -137,3 +138,37 @@ def test_exog_fitted_model_roundtrips_with_x_df(tmp_path):
     model.save(path)
     loaded = load(path)
     pd.testing.assert_frame_equal(loaded.predict(h, X_df=x_df), expected)
+
+
+class MyNaive(Naive):
+    """Unregistered user subclass of a registered model (module level: picklable)."""
+
+
+def test_envelope_registry_name_is_not_inherited(tmp_path):
+    """An unregistered subclass must not claim its parent's registry name.
+
+    ``register()`` stamps ``registry_name`` on the decorated class, and
+    ``save()`` read it with ``getattr(type(self), ...)``, which walks the MRO.
+    A user subclass of a registered model therefore wrote an envelope whose
+    ``class`` said ``MyNaive`` while ``registry_name`` said ``naive`` — two
+    fields disagreeing about what the file contains, and a name that
+    ``get_model()`` resolves to a different class. The own-class attribute is
+    the only one that identifies the saved model, so an unregistered subclass
+    records None. (``engine.py`` already resolves the name this way.)
+    """
+    path = tmp_path / "sub.pkl"
+    MyNaive().fit(_panel()).save(path)
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+
+    assert payload["class"].endswith("MyNaive")
+    assert payload["registry_name"] is None
+
+
+def test_envelope_registry_name_survives_for_registered_classes(tmp_path):
+    """The fix must not blank the name for classes that did register."""
+    path = tmp_path / "naive.pkl"
+    get_model("naive").fit(_panel()).save(path)
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+    assert payload["registry_name"] == "naive"

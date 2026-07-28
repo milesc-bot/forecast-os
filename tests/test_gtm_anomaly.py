@@ -177,3 +177,154 @@ class TestValidation:
     def test_non_dataframe_raises(self):
         with pytest.raises(DataContractError, match="DataFrame"):
             detect_anomalies([1, 2, 3])
+
+
+class TestNullSegmentKeysAreScanned:
+    """Regression for silently unmonitored null-keyed segments (v0.9.0 audit SHOULD-5).
+
+    ``df.groupby(by)`` inherited pandas' default ``dropna=True``, so every row
+    whose segment label was null was dropped before scanning: an unassigned
+    owner/team/region — an everyday CRM export state — came back as an ordinary
+    empty result rather than as an alert, and with the default ``by='unique_id'``
+    a panel with null ids returned empty outright. The internal inconsistency was
+    stark: the same function hard-errors on a NaN in the VALUE column but
+    discarded NaN segment keys without a word. Null keys are now their own
+    segment.
+    """
+
+    def _panel(self, n=10):
+        ds = list(pd.date_range("2026-01-01", periods=n, freq="MS"))
+        return pd.DataFrame(
+            {
+                "team": ["east"] * n + [None] * n,
+                TIME_COL: ds * 2,
+                TARGET_COL: [10.0] * n + [10.0] * (n - 1) + [1000.0],
+            }
+        )
+
+    def test_spike_in_the_null_segment_is_flagged(self):
+        out = detect_anomalies(self._panel(), by="team", window=6, threshold=3.0)
+        assert len(out) == 1
+        row = out.iloc[0]
+        assert pd.isna(row["team"])
+        assert row["value"] == 1000.0
+        assert row["severity"] == "critical"
+
+    def test_null_segment_matches_scanning_that_segment_alone(self):
+        panel = self._panel()
+        alone = panel[panel["team"].isna()].drop(columns=["team"])
+        together = detect_anomalies(panel, by="team", window=6, threshold=3.0)
+        separate = detect_anomalies(alone, by=None, window=6, threshold=3.0)
+        assert len(together) == len(separate) == 1
+        assert together["score"].iloc[0] == separate["score"].iloc[0]
+
+    def test_null_unique_id_panel_is_not_silently_empty(self):
+        n = 10
+        panel = pd.DataFrame(
+            {
+                ID_COL: [None] * n,
+                TIME_COL: pd.date_range("2026-01-01", periods=n, freq="MS"),
+                TARGET_COL: [10.0] * (n - 1) + [1000.0],
+            }
+        )
+        out = detect_anomalies(panel, window=6, threshold=3.0)
+        assert len(out) == 1
+
+    def test_labelled_segments_are_unaffected(self):
+        panel = self._panel()
+        panel.loc[panel["team"].isna(), "team"] = "west"
+        out = detect_anomalies(panel, by="team", window=6, threshold=3.0)
+        assert list(out["team"]) == ["west"]
+
+
+class TestEmptyResultDtypes:
+    """Regression for the object-dtype 'ds' on the empty path (v0.9.0 audit NIT-7).
+
+    The empty-frame builder typed only ``value``/``expected``/``score`` as
+    float64 and defaulted everything else to object, so a segment that flagged
+    nothing produced an object-dtype ``ds``. ``pd.concat``-ing that with a
+    flagged segment's datetime64 ``ds`` downgraded the whole column to object and
+    ``c['ds'].dt.year`` then raised AttributeError. The empty frame now takes its
+    ``ds`` dtype from the input, which also keeps an integer-age panel integer.
+    """
+
+    def _clean(self):
+        return pd.DataFrame(
+            {
+                ID_COL: ["a"] * 10,
+                TIME_COL: pd.date_range("2026-01-01", periods=10, freq="MS"),
+                TARGET_COL: [1.0] * 10,
+            }
+        )
+
+    def _flagged(self):
+        return pd.DataFrame(
+            {
+                ID_COL: ["b"] * 8,
+                TIME_COL: pd.date_range("2026-01-01", periods=8, freq="MS"),
+                TARGET_COL: [10.0] * 7 + [1000.0],
+            }
+        )
+
+    def test_empty_and_flagged_results_share_the_ds_dtype(self):
+        empty = detect_anomalies(self._clean(), window=6)
+        flagged = detect_anomalies(self._flagged(), window=6)
+        assert len(empty) == 0 and len(flagged) == 1
+        assert empty[TIME_COL].dtype == flagged[TIME_COL].dtype
+
+    def test_concat_of_empty_and_flagged_keeps_the_dt_accessor(self):
+        empty = detect_anomalies(self._clean(), window=6)
+        flagged = detect_anomalies(self._flagged(), window=6)
+        both = pd.concat([empty, flagged], ignore_index=True)
+        assert both[TIME_COL].dt.year.tolist() == [2026]
+
+    def test_integer_age_panel_keeps_an_integer_ds(self):
+        ages = pd.DataFrame(
+            {ID_COL: ["c"] * 10, TIME_COL: np.arange(10), TARGET_COL: [1.0] * 10}
+        )
+        out = detect_anomalies(ages, window=6)
+        assert len(out) == 0
+        assert out[TIME_COL].dtype == ages[TIME_COL].dtype
+
+    def test_computed_columns_keep_float64(self):
+        out = detect_anomalies(self._clean(), window=6)
+        for col in ("value", "expected", "score"):
+            assert out[col].dtype == np.dtype("float64")
+
+
+class TestIQRZeroScaleIsDocumentedNotAccidental:
+    """Pins the zero-scale rule the module docstring now states honestly
+    (v0.9.0 audit NIT-9).
+
+    The docstring justified the ``inf``/critical branch as "the trailing window
+    is perfectly flat", which is true for ``zscore`` but not for ``iqr``: ``iqr``
+    only needs a flat interquartile CORE, so a window with one wild point still
+    has ``IQR == 0`` and any later move — however small — scores ``inf``. The
+    control below shows the wild point is irrelevant to the iqr flag (a flat
+    window flags under BOTH methods); its only effect is to silence ``zscore`` by
+    inflating the std. Behaviour is unchanged; the docstring is what was wrong.
+    """
+
+    def _series(self, vals):
+        return pd.DataFrame(
+            {
+                ID_COL: ["a"] * len(vals),
+                TIME_COL: pd.date_range("2026-01-01", periods=len(vals), freq="MS"),
+                TARGET_COL: [float(v) for v in vals],
+            }
+        )
+
+    def test_flat_window_flags_under_both_methods(self):
+        df = self._series([10, 10, 10, 10, 10, 10, 11])
+        for method in ("iqr", "zscore"):
+            out = detect_anomalies(df, method=method, window=6, threshold=3.0)
+            assert len(out) == 1, method
+            assert out["score"].iloc[0] == np.inf
+            assert out["severity"].iloc[0] == "critical"
+
+    def test_flat_core_with_one_wild_point_flags_iqr_only(self):
+        df = self._series([10, 10, 10, 10, 10, 1000, 11])
+        iqr = detect_anomalies(df, method="iqr", window=6, threshold=3.0)
+        assert len(iqr) == 1 and iqr["score"].iloc[0] == np.inf
+        # zscore's std is inflated by the wild point, so it says nothing
+        assert len(detect_anomalies(df, method="zscore", window=6, threshold=3.0)) == 0

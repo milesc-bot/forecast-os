@@ -219,3 +219,119 @@ class TestCompareScenarios:
         base = Scenario({"top_of_funnel": 0, "win_rate": 0.3})
         df = compare_scenarios(base, base.bump(top_of_funnel=100))
         assert math.isnan(df["pct_delta"].iloc[1])
+
+
+class TestRateDriverValidationOnTheDefaultPath:
+    """Regressions for unvalidated rate drivers in project() (v0.9.0 audit SHOULD-3).
+
+    ``project()``'s default branch multiplied every ``*_rate`` driver in without
+    checking it, so ``bump(win_rate=-0.20)`` off a 0.10 baseline produced
+    win_rate = -0.1 and a bookings projection of -$1,000,000 with no complaint —
+    and ``compare_scenarios`` duly reported pct_delta = -2.0. The SAME model
+    computing the SAME quantity through the stages path,
+    ``project({"won": "win_rate"})``, has always raised, because ``propagate``
+    validates each rate in [0, 1]. ``project()`` also already validated
+    ``top_of_funnel >= 0`` and ``acv >= 0``, so rate drivers were the only
+    unchecked input. Negatives are now rejected on both paths.
+
+    Only the NEGATIVE half is a bug: it is the half that produced the impossible
+    number. Values above 1 are legitimate on the default path and are covered by
+    :class:`TestRateDriversAboveOneStillMultiplyIn` below.
+    """
+
+    def _s(self, win_rate):
+        return Scenario({"top_of_funnel": 1000, "win_rate": win_rate, "acv": 10000})
+
+    def test_negative_rate_driver_raises_instead_of_negative_bookings(self):
+        bumped = Scenario(
+            {"top_of_funnel": 1000, "win_rate": 0.10, "acv": 10000}
+        ).bump(win_rate=-0.20)
+        assert bumped.drivers["win_rate"] == pytest.approx(-0.1)
+        with pytest.raises(ForecastOSError, match="win_rate"):
+            bumped.project()
+
+    def test_both_projection_paths_agree_on_rejecting_negatives(self):
+        bad = self._s(-0.1)
+        with pytest.raises(ForecastOSError):
+            bad.project()
+        with pytest.raises(ValueError):  # propagate's own check, via stage_volumes
+            bad.project({"won": "win_rate"})
+
+    def test_compare_scenarios_surfaces_the_error_rather_than_a_minus_200_pct(self):
+        base = Scenario({"top_of_funnel": 1000, "win_rate": 0.10, "acv": 10000})
+        with pytest.raises(ForecastOSError, match="win_rate"):
+            compare_scenarios(base, base.bump(win_rate=-0.20))
+
+    def test_rate_endpoints_zero_and_one_remain_valid(self):
+        assert self._s(0.0).project() == pytest.approx(0.0)
+        assert self._s(1.0).project() == pytest.approx(10_000_000.0)
+
+    def test_bump_itself_still_builds_the_out_of_range_scenario(self):
+        # bump/with_ stay unvalidated intermediates; only projection judges them,
+        # so a caller can still bump twice back into range.
+        s = self._s(0.10).bump(win_rate=-0.20).bump(win_rate=0.25)
+        assert s.project() == pytest.approx(1500000.0)
+
+
+class TestRateDriversAboveOneStillMultiplyIn:
+    """Backward compatibility: a ``*_rate`` driver above 1.0 is NOT an error.
+
+    The v0.9.0 audit remediation for negative rate drivers over-applied itself
+    and bounded every ``*_rate`` driver to [0, 1] on the default projection
+    path. The ``_rate`` suffix is a *name* heuristic, and it cannot tell a
+    conversion probability from a multiplier: ``expansion_rate``,
+    ``attach_rate``, ``growth_rate`` and ``churn_rate`` all legitimately exceed
+    1 in GTM planning, and the module's documented identity
+    ``top_of_funnel * prod(rate drivers) * acv`` is well defined for them.
+
+    Crucially there is no migration path: the ``_rate`` suffix is the ONLY
+    mechanism that makes a driver multiply into ``project()``, so renaming
+    ``expansion_rate`` -> ``expansion_factor`` does not preserve the number, it
+    silently drops the factor (the driver becomes a merely 'carried' driver).
+    These tests pin the v0.9.0 numbers, which must keep working.
+    """
+
+    @pytest.mark.parametrize(
+        "name, value, expected",
+        [
+            ("expansion_rate", 1.15, 115_000.0),
+            ("attach_rate", 1.8, 180_000.0),
+            ("growth_rate", 1.4, 140_000.0),
+        ],
+    )
+    def test_v090_multiplier_rate_drivers_project_the_same_number(
+        self, name, value, expected
+    ):
+        s = Scenario({"top_of_funnel": 1000, name: value, "acv": 100})
+        assert s.project() == pytest.approx(expected)
+
+    def test_renaming_away_from_the_rate_suffix_would_not_preserve_the_value(self):
+        # Documents *why* the upper bound had no migration path: the rename the
+        # error message implied silently drops the factor rather than keeping it.
+        renamed = Scenario({"top_of_funnel": 1000, "expansion_factor": 1.15, "acv": 100})
+        assert renamed.project() == pytest.approx(100_000.0)  # factor dropped
+
+    def test_multiplier_rates_compose_with_conversion_rates(self):
+        s = Scenario(
+            {"top_of_funnel": 1000, "win_rate": 0.30, "expansion_rate": 1.2, "acv": 100}
+        )
+        assert s.project() == pytest.approx(1000 * 0.30 * 1.2 * 100)
+
+    def test_bump_above_one_projects_rather_than_raising(self):
+        base = Scenario({"top_of_funnel": 1000, "expansion_rate": 0.95, "acv": 100})
+        assert base.bump(expansion_rate=0.25).project() == pytest.approx(120_000.0)
+
+    def test_compare_scenarios_reports_an_above_one_alternative(self):
+        base = Scenario({"top_of_funnel": 1000, "expansion_rate": 1.0, "acv": 100})
+        df = compare_scenarios(base, base.with_(expansion_rate=1.5))
+        assert df["projection"].tolist() == pytest.approx([100_000.0, 150_000.0])
+        assert df["pct_delta"].iloc[1] == pytest.approx(0.5)
+
+    def test_stages_path_keeps_propagates_own_zero_to_one_contract(self):
+        # The stages path is a funnel chain, where volume cannot grow from one
+        # stage to the next, so propagate's [0, 1] bound is correct there and is
+        # deliberately NOT relaxed. The asymmetry is documented on project().
+        s = Scenario({"top_of_funnel": 1000, "expansion_rate": 1.15, "acv": 100})
+        assert s.project() == pytest.approx(115_000.0)
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            s.project({"expanded": "expansion_rate"})

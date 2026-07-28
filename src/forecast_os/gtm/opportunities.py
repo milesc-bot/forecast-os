@@ -456,8 +456,11 @@ def weighted_pipeline(
 
     and, when ``level`` is given, a Normal-approximation interval
     ``expected +/- z_level * sqrt(variance)`` clamped to the attainable
-    support ``[0, sum(amount)]`` (a group's realized won-$ cannot be negative
-    or exceed the sum of its deal amounts). ``expected`` and ``variance`` are
+    support. Every deal contributes either ``0`` or its full amount, so that
+    support is ``[sum of the negative amounts, sum of the positive amounts]``
+    — the familiar ``[0, sum(amount)]`` whenever amounts are non-negative,
+    widened at the low end by any negative-amount (downsell/credit) deals
+    rather than collapsed into an inverted band. ``expected`` and ``variance`` are
     exact for independent deals; the interval is the only approximation.
 
     The Normal approximation is well-calibrated when a group holds many
@@ -483,7 +486,10 @@ def weighted_pipeline(
         null segment label are therefore kept, as their own NaN-keyed row, and
         warned about; they are never silently dropped. Relabel them beforehand
         if you want them named (on a ``category`` dtype that means
-        ``add_categories`` first, or ``.astype(object)``).
+        ``add_categories`` first, or ``.astype(object)``). A segment column may
+        not be named after one of this function's own output columns
+        (``expected``, ``n_deals``, ``lo-{level}``, ``hi-{level}``) — that
+        raises rather than overwriting the segment labels with the counts.
     amount_col : the deal-value column (default ``"amount"``).
     level : confidence level in (0, 100) for the interval columns
         ``lo-{level}``/``hi-{level}``; ``None`` omits them.
@@ -512,15 +518,24 @@ def weighted_pipeline(
         )
 
     levels = _check_pipeline_level(level)
+    # The support ends are tracked as separate positive/negative sums so a
+    # negative-amount (downsell/credit) deal WIDENS the low end instead of
+    # swapping the two clamps; see the interval clamp below.
     work = pd.DataFrame(
-        {"_pa": p * amounts, "_var": p * (1.0 - p) * amounts**2, "_amt": amounts},
+        {
+            "_pa": p * amounts,
+            "_var": p * (1.0 - p) * amounts**2,
+            "_pos": np.maximum(amounts, 0.0),
+            "_neg": np.minimum(amounts, 0.0),
+        },
         index=open_deals.index,
     )
 
     if by is None:
         expected = np.array([work["_pa"].sum()])
         variance = np.array([work["_var"].sum()])
-        total_amt = np.array([work["_amt"].sum()])
+        hi_support = np.array([work["_pos"].sum()])
+        lo_support = np.array([work["_neg"].sum()])
         n_deals = np.array([len(work)])
         out = pd.DataFrame({"expected": expected})
         keys: list[str] = []
@@ -530,6 +545,19 @@ def weighted_pipeline(
         if missing:
             raise ForecastOSError(
                 f"open_deals is missing grouping column(s) {missing}"
+            )
+        # A segment column sharing a name with an output column used to be
+        # silently overwritten by that output (by='n_deals' returned the deal
+        # counts in place of the segment labels) or to crash inside pandas.
+        reserved = {"expected", "n_deals"}
+        if levels is not None:
+            reserved |= {f"lo-{levels}", f"hi-{levels}"}
+        clashing = [c for c in keys if c in reserved]
+        if clashing:
+            raise ForecastOSError(
+                f"grouping column(s) {clashing} collide with weighted_pipeline's "
+                f"own output column(s) {sorted(reserved)}; rename them in "
+                f"open_deals before grouping"
             )
         # pandas' groupby drops null keys by default, which would delete those
         # deals from the output entirely: the segments would no longer sum to
@@ -551,27 +579,39 @@ def weighted_pipeline(
                     UserWarning,
                     stacklevel=2,
                 )
-        for c in keys:
-            work[c] = open_deals[c].to_numpy()
-        grouped = work.groupby(keys, sort=True, dropna=False)
+        # Group by standalone key Series rather than by copying the segment
+        # columns into `work`: a segment column named '_pa'/'_var'/'_pos'/'_neg'
+        # would otherwise overwrite the statistic of the same name.
+        groupers = [
+            pd.Series(open_deals[c].to_numpy(), index=work.index, name=c) for c in keys
+        ]
+        grouped = work.groupby(groupers, sort=True, dropna=False)
         agg = grouped.agg(
-            expected=("_pa", "sum"), _variance=("_var", "sum"), _total=("_amt", "sum")
+            expected=("_pa", "sum"),
+            _variance=("_var", "sum"),
+            _pos_total=("_pos", "sum"),
+            _neg_total=("_neg", "sum"),
         )
         n_deals = grouped.size().to_numpy()
         variance = agg["_variance"].to_numpy()
         expected = agg["expected"].to_numpy()
-        total_amt = agg["_total"].to_numpy()
+        hi_support = agg["_pos_total"].to_numpy()
+        lo_support = agg["_neg_total"].to_numpy()
         out = agg[["expected"]].reset_index()
 
     if levels is not None:
         z = float(stats.norm.ppf(0.5 + levels / 200.0))
         sd = np.sqrt(variance)
-        # The realized won-$ of a group lives in [0, sum(amount)] — every deal
-        # contributes either 0 or its full amount. Clamp the Normal-approx band
-        # to that support so a lumpy segment never reports more (or less) than
-        # is physically attainable.
-        out[f"lo-{levels}"] = np.maximum(expected - z * sd, 0.0)
-        out[f"hi-{levels}"] = np.minimum(expected + z * sd, total_amt)
+        # The realized won-$ of a group lives in [sum of negative amounts, sum
+        # of positive amounts] — every deal contributes either 0 or its full
+        # amount, so the extremes are "every loss-making deal lands, no
+        # revenue deal does" and vice versa. Clamp the Normal-approx band to
+        # that support so a lumpy segment never reports more (or less) than is
+        # physically attainable. With non-negative amounts this is the usual
+        # [0, sum(amount)]; with a negative amount present the low end widens
+        # instead of crossing above the high end.
+        out[f"lo-{levels}"] = np.maximum(expected - z * sd, lo_support)
+        out[f"hi-{levels}"] = np.minimum(expected + z * sd, hi_support)
     out["n_deals"] = np.asarray(n_deals, dtype=int)
     return out.reset_index(drop=True)
 

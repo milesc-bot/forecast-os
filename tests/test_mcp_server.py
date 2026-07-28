@@ -231,6 +231,38 @@ class TestForecastTool:
                 model_params={"bogus": 1},
             )
 
+    def test_fractional_level_is_rejected_not_truncated(self):
+        """Regression: ``level=[99.9]`` was ``int()``-ed to 99 right here.
+
+        The model layer rejects a fractional level because the interval is
+        labelled ``lo-{level}``/``hi-{level}``, but this tool truncated
+        first, so the guard never saw the value: an MCP client asking for
+        99.9% quietly received a ~22% narrower interval under a ``lo-99``
+        label it never asked for. The value now reaches ``predict``
+        uncoerced.
+        """
+        with pytest.raises(ValueError, match="whole number"):
+            server.forecast_tool(
+                records=_deal_records(), mapping="mcp_test_deals", h=2, level=[99.9]
+            )
+
+    def test_whole_number_float_level_still_works(self):
+        """JSON has no int/float distinction: ``level=[90.0]`` must still work."""
+        rows = server.forecast_tool(
+            records=_deal_records(), mapping="mcp_test_deals", h=2, level=[90.0]
+        )
+        assert {"lo-90", "hi-90"} <= set(rows[0])
+
+    @pytest.mark.parametrize("kwargs", [{"h": True}, {"level": [True]}])
+    def test_boolean_arguments_are_rejected(self, kwargs):
+        """``bool`` is an ``int`` subclass: ``h=true`` forecast one period and
+        ``level=[true]`` produced a 1% interval, both silently."""
+        kwargs.setdefault("h", 2)
+        with pytest.raises(ValueError, match="not a boolean"):
+            server.forecast_tool(
+                records=_deal_records(), mapping="mcp_test_deals", **kwargs
+            )
+
 
 class TestCompareTool:
     def test_leaderboard_shape(self):
@@ -292,6 +324,117 @@ class TestCompareTool:
             agg="count",
         )
         assert out["leaderboard"][0]["mae"] == pytest.approx(0.0)
+
+    def test_unrelated_warnings_are_not_reported_as_failures(self):
+        """``failures`` explains absent models — it is not a warning dump.
+
+        It used to be built from *every* warning raised anywhere inside the
+        backtest, so a panel whose values overflow float64 during scoring
+        produced dozens of identical numpy 'overflow encountered in square'
+        strings alongside a complete leaderboard: no model failed, yet the
+        agent was handed a pile of unattributed warnings whose length grew
+        with ``n_windows``. Every model on the board means ``failures == []``.
+        """
+        months = pd.date_range("2022-01-01", periods=36, freq="MS")
+        records = [
+            {"unique_id": "s", "ds": d.strftime("%Y-%m-%d"), "y": 1e300 * (1 + i % 5)}
+            for i, d in enumerate(months)
+        ]
+        out = server.compare_tool(records=records, models=["theta", "naive"], h=3, n_windows=5)
+        assert {row["model"] for row in out["leaderboard"]} == {"theta", "naive"}
+        assert out["failures"] == []
+
+    def test_failed_model_is_reported_even_when_its_warning_is_lost(
+        self, failing_model, monkeypatch
+    ):
+        """A model missing from the board is never silently missing.
+
+        ``failures`` was inferred purely from ``warnings.catch_warnings``,
+        which mutates process-global state: when two requests overlapped in
+        FastAPI's threadpool, one request's ``__exit__`` restored the default
+        showwarning under the other, and the failure explanation vanished —
+        the caller got a short leaderboard with ``failures == []`` and no clue
+        a model had been dropped. The list is now derived from the board
+        itself (requested models minus survivors), so the warning text is an
+        enrichment, not the source of truth. Losing the warning is simulated
+        deterministically here by neutering the engine's ``warnings.warn``.
+        """
+        import types
+
+        from forecast_os import engine as engine_module
+
+        monkeypatch.setattr(
+            engine_module, "warnings", types.SimpleNamespace(warn=lambda *a, **k: None)
+        )
+        out = server.compare_tool(
+            records=_deal_records(),
+            mapping="mcp_test_deals",
+            models=["naive", failing_model],
+            h=4,
+            n_windows=2,
+        )
+        assert [row["model"] for row in out["leaderboard"]] == ["naive"]
+        assert len(out["failures"]) == 1
+        assert failing_model in out["failures"][0]
+        json.dumps(out)
+
+    def test_model_specs_beyond_plain_names_still_work(self):
+        """Direct Python callers may pass ``(name, params)`` specs.
+
+        ``failures`` is now derived by matching requested models against the
+        board index, which only works for registry names; a spec tuple must
+        not crash that lookup or be mis-reported as a failed model.
+        """
+        out = server.compare_tool(
+            records=_deal_records(),
+            mapping="mcp_test_deals",
+            models=[("window_average", {"window": 3}), "naive"],
+            h=4,
+            n_windows=2,
+        )
+        assert {row["model"] for row in out["leaderboard"]} == {"window_average", "naive"}
+        assert out["failures"] == []
+
+    def test_non_positive_seasonality_is_rejected(self):
+        """A negative ``seasonality`` produced a meaningless, inverted MASE.
+
+        The MASE denominator is ``mean|y[m:] - y[:-m]|``; for m = -1 that
+        slices ``y[-1:] - y[:1]``, i.e. the whole series range, deflating
+        every score — ``naive`` scored 0.09 against its own yardstick, so an
+        agent reading "below 1 beats a naive forecaster" would pick a model on
+        a fabricated margin. m = 0 already failed, but with a raw numpy
+        broadcast message. A seasonal period below 1 is not a period.
+        """
+        for bad in (0, -1, -12):
+            with pytest.raises(ValueError, match="seasonality"):
+                server.compare_tool(
+                    records=_deal_records(),
+                    mapping="mcp_test_deals",
+                    models=["naive"],
+                    h=2,
+                    n_windows=2,
+                    seasonality=bad,
+                )
+
+    @pytest.mark.parametrize(
+        "kwargs", [{"h": True}, {"n_windows": True}, {"seasonality": True}, {"level": [True]}]
+    )
+    def test_boolean_arguments_are_rejected(self, kwargs):
+        """``seasonality=true`` is 1, so the ``< 1`` guard waved it through.
+
+        That silently swaps the seasonal-naive MASE denominator for a naive
+        one — a leaderboard measured against a yardstick the caller did not
+        choose. ``n_windows``/``h``/``level`` share the coercion.
+        """
+        kwargs.setdefault("h", 2)
+        kwargs.setdefault("n_windows", 2)
+        with pytest.raises(ValueError, match="not a boolean"):
+            server.compare_tool(
+                records=_deal_records(),
+                mapping="mcp_test_deals",
+                models=["naive"],
+                **kwargs,
+            )
 
 
 class TestQuotaTool:
@@ -357,6 +500,116 @@ class TestQuotaTool:
         with pytest.raises(TypeError, match="quota"):
             server.quota_tool(records=_deal_records(), mapping="mcp_test_deals", h=6)
 
+    def test_nan_quota_is_rejected(self):
+        """A NaN quota broke the documented ``p_attain in [0, 1]``.
+
+        NaN scored every series ``p_attain=None`` (JSON null — a consumer
+        doing ``0 <= p <= 1`` gets a TypeError on a field declared a
+        probability). A NaN in ``y`` is already a client error at the
+        boundary; a NaN target is too.
+        """
+        with pytest.raises(ValueError, match="quota must be a number"):
+            server.quota_tool(
+                records=_deal_records(), mapping="mcp_test_deals", h=6, quota=float("nan")
+            )
+
+    def test_nan_quota_in_dict_is_rejected(self):
+        with pytest.raises(ValueError, match="quota must be a number"):
+            server.quota_tool(
+                records=_deal_records(),
+                mapping="mcp_test_deals",
+                h=6,
+                quota={"total": float("nan")},
+            )
+
+    @pytest.mark.parametrize(("target", "expected"), [(float("inf"), 0.0), (float("-inf"), 1.0)])
+    def test_infinite_quota_is_scored_not_rejected(self, target, expected):
+        """An infinite quota has a correct, well-defined answer: keep it.
+
+        The finiteness guard over-reached. ``P(total >= +inf)`` is 0.0 and
+        ``P(total >= -inf)`` is 1.0 — both probabilities in [0, 1], both
+        what v0.9.0 returned. Only NaN is unanswerable. The echoed ``quota``
+        field is JSON null (infinity has no JSON spelling), which the
+        docstring now says.
+        """
+        out = server.quota_tool(
+            records=_deal_records(), mapping="mcp_test_deals", h=6, quota=target
+        )
+        assert all(row["p_attain"] == expected for row in out["rows"])
+
+    def test_string_quota_still_works(self):
+        """Regression: ``math.isfinite("100")`` raised an uncaught TypeError.
+
+        ``quota_tool`` is exported in ``__all__``, and at v0.9.0 a direct
+        Python caller could pass the string form a JSON/CSV round trip
+        produces — ``attainment_probability`` floats it internally, giving
+        the same answer as ``quota=100.0``. The finiteness guard tested the
+        raw value before any coercion, and TypeError is not one of the
+        exceptions ``_tool_errors`` normalises, so it escaped raw.
+        """
+        as_text = server.quota_tool(
+            records=_deal_records(), mapping="mcp_test_deals", h=6, quota="100"
+        )
+        as_number = server.quota_tool(
+            records=_deal_records(), mapping="mcp_test_deals", h=6, quota=100.0
+        )
+        assert as_text == as_number
+        assert all(0.0 <= row["p_attain"] <= 1.0 for row in as_text["rows"])
+
+    def test_non_numeric_quota_raises_value_error(self):
+        """A quota that is not a number at all is a ValueError, not a TypeError."""
+        with pytest.raises(ValueError, match="quota must be a number"):
+            server.quota_tool(
+                records=_deal_records(), mapping="mcp_test_deals", h=6, quota="lots"
+            )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"quota": True},
+            {"quota": 100.0, "h": True},
+            {"quota": 100.0, "level": True},
+        ],
+    )
+    def test_boolean_arguments_are_rejected(self, kwargs):
+        """``bool`` is an ``int`` subclass, so every one of these was silent.
+
+        ``quota=true`` scored against a target of 1.0, ``h=true`` forecast a
+        single period, and ``level=true`` reported attainment against a 1%
+        interval labelled ``lo-1``/``hi-1``. The guard the sweep added to the
+        HTTP ``h`` field belongs on every numeric argument, on both surfaces.
+        """
+        kwargs.setdefault("h", 6)
+        with pytest.raises(ValueError, match="not a boolean"):
+            server.quota_tool(records=_deal_records(), mapping="mcp_test_deals", **kwargs)
+
+
+class TestClientDataErrorsAreValueErrors:
+    """Bad *data* must raise ``ValueError`` — the REST layer turns it into 400.
+
+    Panel shaping runs entirely on caller-supplied values, but only
+    ValueError/ForecastOSError were normalised, so ordinary bad input escaped
+    as ZeroDivisionError/TypeError: over HTTP that is a bare 500 "Internal
+    Server Error", contradicting the serving module's documented "never a 500"
+    contract, and over MCP it is an exception type clients do not expect.
+    """
+
+    def test_zero_length_freq_is_a_value_error(self):
+        with pytest.raises(ValueError):
+            server.preview_panel(
+                records=_deal_records(), mapping="mcp_test_deals", freq="0D"
+            )
+
+    def test_unhashable_series_id_is_a_value_error(self):
+        rows = [{"unique_id": {"a": 1}, "ds": "2024-01-01", "y": 1.0}] * 3
+        with pytest.raises(ValueError):
+            server.preview_panel(records=rows)
+
+    def test_undatelike_timestamp_is_a_value_error(self):
+        rows = [{"unique_id": "s", "ds": {"a": 1}, "y": 1.0}] * 3
+        with pytest.raises(ValueError):
+            server.preview_panel(records=rows)
+
 
 class TestMCPWiring:
     def test_main_without_mcp_raises_install_hint(self, monkeypatch):
@@ -388,3 +641,32 @@ class TestMCPWiring:
         for name in ("preview_panel", "forecast", "compare", "quota"):
             props = tools[name].inputSchema["properties"]
             assert {"freq", "agg"} <= set(props), f"{name} is missing freq/agg"
+
+
+class TestLevelMustBeANumber:
+    """A string `level` raised a bare TypeError that escaped the error decorator.
+
+    `level` is passed to predict() uncoerced so the model layer's own whole-number
+    check stays visible on this surface. That left a string to fail as a raw
+    TypeError from a comparison inside _check_level, which the ValueError-only
+    decorator does not catch — surfacing as a 500 traceback instead of a clean
+    client error.
+    """
+
+    @staticmethod
+    def _panel():
+        return [{"unique_id": "a", "ds": f"2024-{m:02d}-01", "y": float(m)} for m in range(1, 13)]
+
+    @pytest.mark.parametrize("bad", [["80"], [True], [None]])
+    def test_non_numeric_level_raises_value_error(self, bad):
+        from forecast_os.mcp.server import forecast_tool
+
+        with pytest.raises(ValueError, match="level must be a number"):
+            forecast_tool(records=self._panel(), model="naive", h=2, level=bad)
+
+    def test_numeric_levels_still_work(self):
+        from forecast_os.mcp.server import forecast_tool
+
+        rows = forecast_tool(records=self._panel(), model="naive", h=2, level=[80])
+        assert len(rows) == 2
+        assert "lo-80" in rows[0]

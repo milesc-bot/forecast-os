@@ -21,12 +21,12 @@ from typing import Any
 
 import pandas as pd
 
-from .core.base import BaseForecaster
+from .core.base import BaseForecaster, _method_accepts
 from .core.exceptions import ForecastOSError
 from .core.registry import get_model
 from .core.types import ID_COL, TARGET_COL, TIME_COL, validate_panel
 from .evaluation.backtest import cross_validation
-from .evaluation.metrics import evaluate
+from .evaluation.metrics import _resolve_metric_aliases, evaluate
 
 __all__ = ["ForecastEngine"]
 
@@ -109,18 +109,36 @@ class ForecastEngine:
         h: int,
         models: Sequence[ModelLike] | None = None,
         level: list[int] | None = None,
+        X_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Fit fresh clones of each model on ``df`` and forecast ``h`` steps.
 
         Returns a wide frame ``unique_id, ds, <model>[, <model>-lo-l,
         <model>-hi-l, ...]`` with one column set per model (the same renaming
         scheme cross-validation uses).
+
+        ``X_df`` carries known future covariates — ``unique_id, ds`` plus one
+        column per driver, ``h`` rows per series — for panels with covariate
+        columns. It is passed only to models that actually consumed
+        covariates when fitting and whose ``predict`` declares ``X_df``, so
+        mixing exog and plain models in one call is fine. Without it, an exog
+        model fitted on a covariate panel raises, as it does on its own.
         """
         df = validate_panel(df)
         level = self.level if level is None else level
         frames = []
         for model in self._resolve(models):
-            pred = model.clone().fit(df).predict(h, level=level)
+            fitted = model.clone().fit(df)
+            # mirror backtest.py: gate on what the fit actually consumed, not
+            # on the class's supports_exog declaration
+            if (
+                X_df is not None
+                and getattr(fitted, "_exog_features", None)
+                and _method_accepts(type(model), "predict", "X_df")
+            ):
+                pred = fitted.predict(h, level=level, X_df=X_df)
+            else:
+                pred = fitted.predict(h, level=level)
             rename = {"yhat": model.name}
             for col in pred.columns:
                 if col.startswith(("lo-", "hi-")):
@@ -164,8 +182,12 @@ class ForecastEngine:
         Returns a leaderboard with one column per metric (best model first).
         The board is indexed by each model's registry name when its class was
         registered (falling back to ``model.name``), so an index entry can be
-        fed straight back into :meth:`forecast`. Interval metrics
-        (``coverage``, ``winkler``, ``pinball``, ``crps``) require ``level``
+        fed straight back into :meth:`forecast`. When one registry name is
+        claimed by two or more of the models being compared — two
+        parameterizations of one class, told apart by ``alias`` — those models
+        are indexed by ``model.name`` instead, so distinct parameterizations
+        never collapse onto one row. Interval metrics
+        (``coverage``, ``winkler``, ``pinball``, ``wis``) require ``level``
         (falling back to the constructor default) and appear under their
         emitted per-level names, e.g. a ``coverage-80`` column for
         ``level=[80]``.
@@ -174,6 +196,13 @@ class ForecastEngine:
         model whose fit/predict raises is dropped with a ``UserWarning``
         (``"model X failed: ..."``) and the board is built from the
         survivors. If every model fails, :class:`ForecastOSError` is raised.
+
+        Covariate panels: exog-capable models are cross-validated with the
+        known future covariates taken from each held-out window (the
+        convention :func:`~forecast_os.evaluation.backtest.cross_validation`
+        documents), so a ranked exog model needs the same at forecast time —
+        feed its index entry back into :meth:`forecast` together with an
+        ``X_df`` of ``h`` future rows per series.
 
         Sorting: the board is ordered by the first metric's first emitted
         column. If that metric is ``coverage``, models sort by
@@ -185,14 +214,27 @@ class ForecastEngine:
         better).
         """
         df = validate_panel(df)
-        metrics = list(metrics)
+        # Translate deprecated metric spellings before both evaluate() and the
+        # column selection below, which indexes the board by the requested name:
+        # without this, the 'crps' -> 'wis' rename turns a documented v0.9.0 call
+        # into a KeyError on a column that was renamed underneath it.
+        metrics = _resolve_metric_aliases(list(metrics))
+        if not metrics:
+            raise ValueError("no metrics to score; pass at least one metric name")
         level = self.level if level is None else level
         resolved = self._resolve(models)
-        board_names = {m.name: self._display_name(m) for m in resolved}
+        # A registry name claimed by more than one resolved model (two
+        # parameterizations of one class, distinguished by `alias`) would
+        # collapse them onto one index label; those keep their own name.
+        display = [self._display_name(m) for m in resolved]
+        shared = {d for d in display if display.count(d) > 1}
+        board_names = {
+            m.name: (m.name if d in shared else d) for m, d in zip(resolved, display)
+        }
         cv = None
         failures: list[str] = []
         for model in resolved:
-            name = self._display_name(model)
+            name = board_names[model.name]
             try:
                 cv_model = cross_validation(df, [model], h, n_windows=n_windows, level=level)
             except Exception as exc:

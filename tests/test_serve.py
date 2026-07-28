@@ -245,6 +245,167 @@ class TestErrorHandling:
         assert resp.status_code == 400
         assert "error" in resp.json()
 
+    @pytest.mark.parametrize(
+        ("route", "extra"),
+        [
+            ("/preview", {}),
+            ("/forecast", {"h": 2}),
+            ("/compare", {"h": 2, "n_windows": 2, "models": ["naive"]}),
+            ("/quota", {"h": 2, "quota": 1.0, "model": "naive"}),
+        ],
+    )
+    def test_zero_length_freq_is_400_not_500(self, client, route, extra):
+        """A caller-supplied ``freq`` of "0D" used to be a 500 on every route.
+
+        Resampling on a zero-length frequency raises ZeroDivisionError, which
+        is neither ValueError nor ForecastOSError, so it escaped the handlers
+        and became a bare "Internal Server Error" — while the control case
+        freq="ZZZ" correctly returned 400. Both are the same class of mistake:
+        a bad value in the request body.
+        """
+        resp = client.post(
+            route,
+            json={
+                "records": _deal_records(),
+                "mapping": "serve_test_deals",
+                "freq": "0D",
+                **extra,
+            },
+        )
+        assert resp.status_code == 400
+        assert "error" in resp.json()
+
+    def test_unhashable_record_values_are_400_not_500(self, client):
+        """Nested JSON objects where a series id / timestamp belongs -> 400.
+
+        ``{"unique_id": {...}}`` raises TypeError("unhashable type: dict") and
+        ``{"ds": {...}}`` raises TypeError from ``to_datetime``; both escaped
+        as 500s though both are ordinary malformed client data.
+        """
+        for rows in (
+            [{"unique_id": {"a": 1}, "ds": "2024-01-01", "y": 1.0}] * 3,
+            [{"unique_id": "s", "ds": {"a": 1}, "y": 1.0}] * 3,
+        ):
+            resp = client.post("/forecast", json={"records": rows, "h": 2})
+            assert resp.status_code == 400, resp.text
+            assert "error" in resp.json()
+
+    def test_nan_quota_is_400_but_infinities_are_scored(self, client):
+        """A NaN quota returned 200 with ``p_attain: null`` — not a probability.
+
+        JSON's non-standard ``NaN``/``Infinity`` literals parse fine, so a raw
+        body reached the scorer. NaN is unanswerable and is a 400. An infinite
+        quota is answerable — ``P(total >= +inf) = 0`` — and v0.9.0 answered
+        it, so the finiteness guard over-reached and is narrowed to NaN.
+        """
+        import json as _json
+
+        body = _json.dumps({"records": _panel_records(), "h": 3, "model": "naive"})
+
+        def _post(literal):
+            return client.post(
+                "/quota",
+                content=body[:-1] + f', "quota": {literal}}}',
+                headers={"content-type": "application/json"},
+            )
+
+        resp = _post("NaN")
+        assert resp.status_code == 400, resp.text
+        assert "number" in resp.json()["error"]
+
+        for literal, expected in (("Infinity", 0.0), ("-Infinity", 1.0)):
+            resp = _post(literal)
+            assert resp.status_code == 200, (literal, resp.text)
+            assert all(row["p_attain"] == expected for row in resp.json()["rows"])
+
+    def test_negative_seasonality_is_400(self, client):
+        """seasonality=-1 returned a MASE where naive 'beat' naive 11x."""
+        resp = client.post(
+            "/compare",
+            json={
+                "records": _panel_records(),
+                "models": ["naive"],
+                "h": 2,
+                "n_windows": 2,
+                "seasonality": -1,
+            },
+        )
+        assert resp.status_code == 400
+        assert "seasonality" in resp.json()["error"]
+
+    def test_boolean_horizon_is_400(self, client):
+        """``h: true`` silently forecast 1 period; a boolean is not a horizon.
+
+        pydantic's lax mode coerces bool -> int (bool is an int subclass), so
+        ``true`` became h=1 and returned a 200 with one forecast row. Only the
+        unrelated positivity guard stopped ``false`` from doing the same.
+        String and integral-float horizons keep working — the coercion that is
+        wrong is the boolean one.
+        """
+        import json as _json
+
+        records = _json.dumps(_panel_records())
+        for literal, expected in (("true", 400), ("false", 400), ('"2"', 200), ("2.0", 200)):
+            resp = client.post(
+                "/forecast",
+                content=f'{{"records": {records}, "h": {literal}}}',
+                headers={"content-type": "application/json"},
+            )
+            assert resp.status_code == expected, (literal, resp.text)
+            if expected == 200:
+                assert len(resp.json()["forecast"]) == 2
+
+    def test_boolean_is_rejected_on_every_numeric_field(self, client):
+        """The bool guard went on ``h`` only; its siblings share the hole.
+
+        ``{"level": true}`` returned a 200 whose ``p_attain`` came from a 1%
+        interval instead of 80% — a probability answering a question nobody
+        asked, strictly worse than the ``h`` case. ``{"seasonality": true}``
+        silently swapped the seasonal-naive MASE denominator for a naive one
+        (the ``< 1`` guard cannot see it: ``int(True) == 1``), and
+        ``{"quota": true}`` scored against a target of 1.0.
+        """
+        import json as _json
+
+        records = _json.dumps(_panel_records())
+        for route, extra in (
+            ("/quota", '"quota": 100.0, "level": true'),
+            ("/quota", '"quota": true'),
+            ("/compare", '"seasonality": true'),
+            ("/compare", '"n_windows": true'),
+            ("/compare", '"level": [true]'),
+            ("/forecast", '"level": [true]'),
+        ):
+            resp = client.post(
+                route,
+                content=f'{{"records": {records}, "h": 2, {extra}}}',
+                headers={"content-type": "application/json"},
+            )
+            assert resp.status_code == 400, (route, extra, resp.text)
+            assert "boolean" in resp.text
+
+    def test_numeric_fields_keep_their_lax_coercions(self, client):
+        """Backward compat: only the boolean coercion is refused.
+
+        A JSON body has no int/float distinction and a form-encoded client
+        sends numbers as strings, so ``"quota": "100"``, ``"level": 80.0`` and
+        ``"seasonality": "4"`` are legitimate v0.9.0 calls and must stay 200.
+        """
+        import json as _json
+
+        records = _json.dumps(_panel_records())
+        for route, extra in (
+            ("/quota", '"quota": "100", "level": 80.0'),
+            ("/compare", '"seasonality": "4", "n_windows": 2.0'),
+            ("/forecast", '"level": [90.0]'),
+        ):
+            resp = client.post(
+                route,
+                content=f'{{"records": {records}, "h": 2, {extra}}}',
+                headers={"content-type": "application/json"},
+            )
+            assert resp.status_code == 200, (route, extra, resp.text)
+
     def test_quota_matching_no_series_is_400(self, client):
         resp = client.post(
             "/quota",
@@ -354,3 +515,48 @@ class TestPreviewDoesNotReadServerSidePaths:
         resp = client.post("/preview", json={"records": rows})
         assert resp.status_code == 200
         assert resp.json()["rows"] == 2
+
+
+class TestMalformedModelParamsAreNot500:
+    """Bad `model_params` must yield 400 + {"error": ...}, never a 500 traceback.
+
+    `get_model` was guarded, but constructor overrides that SURVIVE construction
+    and are only the wrong type deep inside fit()/predict() (season_length="x",
+    lags=true, models=[1]) escaped every handler and surfaced as a 500 with a
+    server-side traceback — contradicting the "never a 500 traceback" guarantee
+    in the module docstring and docs/serving.md.
+    """
+
+    @staticmethod
+    def _panel():
+        return [{"unique_id": "a", "ds": f"2024-{m:02d}-01", "y": float(m)} for m in range(1, 13)]
+
+    @pytest.mark.parametrize(
+        "model,params",
+        [
+            ("theta", {"season_length": "x"}),
+            ("ridge_lag", {"lags": True}),
+            ("holt", {"alpha": "x"}),
+            ("ensemble", {"models": [1]}),
+        ],
+    )
+    def test_bad_model_params_return_400(self, client, model, params):
+        resp = client.post(
+            "/forecast",
+            json={"records": self._panel(), "model": model, "h": 2, "model_params": params},
+        )
+        assert resp.status_code == 400, f"{model} {params} returned {resp.status_code}"
+        assert "error" in resp.json()
+        assert "model_params" in resp.json()["error"]
+
+    def test_valid_model_params_still_work(self, client):
+        resp = client.post(
+            "/forecast",
+            json={
+                "records": self._panel(),
+                "model": "theta",
+                "h": 2,
+                "model_params": {"season_length": 4},
+            },
+        )
+        assert resp.status_code == 200

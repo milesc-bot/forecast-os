@@ -43,7 +43,7 @@ window walk-forward validation: for each cutoff every model is **re-fitted from
 scratch** on data up to the cutoff (via `clone()`) and scored on the next `h` points —
 no leakage by construction. The output is one frame with a column per model plus
 `cutoff`, directly consumable by `evaluate()` for per-series, per-metric scoring —
-including interval quality: request `coverage`, `winkler`, `pinball`, or `crps`
+including interval quality: request `coverage`, `winkler`, `pinball`, or `wis`
 and they are scored from the `{model}-lo/hi-{level}` columns that
 `cross_validation(level=[...])` emits.
 

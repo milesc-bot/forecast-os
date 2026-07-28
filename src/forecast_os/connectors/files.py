@@ -38,6 +38,14 @@ _NUMERIC_SHARE = 0.8
 #: converting 20260101 to float 20260101.0 corrupts the date column.
 _DATE_SHAPED_RE = re.compile(r"\d{8}")
 
+#: An identifier-shaped value: a whole number written with a leading zero
+#: ("00190", "0190"). The padding carries meaning — GL/account codes, cost
+#: centres, zip codes and SKUs are identifiers, not quantities — and
+#: converting them merges "00190"/"0190"/"190" into one series. Matched
+#: against the value the conversion would see (sign/currency/whitespace
+#: already stripped), so "-0190" and "$0190" are exempt too.
+_ZERO_PADDED_RE = re.compile(r"0\d+")
+
 
 def _clean_numeric_text(records: pd.DataFrame) -> pd.DataFrame:
     """Convert text columns that read as money/numbers into floats (a copy).
@@ -48,9 +56,18 @@ def _clean_numeric_text(records: pd.DataFrame) -> pd.DataFrame:
     decimals), so genuinely-text columns — and columns that are only partly
     numeric — are left untouched. Columns whose non-null values are ALL
     exactly 8 digits are date-shaped (``YYYYMMDD``, e.g. GA4 ``event_date``)
-    and are exempt from conversion so they reach date parsing as text. In a
+    and are exempt from conversion so they reach date parsing as text. A
+    column holding ANY zero-padded whole number (``"00190"``, and likewise
+    ``"-0190"``/``"$0190"``) is exempt for the same reason: the padding is
+    significant, so the value is an identifier rather than a quantity. In a
     converted column the minority of values that do not parse become NaN
     (``pd.to_numeric(errors="coerce")``).
+
+    Both exemptions only reach columns that arrive here as text, which is
+    the whole story for Parquet but not for CSV: ``pandas.read_csv`` parses
+    an all-digit column to int64 (dropping the padding) before this
+    function ever sees it, so a CSV whose identifier or ``YYYYMMDD`` column
+    must survive has to be read with ``read_csv_kwargs={"dtype": str}``.
     """
     out = records.copy()
     for col in out.columns:
@@ -62,6 +79,11 @@ def _clean_numeric_text(records: pd.DataFrame) -> pd.DataFrame:
             continue
         if values.str.fullmatch(_DATE_SHAPED_RE).all():
             continue  # date-shaped (YYYYMMDD): leave as text for date parsing
+        # test the padding on what the conversion would consume, not the raw
+        # text: "0190" was exempt while "-0190"/"$0190"/" 0190" collapsed
+        bare = values.str.replace(_STRIP_RE, "", regex=True).str.lstrip("+-")
+        if bare.str.fullmatch(_ZERO_PADDED_RE).any():
+            continue  # zero-padded identifier ("00190"): the padding matters
         stripped = s.where(s.isna(), s.astype(str).str.replace(_STRIP_RE, "", regex=True))
         out[col] = pd.to_numeric(stripped, errors="coerce")
     return out
@@ -74,6 +96,12 @@ class CSVSource(Source):
     registered recipe name) becomes the source's default recipe for
     :meth:`~forecast_os.connectors.base.Source.to_panel`. ``read_csv_kwargs``
     are passed through to :func:`pandas.read_csv` (e.g. ``{"sep": ";"}``).
+
+    Pass ``read_csv_kwargs={"dtype": str}`` when a column's text form
+    matters — zero-padded identifiers (GL/account codes, zip codes, SKUs)
+    and ``YYYYMMDD`` dates. ``read_csv`` parses those to int64 on its own,
+    which drops the padding before the numeric-text cleaner (which exempts
+    them) can see them.
     """
 
     def __init__(

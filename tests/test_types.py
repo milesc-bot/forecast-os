@@ -253,3 +253,114 @@ class TestNullKeysAreRejected:
     def test_clean_panel_is_unaffected(self):
         df = pd.DataFrame({"unique_id": "a", "ds": [1, 2, 3], "y": [1.0, 2.0, 3.0]})
         assert len(validate_panel(df)) == 3
+
+
+class TestInfiniteTargetsAreRejected:
+    """``y`` accepted +/-inf, which poisoned every downstream number silently.
+
+    ``validate_panel`` used ``isna()`` to police the target, and ``isna()`` is
+    False for inf. An infinite observation therefore validated cleanly, and the
+    models then returned garbage without raising: ``naive`` gave a finite yhat
+    with ``lo-80 = -inf`` / ``hi-80 = +inf``, ``ses`` gave ``yhat = inf`` with
+    NaN intervals, and ``theta``/``holt`` gave NaN for every horizon. The
+    package already holds covariate columns to a finiteness standard
+    (``_check_finite_exog`` rejects NaN *and* inf); the target must not be held
+    to a weaker one. ``allow_missing`` stays an escape hatch for NaN only — a
+    missing observation is a real modelling case, an infinite one is not.
+    """
+
+    @staticmethod
+    def _with(value):
+        return pd.DataFrame(
+            {"unique_id": "a", "ds": [0, 1, 2, 3], "y": [1.0, 2.0, value, 4.0]}
+        )
+
+    @pytest.mark.parametrize("value", [np.inf, -np.inf])
+    def test_infinite_y_raises(self, value):
+        with pytest.raises(DataContractError, match="non-finite"):
+            validate_panel(self._with(value))
+
+    @pytest.mark.parametrize("value", [np.inf, -np.inf])
+    def test_allow_missing_does_not_waive_infinite_y(self, value):
+        with pytest.raises(DataContractError, match="non-finite"):
+            validate_panel(self._with(value), allow_missing=True)
+
+    def test_nan_is_still_governed_by_allow_missing(self):
+        assert validate_panel(self._with(np.nan), allow_missing=True)["y"].isna().sum() == 1
+        with pytest.raises(DataContractError, match="NaN"):
+            validate_panel(self._with(np.nan))
+
+    def test_finite_panel_is_unaffected(self):
+        assert len(validate_panel(self._with(3.0))) == 4
+
+
+class TestObjectDtypeIntegerDsStaysNumeric:
+    """An object-dtype integer ``ds`` was reinterpreted as nanoseconds.
+
+    ``pd.Series([0, 1, 2], dtype=object)`` satisfies neither
+    ``is_datetime64_any_dtype`` nor ``is_numeric_dtype``, so it fell through to
+    ``pd.to_datetime`` and validated as 1970-01-01 00:00:00.000000000..002 —
+    while the identical values as int64 validated as 0..2. Same data, two
+    different time axes, no warning. Object-dtype integers reach the panel via
+    mixed/records construction and ``astype(object)``; they must behave like
+    int64. String ``ds`` still goes to ``to_datetime``.
+    """
+
+    def test_object_integer_ds_is_kept_numeric(self):
+        df = pd.DataFrame(
+            {
+                "unique_id": "a",
+                "ds": pd.Series([0, 1, 2, 3], dtype=object),
+                "y": [1.0, 2.0, 3.0, 4.0],
+            }
+        )
+        out = validate_panel(df)
+        assert pd.api.types.is_numeric_dtype(out["ds"])
+        assert list(out["ds"]) == [0, 1, 2, 3]
+
+    def test_object_integer_ds_matches_int64_ds(self):
+        values = [10, 20, 30, 40]
+        y = [1.0, 2.0, 3.0, 4.0]
+        as_obj = validate_panel(
+            pd.DataFrame(
+                {"unique_id": "a", "ds": pd.Series(values, dtype=object), "y": y}
+            )
+        )
+        as_int = validate_panel(pd.DataFrame({"unique_id": "a", "ds": values, "y": y}))
+        pd.testing.assert_series_equal(
+            as_obj["ds"].astype("int64"), as_int["ds"].astype("int64")
+        )
+
+    def test_object_float_ds_is_kept_numeric(self):
+        df = pd.DataFrame(
+            {
+                "unique_id": "a",
+                "ds": pd.Series([0.0, 0.5, 1.0], dtype=object),
+                "y": [1.0, 2.0, 3.0],
+            }
+        )
+        assert pd.api.types.is_numeric_dtype(validate_panel(df)["ds"])
+
+    def test_object_date_strings_still_parse_to_datetime(self):
+        """Numeric-looking strings are dates to pandas; only real ints change."""
+        df = pd.DataFrame(
+            {
+                "unique_id": "a",
+                "ds": pd.Series(["2024-01-01", "2024-01-02"], dtype=object),
+                "y": [1.0, 2.0],
+            }
+        )
+        assert pd.api.types.is_datetime64_any_dtype(validate_panel(df)["ds"])
+
+    def test_object_timestamps_still_parse_to_datetime(self):
+        df = pd.DataFrame(
+            {
+                "unique_id": "a",
+                "ds": pd.Series(
+                    [pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02")],
+                    dtype=object,
+                ),
+                "y": [1.0, 2.0],
+            }
+        )
+        assert pd.api.types.is_datetime64_any_dtype(validate_panel(df)["ds"])

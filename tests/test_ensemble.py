@@ -28,6 +28,22 @@ class _Const(PerSeriesForecaster):
         return np.full(h, self.value)
 
 
+class _Sigma(PerSeriesForecaster):
+    """Dummy member: repeats the last value with a fixed forecast sigma."""
+
+    def __init__(self, sigma=1.0):
+        self.sigma = sigma
+
+    def _fit_series(self, y):
+        return {"last": float(y[-1])}
+
+    def _predict_series(self, state, h):
+        return np.full(h, state["last"])
+
+    def _predict_sigma(self, state, h):
+        return np.full(h, self.sigma)
+
+
 @pytest.fixture
 def small_panel():
     rng = np.random.default_rng(0)
@@ -65,6 +81,45 @@ def test_interval_columns_combined_like_yhat(small_panel):
     for col in ("yhat", "lo-80", "hi-80"):
         assert np.allclose(pred[col], (p1[col] + p2[col]) / 2)
     assert (pred["lo-80"] <= pred["hi-80"]).all()
+
+
+def test_negative_weights_keep_intervals_ordered_and_nested(small_panel):
+    """Negative combination weights must not invert the prediction intervals.
+
+    Ensemble used to push lo/hi through the same signed weight vector as
+    yhat, so the combined width was ``sum_i w_i * (hi_i - lo_i)``. With a
+    negatively-weighted wide member that width went negative and predict()
+    returned lo > yhat > hi (and a 95% band strictly inside the 80% one) —
+    silently violating the lo <= yhat <= hi invariant that the rest of the
+    library asserts. Negative weights are legitimate (Granger-Ramanathan /
+    OLS forecast combination routinely produces them), so the fix is to
+    keep the signed weighted mean for yhat and combine the members' *half
+    widths* with ``|w_i|``, which is ordered and monotone by construction
+    and identical to the old arithmetic whenever every weight is >= 0.
+    """
+    wide, narrow = _Sigma(20.0), _Sigma(1.0)
+    ens = Ensemble(models=(wide, narrow), weights=[-1.0, 2.0]).fit(small_panel)
+    pred = ens.predict(3, level=[80, 95])
+    assert (pred["lo-80"] <= pred["yhat"]).all()
+    assert (pred["yhat"] <= pred["hi-80"]).all()
+    assert (pred["lo-95"] <= pred["lo-80"]).all()
+    assert (pred["hi-80"] <= pred["hi-95"]).all()
+    # yhat is still the plain (normalised) signed weighted mean.
+    pw = wide.clone().fit(small_panel).predict(3)
+    pn = narrow.clone().fit(small_panel).predict(3)
+    assert np.allclose(pred["yhat"], -1.0 * pw["yhat"] + 2.0 * pn["yhat"])
+
+
+def test_non_negative_weights_leave_interval_arithmetic_unchanged(small_panel):
+    """The half-width rebuild must be a no-op for ordinary convex weights."""
+    wide, narrow = _Sigma(20.0), _Sigma(1.0)
+    pred = Ensemble(models=(wide, narrow), weights=[1.0, 3.0]).fit(small_panel).predict(
+        3, level=[90]
+    )
+    pw = wide.clone().fit(small_panel).predict(3, level=[90])
+    pn = narrow.clone().fit(small_panel).predict(3, level=[90])
+    for col in ("yhat", "lo-90", "hi-90"):
+        assert np.allclose(pred[col], 0.25 * pw[col] + 0.75 * pn[col])
 
 
 def test_members_are_cloned_not_mutated(small_panel):

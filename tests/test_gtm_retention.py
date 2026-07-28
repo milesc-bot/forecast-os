@@ -10,6 +10,7 @@ from forecast_os.core.registry import get_model, list_models
 from forecast_os.core.types import ID_COL, TARGET_COL, TIME_COL, validate_panel
 from forecast_os.datasets.synthetic import generate_series
 from forecast_os.gtm import ShiftedBetaGeometric, cohort_panel
+from forecast_os.gtm.retention import _pooled_curve
 
 
 def _sbg_survival(alpha: float, beta: float, horizon: int) -> np.ndarray:
@@ -533,3 +534,112 @@ class TestRetentionContractEquivalent:
         # in-sample fits are near-exact on noiseless model-generated curves
         resid = (fv[TARGET_COL] - fv["fitted"]).dropna()
         assert np.abs(resid).max() < 0.05
+
+
+class TestPooledFitOnARaggedCohortTriangle:
+    """Regression: pooling averaged survival LEVELS across a ragged triangle
+    (v0.9.0 audit SHOULD-4).
+
+    Every real cohort triangle is ragged — recent cohorts are short. The pooled
+    fit averaged the cohorts' scale-free curves position-wise with ``nanmean``,
+    so the SET of contributing cohorts changed from one position to the next:
+    where the short (here, faster-churning) cohorts ran out, the mean jumped up
+    to whatever the mature cohorts sat at. On 6 mature sBG(0.5, 8) cohorts plus 6
+    short sBG(2, 4) ones the pooled "survival curve" up-ticked by +0.165 at
+    position 3, so it was not a survival curve at all: its churn weights plus
+    ``S(T)`` summed to 1.165, not 1, and ``_sbg_mle``'s clipping — which is there
+    for measurement noise — silently absorbed a systematic composition artifact.
+    The existing tests all built every cohort from ONE identical curve, which is
+    exactly the configuration that hides this.
+
+    Pooling per-period retention RATIOS and cumulating them is monotone by
+    construction, keeps the likelihood weights summing to 1, uses every cohort at
+    every position it observes, and is unchanged on identical-length cohorts.
+    """
+
+    MATURE = (0.5, 8.0)
+    RECENT = (2.0, 4.0)
+
+    def _ragged_panel(self, n_mature=6, n_recent=6, mature_h=12, recent_h=2):
+        s_m = _sbg_survival(*self.MATURE, mature_h)
+        s_r = _sbg_survival(*self.RECENT, recent_h)
+        frames = [
+            pd.DataFrame(
+                {ID_COL: f"mature_{i}", TIME_COL: np.arange(mature_h + 1), TARGET_COL: s_m}
+            )
+            for i in range(n_mature)
+        ] + [
+            pd.DataFrame(
+                {ID_COL: f"recent_{i}", TIME_COL: np.arange(recent_h + 1), TARGET_COL: s_r}
+            )
+            for i in range(n_recent)
+        ]
+        return pd.concat(frames, ignore_index=True)
+
+    def _curves(self, panel):
+        return [
+            g[TARGET_COL].to_numpy(dtype=float)[1:] / g[TARGET_COL].to_numpy(dtype=float)[0]
+            for _, g in panel.groupby(ID_COL, sort=True)
+        ]
+
+    def test_pooled_curve_is_monotone_nonincreasing(self):
+        pooled = _pooled_curve(self._curves(self._ragged_panel()))
+        assert np.all(np.diff(pooled) <= 1e-12), pooled
+
+    def test_pooled_curve_likelihood_weights_sum_to_one(self):
+        """The object handed to _sbg_mle must be a survival curve: the churn
+        increments it implies, plus the final survivors, are a probability
+        distribution over churn periods and must sum to 1."""
+        pooled = _pooled_curve(self._curves(self._ragged_panel()))
+        weights = np.clip(-np.diff(np.concatenate([[1.0], pooled])), 0.0, None)
+        assert float(weights.sum() + pooled[-1]) == pytest.approx(1.0)
+
+    def test_ragged_levels_mean_would_have_failed_both_invariants(self):
+        """Pins WHY this needed fixing, using the old position-wise level mean."""
+        curves = self._curves(self._ragged_panel())
+        mat = np.full((len(curves), max(len(c) for c in curves)), np.nan)
+        for i, c in enumerate(curves):
+            mat[i, : len(c)] = c
+        old = np.nanmean(mat, axis=0)
+        assert np.diff(old).max() > 0.1  # a large UP-tick where short cohorts end
+        old_w = np.clip(-np.diff(np.concatenate([[1.0], old])), 0.0, None)
+        assert float(old_w.sum() + old[-1]) > 1.1  # not a probability distribution
+
+    def test_identical_cohorts_pool_to_that_exact_curve(self):
+        """Backward compatibility: with equal-length identical cohorts the ratio
+        pooling and the old level mean agree exactly, so nothing that the
+        existing suite covers moves."""
+        s = _sbg_survival(1.2, 3.5, 10)
+        curves = [s[1:] / s[0]] * 4
+        np.testing.assert_allclose(_pooled_curve(curves), s[1:], rtol=1e-12)
+
+    def test_borrowing_cohorts_forecast_closer_to_their_own_truth(self):
+        panel = self._ragged_panel()
+        model = ShiftedBetaGeometric().fit(panel)
+        params = model.cohort_params().set_index(ID_COL)
+        assert bool(params.loc["recent_0", "pooled"])  # it does borrow
+
+        h = 6
+        pred = model.predict(h)
+        got = pred[pred[ID_COL] == "recent_0"]["yhat"].to_numpy()
+        truth = _sbg_survival(*self.RECENT, 2 + h)[3:]
+
+        # (0.21656, 1.08756) is what the ragged level-mean produced; its
+        # forecast error is the bar the fix has to beat.
+        s_old = _sbg_survival(0.21656005696991346, 1.087564495816944, 2 + h)
+        old = float(
+            panel[(panel[ID_COL] == "recent_0") & (panel[TIME_COL] == 2)][TARGET_COL].iloc[0]
+        )
+        old_pred = old * s_old[3:] / s_old[2]
+        assert np.max(np.abs(got - truth)) < np.max(np.abs(old_pred - truth))
+
+    def test_pooled_prior_sits_between_the_two_populations(self):
+        """A pooled prior blends; it should not sit outside both truths."""
+        model = ShiftedBetaGeometric().fit(self._ragged_panel())
+        alpha, beta = model.pooled_params_
+        pooled_s1 = 1.0 - alpha / (alpha + beta)
+        assert (
+            1.0 - self.RECENT[0] / sum(self.RECENT)
+            <= pooled_s1
+            <= 1.0 - self.MATURE[0] / sum(self.MATURE)
+        )

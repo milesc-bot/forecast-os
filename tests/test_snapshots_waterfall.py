@@ -533,3 +533,68 @@ class TestDealsSnapshotKind:
         # unknown kind still raises ForecastOSError
         with pytest.raises(ForecastOSError):
             store.snapshot(_before(), as_of="2024-02-15", kind="bogus")
+
+
+class TestHistoricallyClosedDealsAreCountedButContributeNothing:
+    """``won``/``lost``/``removed`` count deals closed AS OF ``after``.
+
+    Classification reads the ``after`` state only, so a deal that was already
+    won or lost before the period starts is re-counted in every subsequent
+    period's bridge. That was reported as a defect; it is not one — dropping
+    those deals would break the documented guarantee that the categories
+    partition the deal universe and that ``n_deals`` sums to the number of
+    distinct deals. Every dollar figure is right (they contribute ``0``,
+    because nothing left the open pipeline this period) and the bridge still
+    closes.
+
+    What was wrong was the documentation: nothing warned that a ``won`` bar can
+    read "247 deals / $0". The module and :func:`pipeline_waterfall` docstrings
+    now say so; these tests pin the behaviour those docstrings promise, so the
+    two cannot drift apart.
+    """
+
+    def test_two_identical_snapshots_still_report_the_historical_closures(self):
+        snap = pd.DataFrame(
+            {
+                "opp_id": ["OLD1", "OLD2", "OLD3", "NEW"],
+                "amount": [1000.0, 2000.0, 3000.0, 50.0],
+                "stage": [WON, WON, LOST, "qualify"],
+            }
+        )
+        wf = pipeline_waterfall(
+            snap, snap.copy(), STAGES, won_stage=WON, lost_stage=LOST
+        )
+        # counted (partition preserved) but contributing nothing
+        assert _cat(wf, "won") == (2, 0.0)
+        assert _cat(wf, "lost") == (1, 0.0)
+        assert _cat(wf, "unchanged") == (1, 0.0)
+        assert int(wf["n_deals"].sum()) == 4
+        assert float(wf["amount"].sum()) == 0.0
+
+    def test_a_real_win_shares_the_bucket_with_the_pre_closed_deals(self):
+        before = pd.DataFrame(
+            {
+                "opp_id": ["OLD1", "A", "B"],
+                "amount": [1000.0, 10.0, 20.0],
+                "stage": [WON, "qualify", "qualify"],
+            }
+        )
+        after = pd.DataFrame(
+            {
+                "opp_id": ["OLD1", "A", "B"],
+                "amount": [1000.0, 10.0, 20.0],
+                "stage": [WON, WON, "qualify"],
+            }
+        )
+        wf = pipeline_waterfall(before, after, STAGES, won_stage=WON, lost_stage=LOST)
+        # n_deals is 2 (OLD1 + A) but the amount is A's alone
+        assert _cat(wf, "won") == (2, -10.0)
+        # the documented workaround: filter to deals open in before, or that
+        # changed state, and the count becomes period-only
+        changed = set(after.loc[after["stage"] != "qualify", "opp_id"]) - {"OLD1"}
+        period_before = before[before["opp_id"].isin(changed) | (before["stage"] != WON)]
+        period_after = after[after["opp_id"].isin(period_before["opp_id"])]
+        wf2 = pipeline_waterfall(
+            period_before, period_after, STAGES, won_stage=WON, lost_stage=LOST
+        )
+        assert _cat(wf2, "won") == (1, -10.0)

@@ -3,10 +3,19 @@
 All transforms are sklearn-style: ``fit(df) -> self``, ``transform(df)``,
 ``fit_transform(df)``, ``inverse_transform(df)``. ``inverse_transform`` also
 handles forecast frames: it applies the inverse to every numeric value column
-present — anything other than ``unique_id``, ``ds``, and ``cutoff``, which
-covers ``y``, ``yhat``, renamed model point columns (e.g. cross-validation's
-``"SES"``), and interval columns — leaving identifier and non-numeric
-columns untouched.
+present — anything other than ``unique_id``, ``ds``, ``cutoff``, and the
+columns the fitted frame carried without being transformed (exogenous
+covariates) — which covers ``y``, ``yhat``, renamed model point columns (e.g.
+cross-validation's ``"SES"``), and interval columns, leaving identifier,
+covariate, and non-numeric columns untouched.
+
+The covariate protection reaches exactly as far as the fitted frame: a
+numeric column is recognised as a covariate only if it was present at
+``fit`` time. A driver column that first appears in the frame handed to
+``inverse_transform`` — fit on a defensive ``df[["unique_id", "ds", "y"]]``
+slice, then joined to future drivers before inverting — is indistinguishable
+by name from a renamed model point column, so it *is* inverted. Fit on the
+frame that carries the covariates, or drop them before inverting.
 """
 
 from __future__ import annotations
@@ -31,20 +40,37 @@ def _value_columns(df: pd.DataFrame) -> list[str]:
     ]
 
 
-def _inverse_value_columns(df: pd.DataFrame) -> list[str]:
-    """Columns the inverse applies to: every numeric non-identifier column.
+def _inverse_value_columns(
+    df: pd.DataFrame, exclude: frozenset[str] = frozenset()
+) -> list[str]:
+    """Columns the inverse applies to: numeric, non-identifier, non-covariate.
 
     Forecast and cross-validation frames rename the point column after the
     model (e.g. ``"SES"``), so the inverse cannot rely on fixed names; it
-    inverts every numeric column except ``unique_id``, ``ds`` and ``cutoff``,
-    leaving non-numeric passthrough columns untouched.
+    inverts every numeric column except ``unique_id``, ``ds``, ``cutoff``,
+    and ``exclude`` (the fitted frame's untransformed columns — see
+    :meth:`BaseTransform._record_passthrough`), leaving non-numeric
+    passthrough columns untouched.
     """
     return [
         c
         for c in df.columns
         if c not in (ID_COL, TIME_COL, "cutoff")
+        and c not in exclude
         and pd.api.types.is_numeric_dtype(df[c])
     ]
+
+
+def _widen_to_float(df: pd.DataFrame, cols: list[str]) -> None:
+    """Cast ``cols`` to float in place.
+
+    Transform outputs are real-valued; writing them into an integer column
+    raises a bare ``TypeError: Invalid value ... for dtype 'int64'`` from
+    pandas instead of doing the obvious thing.
+    """
+    for c in cols:
+        if not pd.api.types.is_float_dtype(df[c]):
+            df[c] = df[c].astype(float)
 
 
 class BaseTransform:
@@ -67,6 +93,28 @@ class BaseTransform:
         if not getattr(self, "_is_fitted", False):
             raise NotFittedError(f"{type(self).__name__} is not fitted; call fit() first")
 
+    def _record_passthrough(self, df: pd.DataFrame) -> None:
+        """Remember the fitted frame's untransformed columns.
+
+        ``inverse_transform`` widens its column set beyond ``y``/``yhat`` so it
+        can catch point columns renamed after the model. Columns already
+        present at fit time that the forward pass did *not* touch are
+        exogenous covariates (``marketing_spend``, ``promo``, ...): the inverse
+        must leave them alone too, or a ``fit_transform``/``inverse_transform``
+        round trip silently rewrites them.
+
+        Fit-time columns are the only signal available. A covariate that
+        first appears at inverse time cannot be told apart from a model point
+        column renamed after the model, so it is not protected — see the
+        module docstring.
+        """
+        self._passthrough_ = frozenset(df.columns) - set(_value_columns(df))
+
+    @property
+    def _passthrough(self) -> frozenset[str]:
+        """Fit-time covariate columns (empty when nothing was recorded)."""
+        return getattr(self, "_passthrough_", frozenset())
+
     def _series_params(self, store: dict[Any, Any], uid: Any) -> Any:
         try:
             return store[uid]
@@ -81,7 +129,12 @@ class BaseTransform:
         if ID_COL not in df.columns:
             raise ForecastOSError(f"frame must contain the {ID_COL!r} column")
         out = df.copy()
-        cols = _inverse_value_columns(out) if inverse else _value_columns(out)
+        cols = (
+            _inverse_value_columns(out, self._passthrough)
+            if inverse
+            else _value_columns(out)
+        )
+        _widen_to_float(out, cols)
         for uid, idx in out.groupby(ID_COL, sort=False).indices.items():
             for c in cols:
                 vals = out[c].to_numpy(dtype=float)[idx]
@@ -139,6 +192,7 @@ class StandardScaler(BaseTransform):
         for uid, g in df.groupby(ID_COL, sort=True):
             y = g[TARGET_COL].to_numpy(dtype=float)
             self.stats_[uid] = (float(y.mean()), max(float(y.std()), 1e-12))
+        self._record_passthrough(df)
         self._is_fitted = True
         return self
 
@@ -188,6 +242,7 @@ class LogTransform(BaseTransform):
                         f"min(y) = {ymin}, offset = {off}"
                     )
             self.offset_[uid] = off
+        self._record_passthrough(df)
         self._is_fitted = True
         return self
 
@@ -220,7 +275,9 @@ class Differencer(BaseTransform):
     two kinds of frames: the **full** transformed training panel itself and
     frames whose ``ds`` all lie **after** the training series (forecast
     continuations). Arbitrary in-range slices are not invertible and raise
-    :class:`ForecastOSError`.
+    :class:`ForecastOSError`. Integration follows ``ds`` order regardless of
+    how the rows are arranged, and the returned frame keeps the caller's row
+    order; a null ``ds`` has no place in that order and is rejected.
     """
 
     def __init__(self, d: int = 1):
@@ -253,6 +310,7 @@ class Differencer(BaseTransform):
             self.last_ds_[uid] = g[TIME_COL].iloc[-1]
             self.n_train_[uid] = len(y)
             self.first_diff_ds_[uid] = g[TIME_COL].iloc[self.d]
+        self._record_passthrough(df)
         self._is_fitted = True
         return self
 
@@ -284,8 +342,26 @@ class Differencer(BaseTransform):
         if ID_COL not in df.columns:
             raise ForecastOSError(f"frame must contain the {ID_COL!r} column")
         out = df.copy()
-        cols = _inverse_value_columns(out)
+        # Integration below is ordered by ds, and a null ds has no place in
+        # that order: numpy sorts it last, so the row would be integrated at
+        # the end and its value scattered back into its original position,
+        # producing silently wrong levels. validate_panel, calendar_features,
+        # and FiscalCalendar all refuse a null ds; refuse it here too.
+        n_null = int(out[TIME_COL].isna().sum())
+        if n_null:
+            raise ForecastOSError(
+                f"Differencer.inverse_transform requires a {TIME_COL!r} value on "
+                f"every row (integration is only defined in time order); got "
+                f"{n_null} null. Drop or repair those rows first."
+            )
+        cols = _inverse_value_columns(out, self._passthrough)
+        _widen_to_float(out, cols)
         for uid, idx in out.groupby(ID_COL, sort=False).indices.items():
+            # Integrating a difference series is only defined in time order:
+            # cumsum over raw row positions turns a ds-descending frame into
+            # silently wrong levels. Sort the positions, integrate along them,
+            # and scatter the results back where they came from.
+            idx = idx[np.argsort(out[TIME_COL].to_numpy()[idx], kind="stable")]
             last_ds = self._series_params(self.last_ds_, uid)
             ds = out[TIME_COL].iloc[idx]
             continuation = bool((ds > last_ds).all())
@@ -318,10 +394,10 @@ class LogitTransform(BaseTransform):
     The forward transform clips values into
     ``[lo + eps*(hi-lo), hi - eps*(hi-lo)]`` (so boundary values stay
     finite) and maps ``y -> log((y-lo)/(hi-y))``. The inverse is the scaled
-    sigmoid ``lo + (hi-lo)*expit(x)`` with the sigmoid output clamped into
-    the open unit interval (``expit`` saturates to exactly 1.0 for inputs
-    above ~36.7), applied to every numeric value column of forecast frames —
-    point and interval columns alike land strictly inside ``(lo, hi)``.
+    sigmoid ``lo + (hi-lo)*expit(x)`` (``expit`` saturates to exactly 1.0 for
+    inputs above ~36.7), clamped to the representable neighbours of the
+    bounds, applied to every numeric value column of forecast frames — point
+    and interval columns alike land strictly inside ``(lo, hi)``.
     """
 
     def __init__(
@@ -366,6 +442,7 @@ class LogitTransform(BaseTransform):
                     f"series {uid!r} has values outside the logit bounds "
                     f"[{lo}, {hi}]: observed range [{ymin}, {ymax}]"
                 )
+        self._record_passthrough(df)
         self._is_fitted = True
         return self
 
@@ -389,7 +466,12 @@ class LogitTransform(BaseTransform):
             # into the open unit interval so results stay strictly inside.
             finfo = np.finfo(float)
             p = np.clip(expit(vals), finfo.tiny, 1.0 - finfo.epsneg)
-            return lo + (hi - lo) * p
+            # Clamping p is not enough once lo != 0: rescaling reintroduces the
+            # rounding, e.g. 0.5 + 0.5*(1 - epsneg) rounds back up to exactly
+            # 1.0. Clamp the rescaled value to the floats adjacent to the
+            # bounds so the result is strictly inside for every (lo, hi).
+            v = lo + (hi - lo) * p
+            return np.clip(v, np.nextafter(lo, hi), np.nextafter(hi, lo))
 
         return self._apply_per_series(df, _sigmoid, inverse=True)
 

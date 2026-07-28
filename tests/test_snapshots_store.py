@@ -270,3 +270,109 @@ def test_manifest_without_ds_unit_still_loads(tmp_path):
     loaded = store.load()
     assert set(loaded["y"]) == {1.0, 2.0, 3.0, 4.0}
     assert pd.api.types.is_datetime64_any_dtype(loaded["ds"])
+
+
+class TestManifestAtomicity:
+    """``manifest.json`` must never be destroyed by a failed rewrite.
+
+    ``_write_manifest`` used to open the real manifest with mode ``'w'``
+    (truncate) and re-dump the whole entry list on every ``snapshot()``, so a
+    crash / ENOSPC mid-``json.dump`` left a half-written manifest on disk and
+    every read API (``load``/``history``/``manifest``/``as_of_dates``) raised
+    ``corrupt snapshot manifest`` — orphaning every snapshot already in the
+    store even though all the parquet files were intact. The correct behaviour
+    for an append-only audit trail is all-or-nothing: a failed write leaves the
+    previous complete manifest in place.
+    """
+
+    def test_failed_manifest_write_leaves_the_previous_manifest_intact(
+        self, tmp_path, monkeypatch
+    ):
+        store = SnapshotStore(tmp_path)
+        store.snapshot(_panel([1, 2, 3, 4]), as_of="2024-01-15")
+        store.snapshot(_panel([5, 6, 7, 8]), as_of="2024-02-15")
+        before = store.manifest()
+        raw_before = (tmp_path / "manifest.json").read_bytes()
+
+        def boom(obj, fp, **kwargs):
+            fp.write('[{"as_of": "2024-')  # partial write, then die
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(store_module.json, "dump", boom)
+        with pytest.raises(OSError):
+            store.snapshot(_panel([9, 9, 9, 9]), as_of="2024-03-15")
+        monkeypatch.undo()
+
+        # the manifest on disk is byte-identical to the pre-crash one
+        assert (tmp_path / "manifest.json").read_bytes() == raw_before
+        # ... and every read API still works
+        pd.testing.assert_frame_equal(store.manifest(), before)
+        assert store.as_of_dates() == [
+            pd.Timestamp("2024-01-15"),
+            pd.Timestamp("2024-02-15"),
+        ]
+        assert set(store.load(as_of="2024-02-15")["y"]) == {5.0, 6.0, 7.0, 8.0}
+        assert len(store.history()) == 8
+
+    def test_no_temp_file_is_left_behind(self, tmp_path, monkeypatch):
+        store = SnapshotStore(tmp_path)
+        store.snapshot(_panel([1, 2, 3, 4]), as_of="2024-01-15")
+        # a successful write leaves only manifest.json
+        assert sorted(p.name for p in tmp_path.glob("manifest*")) == ["manifest.json"]
+
+        def boom(obj, fp, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(store_module.json, "dump", boom)
+        with pytest.raises(OSError):
+            store.snapshot(_panel([2, 2, 2, 2]), as_of="2024-02-15")
+        monkeypatch.undo()
+        assert sorted(p.name for p in tmp_path.glob("manifest*")) == ["manifest.json"]
+
+
+class TestHistoryLatestOnly:
+    """``history()`` stacks every revision of a re-snapshotted ``as_of``.
+
+    That is deliberate (the store is an audit trail) but there was no way to
+    ask for the latest-per-``as_of`` view that ``load()`` gives, so feeding
+    ``history()`` into ``accuracy_over_time`` double-counted a revised as-of.
+    ``latest_only=True`` opts into ``load()``'s "last manifest match wins"
+    rule; the default keeps the historical stacking behaviour.
+    """
+
+    def test_default_still_stacks_every_revision(self, tmp_path):
+        store = SnapshotStore(tmp_path)
+        store.snapshot(_panel([1, 1, 1, 1]), as_of="2024-02-15")
+        store.snapshot(_panel([9, 9, 9, 9]), as_of="2024-02-15")
+        hist = store.history()
+        assert len(hist) == 8
+        assert set(hist["y"]) == {1.0, 9.0}
+
+    def test_latest_only_keeps_one_snapshot_per_as_of(self, tmp_path):
+        store = SnapshotStore(tmp_path)
+        store.snapshot(_panel([1, 1, 1, 1]), as_of="2024-02-15")
+        store.snapshot(_panel([9, 9, 9, 9]), as_of="2024-02-15")
+        store.snapshot(_panel([2, 2, 2, 2]), as_of="2024-03-15")
+
+        hist = store.history(latest_only=True)
+        assert len(hist) == 8  # two as_of dates x 4 rows, not three snapshots
+        assert set(pd.to_datetime(hist["as_of"].unique())) == {
+            pd.Timestamp("2024-02-15"),
+            pd.Timestamp("2024-03-15"),
+        }
+        # the revision wins for 2024-02-15, matching load()
+        feb = hist[hist["as_of"] == pd.Timestamp("2024-02-15")]
+        assert set(feb["y"]) == {9.0}
+        assert set(feb["y"]) == set(store.load(as_of="2024-02-15")["y"])
+
+    def test_latest_only_composes_with_the_series_filter(self, tmp_path):
+        store = SnapshotStore(tmp_path)
+        store.snapshot(_panel([1, 1, 1, 1]), as_of="2024-02-15")
+        store.snapshot(_panel([9, 9, 9, 9]), as_of="2024-02-15")
+        hist = store.history(series="a", latest_only=True)
+        assert set(hist["unique_id"]) == {"a"}
+        assert set(hist["y"]) == {9.0}
+
+    def test_latest_only_on_an_empty_store_returns_an_empty_frame(self, tmp_path):
+        store = SnapshotStore(tmp_path)
+        assert store.history(latest_only=True).empty

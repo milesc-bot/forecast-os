@@ -201,6 +201,32 @@ def test_autoets_prefers_trend_model_on_trending_data(trend_panel):
         assert state["winner_name"] == "Holt"
 
 
+def test_autoets_fits_at_exactly_min_train_size():
+    """``min_train_size`` was 3, but no candidate can be fitted on three rows.
+
+    ``_fit_series`` skips any candidate whose AICc correction 2k(k+1)/(n-k-1)
+    is undefined (n - k - 1 <= 0), and the cheapest candidate is SES with k = 2.
+    At n = 3 that skipped every candidate, so the base-class size guard admitted
+    the series and the fit then died with the opaque "no ETS candidate could be
+    fitted" — for EVERY 3-point series, not just degenerate ones. The declared
+    minimum must be one a caller can actually fit on.
+    """
+    n = AutoETS.min_train_size
+    assert n == 4
+    for y in ([1.0, 2.0, 3.0, 4.0], [5.0, 5.0, 5.0, 5.0], [10.0, 12.0, 11.0, 9.0]):
+        pred = AutoETS().fit(to_panel(np.asarray(y[:n]))).predict(3)
+        assert np.isfinite(pred["yhat"]).all()
+
+
+def test_autoets_below_min_train_size_raises_the_size_guard():
+    """Short series get the documented size message, not the candidate message."""
+    short = to_panel(np.array([1.0, 2.0, 3.0]))
+    with pytest.raises(ForecastOSError, match="requires at least 4 observations"):
+        AutoETS().fit(short)
+    with pytest.raises(ForecastOSError, match="requires at least 4 observations"):
+        AutoETS(season_length=2).fit(short)
+
+
 def test_autoets_sigma_delegation_uses_winner_formula(trend_panel):
     # AutoETS delegates _predict_sigma to the winner, so a Holt winner must
     # produce horizon-growing (not constant) interval widths.

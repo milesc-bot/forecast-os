@@ -212,3 +212,49 @@ def test_methods_reject_non_datetime():
 def test_features_requires_ds_column():
     with pytest.raises(ForecastOSError):
         FiscalCalendar().features(pd.DataFrame({"unique_id": ["a"], "y": [1.0]}))
+
+
+# -- timezone-aware and NaT ds -------------------------------------------------
+
+
+@pytest.mark.parametrize("scheme", ["calendar", "4-4-5"])
+def test_tz_aware_ds_matches_naive_wall_clock(scheme):
+    """A tz-aware ``ds`` used to blow up with raw numpy/stdlib errors
+    (``ufunc 'subtract' cannot use operands with types dtype('O')...`` for
+    ``features``, ``can't compare offset-naive and offset-aware datetimes`` for
+    the whole 4-4-5 scheme) even though such a panel passes ``validate_panel``
+    and works end to end through the rest of the library. Fiscal buckets are
+    wall-clock buckets, so tz-aware input must give the same answer as the same
+    local timestamps with the zone dropped."""
+    naive = pd.date_range("2026-01-01", periods=40, freq="10D")
+    aware = naive.tz_localize("US/Eastern")
+    cal = FiscalCalendar(start_month=2, scheme=scheme)
+
+    np.testing.assert_array_equal(cal.fiscal_year(aware), cal.fiscal_year(naive))
+    np.testing.assert_array_equal(cal.fiscal_quarter(aware), cal.fiscal_quarter(naive))
+    np.testing.assert_array_equal(cal.fiscal_period(aware), cal.fiscal_period(naive))
+    pd.testing.assert_index_equal(cal.quarter_end(aware), cal.quarter_end(naive))
+
+    y = np.arange(len(naive), dtype=float)
+    out_aware = cal.features(pd.DataFrame({"unique_id": "a", "ds": aware, "y": y}))
+    out_naive = cal.features(pd.DataFrame({"unique_id": "a", "ds": naive, "y": y}))
+    for col in FEATURE_COLS:
+        np.testing.assert_allclose(
+            out_aware[col].to_numpy(dtype=float), out_naive[col].to_numpy(dtype=float)
+        )
+    # the caller's own ds column keeps its zone
+    assert out_aware["ds"].dt.tz is not None
+
+
+@pytest.mark.parametrize("scheme", ["calendar", "4-4-5"])
+def test_nat_ds_raises_instead_of_fabricating_a_fiscal_year(scheme):
+    """``fiscal_year`` used to return 0 for a NaT row (NaN cast to int) and
+    ``fiscal_quarter`` then died with a bare ``ValueError: Unknown format code
+    'd'``. A missing timestamp falls in no fiscal quarter, so refuse it."""
+    cal = FiscalCalendar(start_month=2, scheme=scheme)
+    ds = pd.to_datetime(["2026-01-15", None, "2026-03-15"])
+    for call in (cal.fiscal_year, cal.fiscal_quarter, cal.quarter_end, cal.fiscal_period):
+        with pytest.raises(ForecastOSError, match="NaT"):
+            call(ds)
+    with pytest.raises(ForecastOSError, match="NaT"):
+        cal.features(pd.DataFrame({"unique_id": "a", "ds": ds, "y": [1.0, 2.0, 3.0]}))

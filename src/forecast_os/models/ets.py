@@ -266,7 +266,13 @@ class AutoETS(PerSeriesForecaster):
     seasonal component.
     """
 
-    min_train_size = 3
+    # The AICc small-sample correction 2k(k+1)/(n-k-1) is undefined at
+    # n <= k + 1, so `_fit_series` skips any candidate failing that guard. The
+    # cheapest candidate is SES with k = 2, hence no candidate at all survives
+    # below n = 4 and the declared minimum has to match: at 3 the size guard in
+    # `PerSeriesForecaster.fit` let the series through only to fail later with
+    # "no ETS candidate could be fitted".
+    min_train_size = 4
 
     def __init__(self, season_length: int | None = None):
         self.season_length = season_length

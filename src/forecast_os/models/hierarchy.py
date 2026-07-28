@@ -8,8 +8,10 @@ series are the leaves and the only aggregate is the total.
 
 :func:`aggregate_panel` materializes every ancestor level of a leaf panel;
 :class:`HierarchicalReconciler` wraps any registered forecaster and returns
-forecasts for ALL nodes that are coherent — for every parent, the children's
-forecasts sum exactly to the parent's.
+forecasts for ALL nodes whose POINT forecasts are coherent — for every
+parent, the children's ``yhat`` sums exactly to the parent's. Interval
+bounds are a separate per-column projection and are not additive; see
+:class:`HierarchicalReconciler` for what they do guarantee.
 """
 
 from __future__ import annotations
@@ -119,8 +121,11 @@ class HierarchicalReconciler(BaseForecaster):
     with no separator is a single-level hierarchy of leaves + total). The
     member ``model`` may be a forecaster instance or a registry-name string;
     strings are resolved with :func:`get_model` lazily inside :meth:`fit`.
-    ``predict`` returns forecasts for ALL nodes (leaves, interior, total),
-    coherent to floating-point accuracy: children sum to their parent.
+    ``predict`` returns forecasts for ALL nodes (leaves, interior, total).
+    The POINT forecasts are coherent to floating-point accuracy: children's
+    ``yhat`` sums to their parent's. That guarantee covers ``yhat`` only —
+    ``lo``/``hi`` are projected per column and then repaired for ordering,
+    which can leave them non-additive (see "Intervals" below).
 
     Methods:
 
@@ -149,6 +154,15 @@ class HierarchicalReconciler(BaseForecaster):
     then enforces monotone nesting across levels — each higher confidence
     band contains every lower one — because the per-column projection can
     otherwise leave a 50% bound outside the 90% band.
+
+    So the bounds guarantee ordering and nesting, NOT additivity: under
+    ``mint_ols`` the projection can invert a leaf band (``lo`` above ``hi``),
+    and once the guard repairs that row no per-row fix can restore both
+    ordering and additivity. Ordering is the invariant kept, deliberately —
+    a lower bound above its upper bound is unusable output, whereas additive
+    quantiles are not a statistical property anyway (the quantile of a sum is
+    not the sum of the quantiles). Do not sum children's ``lo``/``hi`` and
+    expect the parent's.
     """
 
     def __init__(self, model="auto_ets", method="mint_ols", sep="/", total_id="total"):

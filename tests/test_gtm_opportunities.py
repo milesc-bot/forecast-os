@@ -676,3 +676,106 @@ def test_weighted_pipeline_interval_stays_within_attainable_support():
     total = weighted_pipeline(deals, proba=proba, level=80)
     assert total["hi-80"].iloc[0] <= deals["amount"].sum() + 1e-6
     assert total["lo-80"].iloc[0] >= 0.0
+
+
+class TestNegativeAmountSupport:
+    """Regressions for the interval clamp on negative-amount deals (v0.9.0 audit SHOULD-1).
+
+    The clamp hard-coded the attainable support as ``[0, sum(amount)]``, which is
+    only the true support when every amount is non-negative. A downsell/credit
+    opportunity (``amount < 0``) made ``sum(amount)`` the LOW end of the support,
+    so the code clamped ``lo`` up to 0 and ``hi`` down to a negative total: the
+    interval came back inverted (``hi < lo``) with the point forecast outside its
+    own band. The true support is ``[sum of negative amounts, sum of positive
+    amounts]``, which keeps ``lo <= expected <= hi`` by construction and is
+    unchanged for the all-non-negative case.
+    """
+
+    def test_single_negative_deal_interval_is_not_inverted(self):
+        deals = pd.DataFrame({"opp_id": [1], "amount": [-100.0]})
+        res = weighted_pipeline(deals, proba=[0.5], level=80)
+        lo, hi, expected = res["lo-80"].iloc[0], res["hi-80"].iloc[0], res["expected"].iloc[0]
+        assert expected == pytest.approx(-50.0)
+        # realized won-$ is either -100 or 0, so the support is [-100, 0]
+        assert lo == pytest.approx(-100.0)
+        assert hi == pytest.approx(0.0)
+        assert lo <= expected <= hi
+
+    def test_mixed_sign_group_keeps_a_positive_width_interval(self):
+        # won-$ distribution is {-100, 0, 0, +100}: sd 70.7, not a point mass.
+        deals = pd.DataFrame({"opp_id": [1, 2], "amount": [100.0, -100.0]})
+        res = weighted_pipeline(deals, proba=[0.5, 0.5], level=80)
+        lo, hi = res["lo-80"].iloc[0], res["hi-80"].iloc[0]
+        assert res["expected"].iloc[0] == pytest.approx(0.0)
+        sd = float(np.sqrt(0.25 * 100.0**2 + 0.25 * 100.0**2))
+        assert lo == pytest.approx(max(-Z80 * sd, -100.0))
+        assert hi == pytest.approx(min(Z80 * sd, 100.0))
+        assert hi - lo > 0.0
+
+    def test_lo_le_expected_le_hi_for_every_segment(self):
+        rng = np.random.default_rng(11)
+        n = 60
+        amount = rng.uniform(-2e4, 5e4, n)
+        proba = rng.uniform(0.05, 0.95, n)
+        deals = pd.DataFrame(
+            {"opp_id": np.arange(n), "amount": amount, "region": rng.choice(list("ABC"), n)}
+        )
+        for level in (50, 80, 95):
+            res = weighted_pipeline(deals, proba=proba, by="region", level=level)
+            lo, hi = res[f"lo-{level}"].to_numpy(), res[f"hi-{level}"].to_numpy()
+            assert np.all(lo <= res["expected"].to_numpy() + 1e-9)
+            assert np.all(res["expected"].to_numpy() <= hi + 1e-9)
+
+    def test_non_negative_amounts_clamp_exactly_as_before(self):
+        deals = pd.DataFrame({"opp_id": [0], "amount": [100.0]})
+        res = weighted_pipeline(deals, proba=[0.5], level=80)
+        assert res["lo-80"].iloc[0] == 0.0
+        assert res["hi-80"].iloc[0] == pytest.approx(100.0)
+
+
+class TestGroupingColumnNameCollisions:
+    """Regressions for `by` columns named like internal/output columns (v0.9.0 audit NIT-6).
+
+    ``work`` carried the segment columns alongside the internal ``_pa``/``_var``/
+    ``_amt`` statistics and the output was assembled by assigning into the same
+    frame, so a segment column named after either kind was clobbered: ``by='n_deals'``
+    returned the deal COUNTS in the segment column (losing segment identity
+    silently), ``by='_amt'`` with a numeric column clamped ``hi`` to that column's
+    values instead of the deal totals (a silently wrong interval), and several
+    other names raised raw TypeErrors from inside pandas/numpy. Internal names can
+    no longer collide at all; an output-name collision is now a clear error.
+    """
+
+    def _deals(self, extra_name):
+        return pd.DataFrame(
+            {"opp_id": [1, 2], "amount": [100.0, 200.0], extra_name: ["A", "B"]}
+        )
+
+    @pytest.mark.parametrize("name", ["_pa", "_var", "_pos", "_neg", "_amt"])
+    def test_internal_name_collision_still_segments_correctly(self, name):
+        res = weighted_pipeline(self._deals(name), proba=[0.5, 0.5], by=name, level=80)
+        assert list(res[name]) == ["A", "B"]
+        assert list(res["expected"]) == pytest.approx([50.0, 100.0])
+        assert list(res["hi-80"]) == pytest.approx([100.0, 200.0])
+        assert list(res["n_deals"]) == [1, 1]
+
+    def test_numeric_internal_name_collision_does_not_clamp_to_the_segment_values(self):
+        deals = pd.DataFrame(
+            {"opp_id": [1, 2], "amount": [100.0, 200.0], "_amt": [7.0, 9.0]}
+        )
+        res = weighted_pipeline(deals, proba=[0.5, 0.5], by="_amt", level=80)
+        # hi is clamped to the DEAL totals (100/200), never to the 7/9 segment keys
+        assert list(res["hi-80"]) == pytest.approx([100.0, 200.0])
+
+    @pytest.mark.parametrize("name", ["expected", "n_deals"])
+    def test_output_name_collision_raises(self, name):
+        with pytest.raises(ForecastOSError, match="collide"):
+            weighted_pipeline(self._deals(name), proba=[0.5, 0.5], by=name)
+
+    def test_interval_column_name_collision_raises_only_when_level_is_given(self):
+        deals = self._deals("lo-80")
+        with pytest.raises(ForecastOSError, match="collide"):
+            weighted_pipeline(deals, proba=[0.5, 0.5], by="lo-80", level=80)
+        # without level there are no interval columns, so nothing collides
+        res = weighted_pipeline(deals, proba=[0.5, 0.5], by="lo-80")
+        assert list(res["lo-80"]) == ["A", "B"]

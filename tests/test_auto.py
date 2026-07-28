@@ -44,6 +44,28 @@ class _IncDummy(PerSeriesForecaster):
         return state["last"] + np.arange(1, h + 1, dtype=float)
 
 
+class _UnderDummy(PerSeriesForecaster):
+    """Sandbagging candidate: forecasts 1000 below the last observed value."""
+
+    alias = "_test_under"
+
+    def _fit_series(self, y):
+        return {"last": float(y[-1])}
+
+    def _predict_series(self, state, h):
+        return np.full(h, state["last"] - 1000.0)
+
+
+def _noisy_level(length: int = 40) -> pd.DataFrame:
+    """Level series with noise, so _LastDummy is good but not perfect.
+
+    A perfect forecast scores nan on tracking_signal (MAD 0) and would be
+    dropped from the ranking, which would not exercise the signed-metric path.
+    """
+    rng = np.random.default_rng(7)
+    return to_panel(100.0 + rng.normal(0, 1.0, length), unique_id="A")
+
+
 def _two_series(length: int) -> pd.DataFrame:
     a = to_panel(np.full(length, 5.0), unique_id="A")  # _LastDummy is exact
     b = to_panel(np.arange(length, dtype=float), unique_id="B")  # _IncDummy is exact
@@ -98,10 +120,126 @@ def test_unknown_string_candidate_fails_at_fit_not_construct():
         auto.fit(_two_series(40))
 
 
+class _PartialNaN(PerSeriesForecaster):
+    """Contract-violating candidate: forecasts step 1, NaN for every later step."""
+
+    alias = "_test_partial_nan"
+
+    def _fit_series(self, y):
+        return {"last": float(y[-1])}
+
+    def _predict_series(self, state, h):
+        out = np.full(h, np.nan)
+        out[0] = state["last"]
+        return out
+
+
+def _random_walk(n: int = 60) -> pd.DataFrame:
+    rng = np.random.default_rng(0)
+    return to_panel(np.cumsum(rng.normal(0, 1.0, n)) + 100, unique_id="A")
+
+
+@pytest.mark.parametrize(("val_h", "n_windows"), [(6, 2), (12, 2)])
+def test_partial_coverage_candidate_cannot_win(val_h, n_windows):
+    """A candidate scored on a subset of the window must not beat a full one.
+
+    ``evaluate`` drops NaN rows per model column, so a candidate that returns
+    NaN for the hard long-horizon steps was scored only on the easy step-1
+    rows it did produce (2 of 12) while an honest candidate was scored on all
+    12. On the rows both produced they were numerically identical, yet the
+    lazy one won on mase and AutoSelect refitted it. Coverage is not
+    comparable across candidates, so a short-covering candidate is excluded
+    from the argmin (and warned about) instead of competing on an easier
+    subset. Parametrised over both scoring schemes: (6, 2) exercises the CV
+    path, (12, 2) the 75/25 holdout fallback.
+    """
+    df = _random_walk()
+    auto = AutoSelect(
+        candidates=(_LastDummy(), _PartialNaN()), val_h=val_h, n_windows=n_windows
+    )
+    with pytest.warns(UserWarning, match="part of the validation window"):
+        auto.fit(df)
+    assert auto.best_models_ == {"A": "_test_last"}
+
+
+def test_full_coverage_candidates_do_not_warn():
+    """The coverage guard must stay silent for well-behaved candidates."""
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", UserWarning)
+        AutoSelect(candidates=(_LastDummy(), _IncDummy()), val_h=6, n_windows=2).fit(
+            _two_series(40)
+        )
+
+
 def test_duplicate_candidate_names_raise():
     auto = AutoSelect(candidates=(_LastDummy(), _LastDummy()), val_h=6, n_windows=2)
     with pytest.raises(ValueError, match="duplicate"):
         auto.fit(_two_series(40))
+
+
+@pytest.mark.parametrize("metric", ["bias", "pct_bias", "tracking_signal"])
+def test_signed_metrics_selected_on_absolute_value(metric):
+    """A signed metric selects the LEAST biased candidate, not the argmin.
+
+    ``bias``/``pct_bias``/``tracking_signal`` are documented by metrics.py as
+    signed — they expose the direction of systematic under/over-forecasting —
+    so a raw ``idxmin`` picks the most severely under-forecasting candidate.
+    Against ``_UnderDummy`` (1000 below truth every step) v0.9.0 silently
+    selected the sandbagger: no error, no warning, provably the worst pick.
+    Ranking by |metric| fixes the selection while keeping these v0.9.0 calls
+    working — rejecting them at construction broke a published API for a bug
+    that has a correct answer (closest to zero is least biased).
+    """
+    df = _noisy_level()
+    auto = AutoSelect(
+        candidates=(_LastDummy(), _UnderDummy()), metric=metric, val_h=6, n_windows=2
+    )
+    auto.fit(df)
+    assert auto.best_models_ == {"A": "_test_last"}
+
+
+def test_signed_metric_construction_does_not_raise():
+    """v0.9.0 backward compatibility: constructing with a signed metric works."""
+    for metric in ("bias", "pct_bias", "tracking_signal"):
+        assert AutoSelect(candidates=(_LastDummy(),), metric=metric).metric == metric
+
+
+def test_signed_metric_argmin_would_pick_the_sandbagger():
+    """Pins WHY |metric| is needed: the raw scores favour the under-forecaster.
+
+    Guards against the test above passing for the wrong reason (e.g. if the
+    sandbagging candidate stopped being the raw argmin, the fix would no
+    longer be under test).
+    """
+    df = _noisy_level()
+    scores = fos.evaluate(
+        fos.cross_validation(df, [_LastDummy(), _UnderDummy()], h=6, n_windows=2),
+        metrics=["bias"],
+    )
+    row = scores.set_index(ID_COL).loc["A"]
+    assert row["_test_under"] < row["_test_last"]  # raw argmin = the sandbagger
+    assert abs(row["_test_last"]) < abs(row["_test_under"])  # |bias| argmin = honest
+
+
+@pytest.mark.parametrize("metric", ["coverage", "winkler", "pinball", "crps"])
+def test_interval_metrics_rejected(metric):
+    """Interval metrics cannot be scored: AutoSelect never requests lo/hi.
+
+    These previously blew up deep inside fit() with 'interval metrics need
+    lo/hi columns ... pass level=[...]', advice the caller has no way to act
+    on because AutoSelect's validation pass does not thread ``level`` into
+    cross_validation. Reject at construction with an accurate reason instead.
+    """
+    with pytest.raises(ValueError, match="interval metric"):
+        AutoSelect(candidates=(_LastDummy(),), metric=metric)
+
+
+def test_lower_is_better_point_metrics_accepted():
+    """The orientation guard must not reject the metrics that do work."""
+    for metric in ("mae", "rmse", "mape", "smape", "mase", "rmsse"):
+        assert AutoSelect(candidates=(_LastDummy(),), metric=metric).metric == metric
 
 
 def test_predict_before_fit_raises():
@@ -361,11 +499,18 @@ def test_cv_span_boundary_falls_back_to_the_documented_holdout(monkeypatch):
 
 
 def test_cv_still_used_once_the_first_fold_can_fit_the_pool(monkeypatch):
-    """CV must not be abandoned wholesale: it still runs as soon as it is sound."""
+    """CV must not be abandoned wholesale: it still runs as soon as it is sound.
+
+    The fold width is chosen to clear ``max(min_train_size) + _CV_TRAIN_MARGIN``
+    for the default pool rather than to sit exactly on it: the boundary moves
+    whenever a candidate corrects its declared minimum (AutoETS went from an
+    understated 3 to an honest 4), and this test is about "CV is still used
+    when the fold fits", not about the exact row on which that starts.
+    """
     captured = _spy_evaluate(monkeypatch)
-    df = _monthly_panel({"s1": 28})  # span = 24 -> first fold trains on 4 rows
+    df = _monthly_panel({"s1": 29})  # span = 24 -> first fold trains on 5 rows
     AutoSelect().fit(df)
-    assert (captured["train_df"].groupby(ID_COL).size() == 4).all()
+    assert (captured["train_df"].groupby(ID_COL).size() == 5).all()
 
 
 def _daily_seasonal_panel(n: int) -> pd.DataFrame:

@@ -51,6 +51,19 @@ so ``won``/``lost`` here show the pipeline REDUCTION (their ``before`` value),
 not the booked revenue. :func:`waterfall_summary` wraps the categories with
 opening/closing anchor rows and a running total, ready to render as a bridge.
 
+Read the ``n_deals`` counts with that in mind. Classification is a function of
+the ``after`` state alone, so a deal that was ALREADY won, lost or gone before
+the period still lands in ``won``/``lost``/``removed`` — contributing ``0``,
+because nothing left the open pipeline this period. Those three counts are
+therefore "deals closed/dropped AS OF ``after``", not "deals closed this
+period", and they grow with every historical deal the snapshots carry: a
+``won`` row can read ``247 deals / $0`` in a period where three deals were
+actually won. This is deliberate — dropping the already-closed deals would
+break the partition guarantee below — but if you want period-only counts for a
+chart label, filter both snapshots to deals that are open in ``before`` or
+changed state during the period before bridging. The dollar figures need no
+such filtering: they are already period-only.
+
 Because that identity is the point of the bridge, a null (``NaN``/``pd.NA``)
 ``amount`` on a deal that is OPEN in either snapshot is a
 :class:`DataContractError`, not a zero: an amount that is merely missing has no
@@ -263,6 +276,11 @@ def pipeline_waterfall(
     signed contribution to the open-pipeline total. The categories partition
     the deal universe, so ``n_deals`` sums to the number of distinct deals and
     ``amount`` sums to ``closing_open_pipeline - opening_open_pipeline``.
+
+    Because that partition covers every deal in both snapshots, the
+    ``won``/``lost``/``removed`` counts include deals that were already closed
+    or gone in ``before`` (they contribute ``0``); those counts are "closed as
+    of ``after``", not "closed this period". See the module docstring.
     """
     closed = {s for s in (won_stage, lost_stage) if s is not None}
     _require_deals(before, "before", id_col, amount_col, stage_col, close_col, closed)

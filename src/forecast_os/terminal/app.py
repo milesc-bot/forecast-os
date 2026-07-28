@@ -122,6 +122,9 @@ if _HAS_TEXTUAL:
             self.last_refresh: str | None = None
             self._board_working = False
             self._governance_working = False
+            # bumped by every refresh; workers capture it at start so a result
+            # computed from the pre-refresh panel can be recognised and dropped
+            self._generation = 0
             self._drill_target: str | None = None
             self._save_note: str | None = None
 
@@ -142,6 +145,7 @@ if _HAS_TEXTUAL:
 
         def action_refresh(self) -> None:
             """Reload sources and recompute everything off the UI thread."""
+            self._generation += 1
             self.board = None
             self.governance = None
             self.refreshing = True
@@ -205,6 +209,12 @@ if _HAS_TEXTUAL:
 
         @work(thread=True, exclusive=True, group="refresh")
         def _refresh_worker(self) -> None:
+            # exclusive=True cannot cancel a thread worker mid-run, so two
+            # overlapping refreshes both finish and the slower one can land
+            # last. Stamp the result with the generation this worker started
+            # on so a superseded refresh can be dropped instead of reinstating
+            # its older panel.
+            generation = self._generation
             settings = self.workspace.settings
             alerts = self.workspace.alerts
             try:
@@ -218,11 +228,21 @@ if _HAS_TEXTUAL:
                     panel, forecasts, alerts, governance=governance
                 )
             except Exception as exc:
-                self.call_from_thread(self._refresh_failed, exc)
+                self.call_from_thread(self._refresh_failed, exc, generation)
                 return
-            self.call_from_thread(self._apply_refresh, panel, rows, fired, governance)
+            self.call_from_thread(
+                self._apply_refresh, panel, rows, fired, governance, generation
+            )
 
-        def _apply_refresh(self, panel, rows, fired, governance) -> None:
+        def _apply_refresh(
+            self, panel, rows, fired, governance, generation: int | None = None
+        ) -> None:
+            if generation is not None and generation != self._generation:
+                # a newer refresh superseded this one: installing this panel
+                # would roll the console back to older data (and its
+                # governance frame past the _apply_governance guard). Leave
+                # `refreshing` set — the newer worker clears it when it lands.
+                return
             self.panel = panel
             self.rows = rows
             self.fired_alerts = fired
@@ -234,7 +254,11 @@ if _HAS_TEXTUAL:
             self._update_status()
             self._update_active_screen()
 
-        def _refresh_failed(self, exc: Exception) -> None:
+        def _refresh_failed(self, exc: Exception, generation: int | None = None) -> None:
+            if generation is not None and generation != self._generation:
+                # a superseded refresh failing must not clobber the alerts a
+                # newer, successful refresh already published
+                return
             self.fired_alerts = [f"refresh failed: {exc}"]
             self.refreshing = False
             self.alerts_count = len(self.fired_alerts)
@@ -242,29 +266,55 @@ if _HAS_TEXTUAL:
             self._update_active_screen()
 
         def request_board(self) -> None:
-            """Compute the leaderboard in a worker (no-op while one is running)."""
-            if self.board is None and self.panel is not None and not self._board_working:
+            """Compute the leaderboard in a worker.
+
+            A no-op while one is already running, and while a refresh is in
+            flight: ``self.panel`` is still the pre-refresh one then, so the
+            board would be computed from stale data yet stamped with the
+            post-refresh generation, which the ``_apply_board`` guard cannot
+            detect. ``_apply_refresh`` re-renders the active screen, and the
+            screen re-requests because ``board`` is still ``None``.
+            """
+            if (
+                self.board is None
+                and self.panel is not None
+                and not self.refreshing
+                and not self._board_working
+            ):
                 self._board_working = True
                 self._board_worker()
 
         @work(thread=True, exclusive=True, group="board")
         def _board_worker(self) -> None:
+            generation = self._generation
             try:
                 board = engine_bridge.leaderboard_frame(self.panel, self.workspace.settings)
             except Exception as exc:
                 board = ComputeFailure(str(exc))
-            self.call_from_thread(self._apply_board, board)
+            self.call_from_thread(self._apply_board, board, generation)
 
-        def _apply_board(self, board) -> None:
+        def _apply_board(self, board, generation: int | None = None) -> None:
             self._board_working = False
+            if generation is not None and generation != self._generation:
+                # a refresh landed while this worker ran: its board describes the
+                # pre-refresh panel. Leave self.board at None and let the active
+                # screen re-request, rather than resurrecting a stale board that
+                # request_board() would then never recompute.
+                self._update_active_screen()
+                return
             self.board = board  # DataFrame or ComputeFailure — never back to None
             self._update_active_screen()
 
         def request_governance(self) -> None:
-            """Compute the governance frame in a worker (no-op while one is running)."""
+            """Compute the governance frame in a worker.
+
+            A no-op while one is already running or a refresh is in flight —
+            see :meth:`request_board` for why the in-flight case matters.
+            """
             if (
                 self.governance is None
                 and self.panel is not None
+                and not self.refreshing
                 and not self._governance_working
             ):
                 self._governance_working = True
@@ -272,16 +322,21 @@ if _HAS_TEXTUAL:
 
         @work(thread=True, exclusive=True, group="governance")
         def _governance_worker(self) -> None:
+            generation = self._generation
             try:
                 governance = engine_bridge.governance_frame(
                     self.panel, self.workspace.settings
                 )
             except Exception as exc:
                 governance = ComputeFailure(str(exc))
-            self.call_from_thread(self._apply_governance, governance)
+            self.call_from_thread(self._apply_governance, governance, generation)
 
-        def _apply_governance(self, governance) -> None:
+        def _apply_governance(self, governance, generation: int | None = None) -> None:
             self._governance_working = False
+            if generation is not None and generation != self._generation:
+                # stale: computed from the pre-refresh panel (see _apply_board)
+                self._update_active_screen()
+                return
             self.governance = governance  # DataFrame or ComputeFailure, not None
             self._update_active_screen()
 

@@ -57,6 +57,68 @@ def test_recursive_forecast_finite_h30(panel):
     for col in ("yhat", "lo-80", "hi-80"):
         assert np.isfinite(pred[col]).all()
     assert (pred["lo-80"] <= pred["hi-80"]).all()
+    # Regression: this test used to check finiteness only, which passed while
+    # every horizon reported the identical one-step residual sigma.
+    for _, g in pred.groupby(ID_COL):
+        width = (g["hi-80"] - g["lo-80"]).to_numpy()
+        assert (np.diff(width) >= 0).all()
+        assert width[-1] > width[0]
+
+
+def test_interval_width_grows_with_horizon_on_persistent_series():
+    """RidgeLag reported the one-step sigma at every horizon.
+
+    ``_predict_series`` feeds its own predictions back into the lag window, so
+    a one-step innovation propagates: the h-step variance is
+    sigma^2 * sum_{j<h} psi_j^2 with psi from the fitted lag weights. With no
+    ``_predict_sigma`` the model inherited the flat ``np.full(h, sigma)``
+    fallback, making the h=24 band bit-identical to the h=1 band on an AR(1)
+    with phi=0.8 (nominal-80 coverage measured at 0.60 for h>=6). The correct
+    behaviour is strictly widening intervals whenever the fitted AR weights
+    are non-trivial.
+    """
+    y = _ar1(400, phi=0.8, seed=11)
+    model = RidgeLag(lags=5).fit(to_panel(y))
+    pred = model.predict(24, level=[80])
+    width = (pred["hi-80"] - pred["lo-80"]).to_numpy()
+    assert (np.diff(width) > 0).all()
+    assert width[23] > 1.5 * width[0]
+
+
+def test_interval_width_matches_psi_weight_recursion():
+    """Pin the psi-weight construction (same shape as ARIMA's ``_psi_sigma``).
+
+    Only the ``lags`` leading weights enter: Fourier and exogenous columns are
+    deterministic given the future clock, so they carry no innovation.
+    """
+    lags = 4
+    y = _ar1(300, phi=0.7, seed=3)
+    model = RidgeLag(lags=lags, season_length=7, fourier_k=2).fit(to_panel(y))
+    state = next(iter(model._series_state.values()))
+    h = 12
+    phi = state["w"][:lags] * state["y_std"] / state["x_std"][:lags]
+    psi = np.zeros(h)
+    psi[0] = 1.0
+    for j in range(1, h):
+        psi[j] = sum(phi[i - 1] * psi[j - i] for i in range(1, min(j, lags) + 1))
+    expected = state["_sigma"] * np.sqrt(np.cumsum(psi**2))
+    assert np.allclose(model._predict_sigma(state, h), expected)
+    assert np.isclose(model._predict_sigma(state, h)[0], state["_sigma"])
+
+
+def test_flat_series_keeps_flat_intervals():
+    """Zero fitted lag weights must leave the constant-sigma behaviour intact.
+
+    The psi recursion degenerates to psi = (1, 0, 0, ...) when the model has no
+    autoregressive signal, so the fix must not widen intervals on data whose
+    dynamics do not imply widening.
+    """
+    rng = np.random.default_rng(0)
+    y = rng.normal(size=300)  # iid: fitted lag weights shrink to ~0
+    model = RidgeLag(lags=5, alpha=10.0).fit(to_panel(y))
+    pred = model.predict(20, level=[80])
+    width = (pred["hi-80"] - pred["lo-80"]).to_numpy()
+    assert np.allclose(width, width[0], rtol=0.05)
 
 
 def test_fitted_values_have_lag_warmup(panel):

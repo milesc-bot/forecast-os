@@ -169,6 +169,21 @@ class TestSparkline:
         assert "·" in engine_bridge.sparkline([1.0, float("nan"), 2.0])
         assert engine_bridge.sparkline([]) == ""
 
+    def test_non_positive_width_renders_nothing(self):
+        """width<=0 must render no values, not the whole series.
+
+        What went wrong: the window was taken with ``values[-width:]``, and
+        ``[-0:]`` is ``[0:]`` — the WHOLE array. So ``sparkline(range(20),
+        width=0)`` returned 20 characters and ``width=-2`` returned 18,
+        where the documented contract ("The last ``width`` values as a ...
+        sparkline") implies an empty string. ``sparkline`` is exported in
+        ``__all__``, so this is reachable by any caller sizing a sparkline
+        from a column width that collapsed to zero.
+        """
+        assert engine_bridge.sparkline(range(20), width=0) == ""
+        assert engine_bridge.sparkline(range(20), width=-2) == ""
+        assert len(engine_bridge.sparkline(range(20), width=3)) == 3
+
 
 class TestModelParams:
     def test_season_length_passed_only_when_accepted(self, settings):
@@ -327,6 +342,62 @@ class TestWorkspaceTypeValidation:
         (tmp_path / "workspace.json").write_text(json.dumps(payload))
         with pytest.raises(ForecastOSError, match=field):
             Workspace.load(home=tmp_path)
+
+    @pytest.mark.parametrize(
+        "settings,key",
+        [
+            ({"refresh_seconds": "every 5 minutes"}, "refresh_seconds"),
+            ({"h": "twelve"}, "h"),
+            ({"level": [80, 95]}, "level"),
+            ({"model": 5}, "model"),
+            ({"season_length": "yearly"}, "season_length"),
+            # bool is an int subclass, so int(True) == 1: v0.9.0 mounted
+            # {"h": true} as a 1-period horizon and {"level": true} as a 1%
+            # confidence level. Neither is a horizon or a level a user could
+            # have meant, and silently coercing them hides the typo, so the
+            # bool exclusion in _require_usable_settings is deliberate.
+            ({"h": True}, "h"),
+            ({"level": True}, "level"),
+        ],
+    )
+    def test_unusable_setting_value_raises_named_error(self, tmp_path, settings, key):
+        """A hand-edited setting value must fail in load(), not during mount.
+
+        What went wrong: load() type-checked the containers (sources/watch/
+        alerts/settings) but merged settings VALUES verbatim, then reported
+        success. ForecastOSApp.on_mount then ran
+        ``int(settings.get("refresh_seconds") or 0)`` outside any try, so the
+        TUI died mid-mount with a bare ``ValueError: invalid literal for
+        int()`` and textual's "1 of 2 errors shown" banner. Hand-editing
+        workspace.json is the only way to change these (the terminal package
+        has no settings-editing UI), so a typo there is the expected failure
+        mode — and the class docstring promises "Loading is tolerant".
+
+        Right behaviour: raise ForecastOSError naming the file and the
+        setting, which ``terminal.app.main`` already renders as a clean
+        one-line ``forecast-os-tui: ...`` exit, exactly as it does for the
+        container type errors.
+        """
+        (tmp_path / "workspace.json").write_text(json.dumps({"settings": settings}))
+        with pytest.raises(ForecastOSError, match=key):
+            Workspace.load(home=tmp_path)
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            {"refresh_seconds": 30, "h": 12, "level": 95, "model": "theta"},
+            {"season_length": None, "refresh_seconds": None},  # documented nulls
+            {"h": "12"},  # a JSON string that int() handles is still tolerated
+            {"level": 80.0},  # JSON numbers may arrive as floats
+            {"unknown_future_setting": {"nested": True}},  # forward compatible
+        ],
+    )
+    def test_usable_setting_values_still_load(self, tmp_path, settings):
+        """The guard must not reject values the app has always coped with."""
+        (tmp_path / "workspace.json").write_text(json.dumps({"settings": settings}))
+        ws = Workspace.load(home=tmp_path)
+        for key, value in settings.items():
+            assert ws.settings[key] == value
 
     def test_valid_partial_file_still_merges(self, tmp_path):
         (tmp_path / "workspace.json").write_text(

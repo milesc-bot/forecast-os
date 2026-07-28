@@ -46,7 +46,7 @@ model for any other without changing a line of surrounding code.
   propagation, ETS), plus distribution-free split-conformal calibration for any model.
 - **Evaluation built in** — walk-forward cross-validation and a leaderboard in two
   calls; scaled metrics (MASE, RMSSE) done correctly, and interval quality
-  (coverage, Winkler, pinball, CRPS) scored through the same pipeline.
+  (coverage, Winkler, pinball, WIS) scored through the same pipeline.
 - **Finance is first-class** — GARCH volatility forecasts, GBM scenario simulation,
   bull/bear regime detection, and a strategy backtester that scores any forecaster with
   Sharpe / Sortino / max drawdown / hit rate.
@@ -161,11 +161,11 @@ conf.predict(h=12, level=[90])
 from forecast_os.finance import GARCH11, MonteCarloSimulator, MarkovRegimeSwitching
 import numpy as np
 
-returns = np.diff(np.log(prices))          # your daily log returns
+returns = np.diff(prices) / prices[:-1]    # your daily simple returns
 vol = GARCH11().fit(returns)               # volatility model
 vol.forecast_volatility(h=10)              # next-10-day conditional vol
 
-mc = MonteCarloSimulator.from_returns(returns)
+mc = MonteCarloSimulator.from_returns(returns)   # expects simple returns
 mc.summary(s0=prices[-1], h=252)           # 1-year price quantile fan
 
 regimes = MarkovRegimeSwitching().fit(returns)
@@ -329,8 +329,8 @@ client (Claude Desktop / Claude Code / your agent framework):
 {"mcpServers": {"forecast-os": {"command": "forecast-os-mcp"}}}
 ```
 
-The server exposes `preview_panel`, `forecast`, `compare`, and
-`quota_attainment` tools over CSV paths or inline records, so an agent can
+The server exposes six tools — `preview_panel`, `forecast`, `compare`, `quota`,
+`list_models`, `list_mappings` — over CSV paths or inline records, so an agent can
 map a raw export, sanity-check the panel, rank models, and report quota
 attainment probability without writing pandas.
 

@@ -549,6 +549,153 @@ def test_agg_without_freq_rejects_rows_with_a_null_ds(undated_crm_csv, capsys):
     assert "null" in err and "ds" in err
 
 
+# -- null unique_id (regression: --agg/--freq silently deleted unidentified rows) --
+
+
+@pytest.fixture
+def unassigned_crm_csv(tmp_path):
+    """CRM export where one deal has no owner in the Rep column."""
+    path = tmp_path / "unassigned.csv"
+    pd.DataFrame(
+        {
+            "Rep": ["alice", "alice", "", "bob", "bob"],
+            "Close Date": [
+                "2024-01-01", "2024-02-01", "2024-01-01", "2024-01-01", "2024-02-01",
+            ],
+            "Amount": [10.0, 20.0, 999.0, 5.0, 7.0],
+        }
+    ).to_csv(path, index=False)
+    return path
+
+
+def test_agg_rejects_rows_with_a_null_unique_id(unassigned_crm_csv, capsys):
+    """A blank owner cell must be reported, not quietly deleted by --agg.
+
+    What went wrong: ``_aggregate``'s groupby defaults to ``dropna=True``, so
+    a row with a blank mapped id vanished with its y. This export sums to
+    1041.0 and the CLI printed a panel summing to 42.0 with exit status 0 —
+    the 999.0 row simply gone, no warning.
+
+    Why raising is right: without ``--agg`` this very file already exits 2,
+    because ``validate_panel`` rejects null keys ("every row must name the
+    series it belongs to"). So ``--agg`` was silently *bypassing* a contract
+    check the plain path enforces; the two paths must agree, and only the
+    user can say whether to drop the row or assign it an owner.
+    """
+    rc = main(
+        [
+            "forecast", str(unassigned_crm_csv), "--h", "1", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "1 row(s)" in err and "unique_id" in err
+    assert "Traceback" not in err
+
+
+def test_freq_rejects_rows_with_a_null_unique_id(unassigned_crm_csv, capsys):
+    """--freq regularizes per series, so it dropped unidentified rows too."""
+    rc = main(
+        [
+            "forecast", str(unassigned_crm_csv), "--h", "1", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--freq", "MS",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unique_id" in err and "null" in err
+
+
+def test_agg_keeps_every_identified_row(tmp_path, capsys):
+    """The guard must not reject ordinary exports: full ids still aggregate."""
+    path = tmp_path / "clean.csv"
+    pd.DataFrame(
+        {
+            "Rep": ["alice", "alice", "alice", "bob", "bob"],
+            "Close Date": [
+                "2024-01-01", "2024-01-17", "2024-02-01", "2024-01-01", "2024-02-01",
+            ],
+            "Amount": [10.0, 999.0, 20.0, 5.0, 7.0],
+        }
+    ).to_csv(path, index=False)
+    out_path = tmp_path / "out.csv"
+    rc = main(
+        [
+            "forecast", str(path), "--h", "1", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "MS", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    assert out_path.exists()
+
+
+# -- --fill nan ------------------------------------------------------------------
+
+
+def test_fill_nan_reports_a_cli_level_remedy(tmp_path, capsys):
+    """--fill nan must fail with advice a shell user can act on.
+
+    What went wrong: ``--fill nan`` leaves gap rows as NaN, but every CLI
+    consumer routes through ``validate_panel``, which rejects NaN targets
+    unless ``allow_missing=True`` — a library-only kwarg the CLI exposes
+    nowhere. So the user was told to "pass allow_missing=True", which reads
+    as actionable advice but is a dead end from the shell.
+
+    Right behaviour: the CLI names the gaps it created and points at options
+    that exist on the command line (--fill zero), while still failing (exit
+    2) rather than forecasting an incomplete target.
+    """
+    path = tmp_path / "gap.csv"
+    pd.DataFrame(
+        {
+            "Rep": ["alice"] * 3,
+            "Close Date": ["2024-01-01", "2024-03-01", "2024-04-01"],
+            "Amount": [10.0, 20.0, 30.0],
+        }
+    ).to_csv(path, index=False)
+    rc = main(
+        [
+            "forecast", str(path), "--h", "1", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "MS", "--fill", "nan",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "--fill nan" in err and "--fill zero" in err
+    assert "allow_missing" not in err  # the library-only dead end is gone
+    assert "Traceback" not in err
+    # "reports the gaps it found" has to mean the periods, not just a count:
+    # a count sends the user back to the spreadsheet to find them by hand
+    assert "2024-02-01" in err and "alice" in err
+
+
+def test_fill_nan_is_still_accepted_when_there_are_no_gaps(tmp_path):
+    """--fill nan on a gapless panel is a no-op and must keep working."""
+    path = tmp_path / "nogap.csv"
+    pd.DataFrame(
+        {
+            "Rep": ["alice"] * 4,
+            "Close Date": ["2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01"],
+            "Amount": [10.0, 20.0, 30.0, 40.0],
+        }
+    ).to_csv(path, index=False)
+    rc = main(
+        [
+            "forecast", str(path), "--h", "1", "--model", "_test_cli_naive",
+            "--id-col", "Rep", "--time-col", "Close Date", "--target-col", "Amount",
+            "--agg", "sum", "--freq", "MS", "--fill", "nan",
+        ]
+    )
+    assert rc == 0
+
+
 # -- forecast --param ------------------------------------------------------------
 
 
@@ -679,6 +826,30 @@ def test_compare_level_repeat_and_comma_list(tmp_path, panel_csv):
     assert rc == 0
     board = pd.read_csv(out_path)
     assert {"coverage-60", "coverage-80", "coverage-95"} <= set(board.columns)
+
+
+@pytest.mark.parametrize("metrics", ["", ",", " , "])
+def test_compare_empty_metrics_returns_2_not_a_traceback(panel_csv, capsys, metrics):
+    """An empty --metrics must obey the documented "error: ... exit 2" contract.
+
+    What went wrong: ``_split_csv_arg`` turned these into ``[]``, and
+    ``compare(metrics=[])`` raised ``KeyError: 'metric'`` from pandas. KeyError
+    is not in main()'s caught tuple, so a full traceback reached the terminal
+    and the process exited 1 — contradicting cli.py's module docstring:
+    "print ``error: ...`` to stderr and exit with status 2 — never a
+    traceback".
+    """
+    rc = main(
+        [
+            "compare", str(panel_csv), "--h", "4",
+            "--models", "_test_cli_naive", "--metrics", metrics,
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "Traceback" not in err
+    assert "metric" in err
 
 
 def test_compare_interval_metric_without_level_returns_2(panel_csv, capsys):
@@ -888,6 +1059,76 @@ def test_mapping_conflicts_with_manual_panel_options(hubspot_csv, capsys):
     err = capsys.readouterr().err
     assert err.startswith("error:")
     assert "--mapping" in err and "--agg" in err
+
+
+@pytest.fixture
+def gappy_hubspot_csv(tmp_path):
+    """HubSpot-style export with a five-month hole in the middle."""
+    months = [*pd.date_range("2025-01-01", periods=4, freq="MS"),
+              *pd.date_range("2025-10-01", periods=4, freq="MS")]
+    rows = [
+        {
+            "closedate": (m + pd.Timedelta(days=4)).strftime("%Y-%m-%d"),
+            "amount": 100.0,
+            "dealstage": "closedwon",
+            "hubspot_owner_id": "42",
+        }
+        for m in months
+    ]
+    path = tmp_path / "hubspot_gappy.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def test_mapping_honours_fill_nan_instead_of_dropping_it(gappy_hubspot_csv, capsys):
+    """--fill must reach the --mapping path, not be silently discarded.
+
+    What went wrong: ``_prepare_panel`` returned early on the ``--mapping``
+    branch with ``freq`` as the only override, so ``--fill`` never reached
+    the gap handling. ``--mapping`` errors on a conflicting ``--id-col``/
+    ``--time-col``/``--target-col``/``--agg`` but accepted ``--fill`` and
+    dropped it, so a user auditing for holes with ``--fill nan`` got an
+    exit-0 forecast built on the recipe's invented zeros — the one outcome
+    the flag exists to prevent.
+    """
+    rc = main(
+        [
+            "forecast", str(gappy_hubspot_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--mapping", "hubspot_deals", "--fill", "nan",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "--fill nan" in err and "--fill zero" in err
+    assert "2025-05-01" in err  # the first missing period, named
+    assert "Traceback" not in err
+
+
+def test_mapping_with_fill_nan_and_no_gaps_still_forecasts(hubspot_csv, tmp_path):
+    """--fill nan is a no-op on a gapless recipe panel, exactly as on --freq."""
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(hubspot_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--mapping", "hubspot_deals", "--fill", "nan", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    assert len(pd.read_csv(out_path)) == 2
+
+
+def test_mapping_default_fill_still_zero_fills(gappy_hubspot_csv, tmp_path):
+    """Backward compatibility: without --fill the recipe keeps zero-filling."""
+    out_path = tmp_path / "fc.csv"
+    rc = main(
+        [
+            "forecast", str(gappy_hubspot_csv), "--h", "2", "--model", "_test_cli_naive",
+            "--mapping", "hubspot_deals", "--output", str(out_path),
+        ]
+    )
+    assert rc == 0
+    assert len(pd.read_csv(out_path)) == 2
 
 
 def test_forecast_unknown_mapping_returns_2(hubspot_csv, capsys):

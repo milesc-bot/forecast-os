@@ -12,11 +12,14 @@ recursion ``p_1 = alpha / (alpha + beta)``,
 ``S(t) = S(t-1) - p_t``. Parameters are estimated per cohort by maximum
 likelihood on the observed retention curve, with an empirical-Bayes-lite
 fallback: cohorts too short for a stable MLE borrow POOLED parameters
-fitted on the position-wise mean of the cohorts' scale-free (age-0
-normalized) curves.
+fitted on the cohorts' scale-free (age-0 normalized) curves, combined
+position-wise through their per-period retention ratios so a ragged cohort
+triangle still pools into a monotone survival curve.
 """
 
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -121,6 +124,43 @@ def _survival_curve(y: np.ndarray) -> np.ndarray:
     return y[1:] / y[0]
 
 
+def _pooled_curve(curves: list[np.ndarray]) -> np.ndarray:
+    """Pool ragged scale-free cohort curves into one survival curve.
+
+    Every real cohort triangle is RAGGED — recent cohorts are short — so the
+    pooling is done position-wise on per-period retention *ratios*
+    (``c[t] / c[t-1]``), then cumulated, rather than on the survival levels
+    themselves. Averaging the levels lets the composition of the panel change
+    from one position to the next: where the short cohorts run out, the mean
+    jumps to whatever the surviving (typically more mature, higher-retention)
+    cohorts sit at, and the "curve" goes UP. That is not a survival curve —
+    its churn weights and ``S(T)`` no longer sum to 1, so the clipping in
+    :func:`_sbg_mle`, which exists to absorb measurement noise, silently
+    swallows a systematic composition artifact instead.
+
+    Cumulating mean ratios is monotone nonincreasing by construction (each
+    mean ratio is clipped into [0, 1], the same noisy-up-tick convention
+    :func:`_sbg_mle` uses), uses every cohort at every position it actually
+    observes, and returns the identical curve when all cohorts share one
+    curve. Position 0 is measured against the age-0 anchor of 1.0 that
+    :func:`_survival_curve` already divided out; a position no usable cohort
+    reaches carries forward flat.
+    """
+    max_len = max(len(c) for c in curves)
+    mat = np.full((len(curves), max_len), np.nan)
+    for i, c in enumerate(curves):
+        mat[i, : len(c)] = c
+    prev = np.concatenate([np.ones((len(curves), 1)), mat[:, :-1]], axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        safe_prev = np.where(prev > _EPS, prev, 1.0)
+        ratio = np.where(prev > _EPS, mat / safe_prev, np.nan)
+    ratio = np.clip(ratio, 0.0, 1.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN position
+        mean_ratio = np.nanmean(ratio, axis=0)
+    return np.cumprod(np.where(np.isnan(mean_ratio), 1.0, mean_ratio))
+
+
 def _sbg_mle(s_obs: np.ndarray) -> tuple[float, float, bool]:
     """MLE of (alpha, beta) on one retention curve; third element is success.
 
@@ -185,9 +225,12 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
     fractions in [0, 1] — anything else raises at ``fit`` (this model is
     retention-only by design and refuses generic panels).
 
-    Empirical-Bayes-lite pooling: ``fit`` first estimates POOLED parameters
-    on the position-wise mean of the cohorts' scale-free curves, then fits
-    each cohort; a cohort with fewer than ``pooled_threshold`` observations,
+    Empirical-Bayes-lite pooling: ``fit`` first estimates POOLED parameters on
+    the cohorts' scale-free curves, pooled position-wise through their
+    per-period retention ratios (see :func:`_pooled_curve` — a plain mean of
+    the survival LEVELS is non-monotone on the ragged triangle every real
+    panel is), then fits each cohort; a cohort with fewer than
+    ``pooled_threshold`` observations,
     or whose MLE fails, or with no age-0 retention to measure survival
     against, uses the pooled parameters instead (so even a 2-point or dead
     cohort forecasts sensibly). Both ``pooled_threshold`` and
@@ -317,7 +360,7 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
         return validate_panel(pd.concat([df, anchors], ignore_index=True))
 
     def _fit_pooled(self, df: pd.DataFrame) -> tuple[float, float]:
-        """Pooled (alpha, beta) from the mean of the cohorts' scale-free curves.
+        """Pooled (alpha, beta) from the cohorts' mean per-period retention.
 
         Normalizing by each cohort's age-0 anchor keeps a cohort with 60%
         activation from dragging the pooled curve down as though it churned
@@ -332,6 +375,11 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
         pooled curve is then in [0, 1] by construction. If that leaves nothing
         usable the pooled fit has failed and (1.0, 1.0) is returned, the same
         neutral fallback a failed MLE gets.
+
+        The surviving curves are ragged (recent cohorts are short), so they are
+        combined by :func:`_pooled_curve` rather than by a position-wise mean
+        of the levels — see that function for why the levels version is not a
+        survival curve at all.
         """
         curves = []
         for _, g in df.groupby(ID_COL, sort=True):
@@ -341,14 +389,9 @@ class ShiftedBetaGeometric(PerSeriesForecaster):
             curve = _survival_curve(y)
             if curve.size and np.all(curve <= 1.0 + _EPS):
                 curves.append(curve)
-        max_len = max((len(c) for c in curves), default=0)
-        if max_len < 1:
+        if not curves:
             return 1.0, 1.0
-        mat = np.full((len(curves), max_len), np.nan)
-        for i, c in enumerate(curves):
-            mat[i, : len(c)] = c
-        pooled_curve = np.nanmean(mat, axis=0)
-        alpha, beta, ok = _sbg_mle(pooled_curve)
+        alpha, beta, ok = _sbg_mle(_pooled_curve(curves))
         return (alpha, beta) if ok else (1.0, 1.0)
 
     def _fit_series(self, y: np.ndarray) -> dict:

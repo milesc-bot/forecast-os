@@ -9,6 +9,7 @@ Kelly), and ``cost_bps`` basis points charged per unit of position change.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,7 +17,7 @@ import pandas as pd
 from scipy import stats
 
 from ..core.base import BaseForecaster
-from ..core.types import ID_COL, TARGET_COL, TIME_COL
+from ..core.types import ID_COL, TARGET_COL, TIME_COL, infer_step, validate_panel
 from ..evaluation.backtest import cross_validation
 from .metrics import (
     annualized_return,
@@ -36,6 +37,46 @@ _META_COLS = {ID_COL, TIME_COL, TARGET_COL, "cutoff"}
 _SIZINGS = ("binary", "proportional", "kelly")
 _SIGMA_EPS = 1e-12
 
+#: Periods per year implied by the root of an inferred pandas frequency string.
+#: Daily and business-daily both map to the 252 trading-day convention, which is
+#: also the fallback for any step this table does not cover (numeric ``ds``,
+#: irregular datetimes), preserving the historical default.
+_PERIODS_BY_FREQ = {
+    "D": 252,
+    "B": 252,
+    "W": 52,
+    "M": 12,
+    "MS": 12,
+    "ME": 12,
+    "Q": 4,
+    "QS": 4,
+    "QE": 4,
+    "Y": 1,
+    "YS": 1,
+    "YE": 1,
+    "A": 1,
+    "h": 24 * 252,
+    "H": 24 * 252,
+}
+_DEFAULT_PERIODS = 252
+
+
+def _infer_periods(df: pd.DataFrame) -> int:
+    """Periods per year implied by the panel's modal per-series time step.
+
+    Expects a frame that has already been through
+    :func:`~forecast_os.core.types.validate_panel`: ``ds`` may legally arrive
+    as ISO strings or ``datetime.date`` objects and only validation normalises
+    those to datetime64.
+    """
+    steps = [infer_step(g[TIME_COL]) for _, g in df.groupby(ID_COL, sort=True)]
+    if not steps:
+        return _DEFAULT_PERIODS
+    modal = Counter(steps).most_common(1)[0][0]
+    if not isinstance(modal, str):
+        return _DEFAULT_PERIODS
+    return _PERIODS_BY_FREQ.get(modal.split("-")[0], _DEFAULT_PERIODS)
+
 
 @dataclass
 class BacktestResult:
@@ -49,10 +90,17 @@ class BacktestResult:
     per-step forecast standard deviation recovered from the model's prediction
     interval, inserted after ``yhat``); for binary sizing the column is
     omitted entirely.
+
+    ``periods`` is the periods-per-year actually used to annualize
+    annualized_return, sharpe, sortino, annualized_vol and calmar — either the
+    value passed to :class:`StrategyBacktester` or the one inferred from the
+    panel's time step and the run's ``step_size`` (the realized returns are
+    ``step_size`` bars apart, so the panel's rate is divided by it).
     """
 
     summary: pd.DataFrame
     frame: pd.DataFrame
+    periods: int = _DEFAULT_PERIODS
 
 
 class StrategyBacktester:
@@ -78,6 +126,15 @@ class StrategyBacktester:
     Trading costs of ``cost_bps / 1e4`` per unit of position change are
     charged on entry and on every resize (``|position_t - position_{t-1}|``,
     starting flat).
+
+    ``periods`` is the periods-per-year used to annualize annualized_return,
+    sharpe, sortino, annualized_vol and calmar. Left as ``None`` it is inferred
+    from the (validated) panel's modal time step (daily/business-daily 252,
+    weekly 52, monthly 12, quarterly 4, yearly 1, hourly 24*252), falls back to
+    252 for numeric or irregular ``ds``, and is then divided by :meth:`run`'s
+    ``step_size`` so it describes the strategy's own return series rather than
+    the panel's bar spacing. The resolved value is reported on
+    :attr:`BacktestResult.periods`.
     """
 
     def __init__(
@@ -89,6 +146,7 @@ class StrategyBacktester:
         level: int = 80,
         kelly_fraction: float = 0.5,
         max_leverage: float = 1.0,
+        periods: int | None = None,
     ):
         if sizing not in _SIZINGS:
             raise ValueError(f"sizing must be one of {_SIZINGS}, got {sizing!r}")
@@ -98,6 +156,9 @@ class StrategyBacktester:
             raise ValueError(f"kelly_fraction must be finite and > 0, got {kelly_fraction!r}")
         if not np.isfinite(max_leverage) or max_leverage <= 0:
             raise ValueError(f"max_leverage must be finite and > 0, got {max_leverage!r}")
+        if periods is not None and (int(periods) != periods or periods < 1):
+            raise ValueError(f"periods must be None or an integer >= 1, got {periods!r}")
+        self.periods = None if periods is None else int(periods)
         self.model = model
         self.threshold = float(threshold)
         self.cost_bps = float(cost_bps)
@@ -129,10 +190,17 @@ class StrategyBacktester:
 
     def run(self, df: pd.DataFrame, test_size: int = 60, step_size: int = 1) -> BacktestResult:
         """Walk-forward backtest over the last ``test_size`` one-step windows."""
+        df = validate_panel(df)  # normalises ds before any inference reads it
         level = None if self.sizing == "binary" else [self.level]
         cv = cross_validation(
             df, [self.model], h=1, n_windows=test_size, step_size=step_size, level=level
         )
+        if self.periods is not None:
+            periods = self.periods
+        else:
+            # Consecutive realized returns are step_size bars apart, so the
+            # panel's own periods-per-year has to be divided by that cadence.
+            periods = max(1, round(_infer_periods(df) / step_size))
         forecast_col = next(
             c for c in cv.columns if c not in _META_COLS and "-lo-" not in c and "-hi-" not in c
         )
@@ -171,19 +239,21 @@ class StrategyBacktester:
                 {
                     ID_COL: uid,
                     "total_return": float(equity[-1] - 1.0),
-                    "annualized_return": annualized_return(strat_ret),
-                    "sharpe": sharpe_ratio(strat_ret),
-                    "sortino": sortino_ratio(strat_ret),
+                    "annualized_return": annualized_return(strat_ret, periods=periods),
+                    "sharpe": sharpe_ratio(strat_ret, periods=periods),
+                    "sortino": sortino_ratio(strat_ret, periods=periods),
                     "max_drawdown": max_drawdown(strat_ret),
                     "hit_rate": hit_rate(strat_ret),
                     "n_trades": int(np.sum(dpos > 0)),
                     "exposure": float(np.mean(position)),
-                    "annualized_vol": annualized_vol(strat_ret),
-                    "calmar": calmar_ratio(strat_ret),
+                    "annualized_vol": annualized_vol(strat_ret, periods=periods),
+                    "calmar": calmar_ratio(strat_ret, periods=periods),
                     "var_95": value_at_risk(strat_ret, level=0.95),
                     "cvar_95": conditional_var(strat_ret, level=0.95),
                 }
             )
         return BacktestResult(
-            summary=pd.DataFrame(rows), frame=pd.concat(frames, ignore_index=True)
+            summary=pd.DataFrame(rows),
+            frame=pd.concat(frames, ignore_index=True),
+            periods=periods,
         )

@@ -6,6 +6,8 @@ the pilot tests drive a headless demo app and are skipped when the optional
 ``[terminal]`` extra is not installed.
 """
 
+import asyncio
+import threading
 
 import pandas as pd
 import pytest
@@ -194,6 +196,156 @@ class TestFailureHandling:
             await pilot.pause()
             table = app.screen.query_one("#dashboard-table", DataTable)
             assert table.row_count == DEMO_SERIES_COUNT  # exclusive worker → no dupes
+
+
+@needs_textual
+class TestRefreshInvalidatesInFlightWorkers:
+    """Regression: an explicit refresh must not be overwritten by a stale worker.
+
+    What went wrong: ``action_refresh`` set ``board``/``governance`` back to
+    ``None``, but the already-running board/governance worker lives in a
+    different worker group ("board"/"governance") than the refresh worker
+    ("refresh"), so ``exclusive=True`` never cancelled it — and a thread
+    worker cannot be cancelled mid-run anyway. It finished and wrote its
+    PRE-refresh result over the ``None``. Because ``request_board`` only
+    fires ``if self.board is None``, nothing ever recomputed it, so pressing
+    ``r`` (the leaderboard hint literally reads "r recomputes") left a stale
+    board on screen with no indication it was stale.
+
+    The right behaviour: a result produced by a worker that started before
+    the refresh is discarded, and the board/governance is recomputed from the
+    post-refresh panel.
+    """
+
+    @pytest.mark.asyncio
+    async def test_refresh_discards_in_flight_board(self, tmp_path, monkeypatch):
+        calls = {"n": 0}
+        gate = threading.Event()
+
+        def staged(panel, settings, *a, **k):
+            calls["n"] += 1
+            n = calls["n"]
+            if n == 1:  # the pre-refresh run: still in flight when "r" is pressed
+                gate.wait(timeout=10)
+            return pd.DataFrame({"model": [f"v{n}"], "mase": [float(n)]})
+
+        monkeypatch.setattr(engine_bridge, "leaderboard_frame", staged)
+        app = make_demo_app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.press("l")  # requests the board; worker 1 blocks on the gate
+            await pilot.pause()
+            assert app._board_working
+            await pilot.press("r")  # user asks for a recompute
+            gate.set()  # ...and only now does the pre-refresh worker finish
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if calls["n"] >= 2 and not app._board_working:
+                    break
+            assert app.board is not None, "board never recomputed after refresh"
+            assert list(app.board["model"]) == ["v2"], (
+                f"refresh kept the pre-refresh board {list(app.board['model'])}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_refresh_discards_in_flight_governance(self, tmp_path, monkeypatch):
+        calls = {"n": 0}
+        gate = threading.Event()
+
+        def staged(panel, settings, *a, **k):
+            calls["n"] += 1
+            n = calls["n"]
+            if n == 1:
+                gate.wait(timeout=10)
+            return pd.DataFrame(
+                {
+                    "unique_id": [f"v{n}"],
+                    "cutoff": [pd.Timestamp("2026-01-01")],
+                    "mase": [float(n)],
+                    "pct_bias": [0.0],
+                    "coverage": [1.0],
+                }
+            )
+
+        monkeypatch.setattr(engine_bridge, "governance_frame", staged)
+        app = make_demo_app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.press("g")
+            await pilot.pause()
+            assert app._governance_working
+            await pilot.press("r")
+            gate.set()
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if calls["n"] >= 2 and not app._governance_working:
+                    break
+            assert app.governance is not None, "governance never recomputed after refresh"
+            assert list(app.governance["unique_id"]) == ["v2"], (
+                f"refresh kept the pre-refresh governance "
+                f"{list(app.governance['unique_id'])}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_stale_refresh_does_not_reinstate_an_older_panel(
+        self, tmp_path, monkeypatch
+    ):
+        """The refresh worker needs the same generation guard as board/governance.
+
+        ``_refresh_worker`` is ``exclusive=True, group="refresh"``, but a
+        thread worker cannot be cancelled mid-run: a slow refresh started
+        before the user pressed ``r`` keeps going and used to overwrite
+        ``panel``/``rows``/``fired_alerts``/``last_refresh`` — and assigned
+        ``self.governance`` directly, walking a pre-refresh governance frame
+        straight past the ``_apply_governance`` guard. The console then showed
+        data older than its own "refreshed HH:MM:SS" stamp.
+        """
+
+        def panel_for(tag):
+            return pd.DataFrame(
+                {
+                    "unique_id": [tag] * 40,
+                    "ds": pd.date_range("2020-01-01", periods=40, freq="MS"),
+                    "y": [float(i + 1) for i in range(40)],
+                }
+            )
+
+        calls = {"n": 0}
+        gate = threading.Event()
+
+        def staged_refresh(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                gate.wait(timeout=10)  # the older refresh lands last
+                return panel_for("old")
+            return panel_for("new")
+
+        monkeypatch.setattr(app_module.PanelProvider, "refresh", staged_refresh)
+        app = make_demo_app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            for _ in range(50):  # on_mount fired refresh #1; it blocks on the gate
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if calls["n"] >= 1:
+                    break
+            await pilot.press("r")  # refresh #2 overtakes it
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if calls["n"] >= 2 and app.panel is not None:
+                    break
+            assert app.panel["unique_id"].iloc[0] == "new"
+            gate.set()  # ...and only now does the superseded refresh finish
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if app.panel["unique_id"].iloc[0] == "old":
+                    break
+            assert app.panel["unique_id"].iloc[0] == "new", (
+                "a superseded refresh reinstated its older panel"
+            )
 
 
 @needs_textual

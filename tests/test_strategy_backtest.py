@@ -383,3 +383,143 @@ def test_kelly_sigma_fallback_respects_max_leverage():
     assert pos[1] == pytest.approx(min(0.5 * 0.01 / 0.02**2, 0.4))
     assert pos[2] == 0.0
     assert (pos <= 0.4 + 1e-12).all()
+
+
+class ConstForecaster(PerSeriesForecaster):
+    """Always forecast a fixed positive return."""
+
+    def _fit_series(self, y):
+        return {"c": 0.05}
+
+    def _predict_series(self, state, h):
+        return np.full(h, 0.05)
+
+
+def _monthly_panel():
+    import pandas as pd
+
+    return pd.DataFrame(
+        {
+            ID_COL: "asset-0",
+            "ds": pd.date_range("2015-01-31", periods=120, freq="ME"),
+            "y": 0.05,
+        }
+    )
+
+
+def test_annualization_follows_the_panel_frequency():
+    """Annualized summary metrics must use the panel's own periods-per-year.
+
+    Regression: every summary metric was called with metrics.py's ``periods``
+    default of 252, and ``StrategyBacktester`` exposed no override. A monthly
+    panel of constant +5% returns therefore reported annualized_return =
+    218625.78 (1.05**252 - 1) instead of the frequency-correct 0.79586
+    (1.05**12 - 1), with sharpe/sortino/annualized_vol/calmar inflated by
+    sqrt(252/12) alongside. Nothing documented a daily-bar assumption, and
+    there was no workaround short of recomputing from ``result.frame``.
+    """
+    res = StrategyBacktester(ConstForecaster()).run(_monthly_panel(), test_size=24)
+    row = res.summary.iloc[0]
+    assert row["annualized_return"] == pytest.approx(1.05**12 - 1.0)
+    assert res.periods == 12
+    # frequency-free metrics are unaffected
+    assert row["total_return"] == pytest.approx(1.05**24 - 1.0)
+
+
+def test_annualization_periods_can_be_overridden():
+    """An explicit ``periods`` wins over inference."""
+    res = StrategyBacktester(ConstForecaster(), periods=4).run(_monthly_panel(), test_size=24)
+    assert res.periods == 4
+    assert res.summary.iloc[0]["annualized_return"] == pytest.approx(1.05**4 - 1.0)
+
+
+def test_annualization_defaults_to_252_on_daily_panels(drift_result):
+    """Business/calendar-daily panels keep the historical 252 convention."""
+    assert drift_result.periods == 252
+
+
+def test_periods_validated():
+    with pytest.raises(ValueError):
+        StrategyBacktester(ConstForecaster(), periods=0)
+    with pytest.raises(ValueError):
+        StrategyBacktester(ConstForecaster(), periods=2.5)
+
+
+def _daily_panel(ds):
+    import pandas as pd
+
+    return pd.DataFrame({ID_COL: "asset-0", "ds": ds, "y": 0.01})
+
+
+def test_run_accepts_contract_legal_object_dtype_ds():
+    """Backward compat: ISO-string / ``datetime.date`` ``ds`` must still run.
+
+    Regression: the annualization fix inferred the periods-per-year from the
+    caller's *raw* frame as run()'s first statement, before
+    ``cross_validation`` -> ``validate_panel`` had a chance to normalise ``ds``.
+    ``validate_panel`` explicitly accepts an object-dtype ``ds`` and coerces it
+    with ``pd.to_datetime`` (exactly what ``pd.read_csv`` without
+    ``parse_dates`` produces), so both panels below completed at v0.9.0; after
+    the fix they raised ``TypeError: operation 'sub' not supported for dtype
+    'str'`` and ``TypeError: float() argument must be ... not 'Timedelta'``.
+    Periods must be inferred from the validated frame.
+    """
+    import pandas as pd
+
+    idx = pd.date_range("2020-01-01", periods=120, freq="D")
+    for ds in (
+        idx.strftime("%Y-%m-%d"),  # ISO strings, object dtype
+        [d.date() for d in idx],  # datetime.date objects
+        [d.to_pydatetime() for d in idx],  # datetime.datetime objects
+    ):
+        res = StrategyBacktester(ConstForecaster()).run(_daily_panel(ds), test_size=12)
+        assert res.periods == 252
+        assert len(res.frame) == 12
+        assert isinstance(res, BacktestResult)
+
+
+def test_malformed_panels_still_raise_data_contract_error():
+    """Backward compat: contract violations keep their actionable error.
+
+    Regression: inferring the periods-per-year before validation meant a
+    malformed panel hit ``df[ID_COL]`` / ``groupby`` first and surfaced a bare
+    ``KeyError`` / ``IndexError`` / ``AttributeError`` instead of the package's
+    ``DataContractError``.
+    """
+    import pandas as pd
+
+    from forecast_os.core.exceptions import DataContractError
+
+    idx = pd.date_range("2020-01-01", periods=120, freq="D")
+    cases = [
+        pd.DataFrame({"ds": idx, "y": 0.01}),  # missing unique_id
+        pd.DataFrame({ID_COL: [], "ds": [], "y": []}),  # empty
+        pd.DataFrame({ID_COL: [None] * 120, "ds": idx, "y": 0.01}),  # null ids
+        {"unique_id": "a"},  # not a DataFrame at all
+    ]
+    for case in cases:
+        with pytest.raises(DataContractError):
+            StrategyBacktester(ConstForecaster()).run(case, test_size=12)
+
+
+def test_inferred_periods_account_for_step_size():
+    """Inferred annualization must match the *trade* cadence, not the panel's.
+
+    Regression: ``periods`` was inferred from the panel's bar spacing alone, but
+    the realized return series is ``step_size`` bars apart. On a business-daily
+    panel with ``step_size=5`` the 40 realized returns span 273 calendar days,
+    yet ``periods`` was reported as 252 — a 5.8x overstatement of
+    annualized_return (0.43 vs the honest 0.07), under a ``BacktestResult.periods``
+    documented as "the periods-per-year actually used to annualize".
+    """
+    import pandas as pd
+
+    from forecast_os.finance.metrics import annualized_return as ann
+
+    df = _daily_panel(pd.bdate_range("2020-01-01", periods=300))
+    res = StrategyBacktester(ConstForecaster()).run(df, test_size=40, step_size=5)
+    assert res.periods == 50  # 252 business days / 5-day rebalance
+    strat = res.frame["strategy_return"].to_numpy()
+    assert res.summary.iloc[0]["annualized_return"] == pytest.approx(ann(strat, periods=50))
+    # step_size=1 is unchanged
+    assert StrategyBacktester(ConstForecaster()).run(df, test_size=40).periods == 252

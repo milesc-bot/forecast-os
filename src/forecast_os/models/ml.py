@@ -134,3 +134,24 @@ class RidgeLag(PerSeriesForecaster):
             out[k] = float(xs @ state["w"]) * state["y_std"] + state["y_mean"]
             hist.append(out[k])
         return out
+
+    def _predict_sigma(self, state: dict, h: int) -> np.ndarray:
+        """Forecast std errors from the psi weights of the fitted lag recursion.
+
+        ``_predict_series`` feeds each prediction back into the lag window, so
+        the model's own AR(m) dynamics propagate a one-step innovation across
+        the horizon: var_h = sigma^2 * sum_{j<h} psi_j^2. Keeping the flat
+        one-step residual sigma (the base-class fallback) would report the same
+        interval at h=1 and h=24. Same construction as ``_psi_sigma`` in
+        ``models/arima.py``. Fourier and exogenous columns are deterministic
+        given the future clock and ``X_future``, so only the ``lags`` leading
+        weights enter; de-standardized, phi_j = w[j] * y_std / x_std[j].
+        """
+        m = self.lags
+        phi = state["w"][:m] * state["y_std"] / state["x_std"][:m]
+        psi = np.zeros(h)
+        psi[0] = 1.0
+        for j in range(1, h):
+            t = min(j, m)
+            psi[j] = float(phi[:t] @ psi[j - t : j][::-1])
+        return state["_sigma"] * np.sqrt(np.cumsum(psi**2))

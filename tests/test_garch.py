@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy import stats
 from scipy.optimize import OptimizeResult, minimize
 
 from forecast_os.core.exceptions import ForecastOSError, NotFittedError
@@ -355,3 +356,99 @@ class TestGARCHVolatility:
         clone = model.clone()
         assert type(clone) is GARCHVolatility
         assert clone.get_params() == model.get_params()
+
+
+class TestGARCHVolatilityIntervals:
+    """Regression: prediction intervals for a strictly positive quantity.
+
+    ``GARCHVolatility`` did not override ``_predict_sigma``, so it inherited the
+    base class's generic residual scale: ``BaseForecaster`` computes
+    ``resid = y - state["fitted"]`` and takes an uncentered RMS. For every other
+    model ``fitted`` is a fit of ``y``; here it is the conditional VOLATILITY,
+    so the "residual" was approximately ``y`` itself and the interval half-width
+    tracked the level of the series rather than any uncertainty about the
+    volatility. On the contract panel that gave yhat=16.86 with lo-80=-125.37
+    (interval sigma 110.98 vs mean y 117.36), and even on a natural zero-mean
+    returns panel lo-80 came out negative — impossible for a volatility.
+    """
+
+    @staticmethod
+    def _returns_panel():
+        rng = np.random.default_rng(0)
+        return to_panel(0.01 * rng.standard_normal(300), unique_id="asset-0")
+
+    def test_lower_bound_positive_on_returns_panel(self):
+        pred = GARCHVolatility().fit(self._returns_panel()).predict(3, level=[80])
+        assert (pred["lo-80"] > 0).all()
+        assert (pred["lo-80"] < pred["yhat"]).all()
+        assert (pred["hi-80"] > pred["yhat"]).all()
+
+    def test_lower_bound_positive_on_level_panel(self):
+        pred = GARCHVolatility().fit(_contract_panel()).predict(5, level=[80])
+        assert (pred["lo-80"] > 0).all()
+
+    def test_interval_width_scales_with_volatility_not_with_the_level(self):
+        """Shifting the series by a constant leaves the volatility interval alone."""
+        df = self._returns_panel()
+        shifted = df.copy()
+        shifted["y"] = shifted["y"] + 100.0
+        a = GARCHVolatility().fit(df).predict(3, level=[80])
+        b = GARCHVolatility().fit(shifted).predict(3, level=[80])
+        width_a = (a["hi-80"] - a["lo-80"]).to_numpy()
+        width_b = (b["hi-80"] - b["lo-80"]).to_numpy()
+        # a +100 level shift changes the volatility (and so its interval) by
+        # far less than the ~200x the old y-residual scale would have given
+        assert np.allclose(width_b, width_a, rtol=0.5)
+
+    def test_interval_is_a_relative_band_around_the_volatility_forecast(self):
+        """Half-width is z * yhat / sqrt(2n): the sd of a volatility estimate."""
+        df = self._returns_panel()
+        pred = GARCHVolatility().fit(df).predict(4, level=[80])
+        z = float(stats.norm.ppf(0.9))
+        expected = z * pred["yhat"].to_numpy() / np.sqrt(2 * len(df))
+        got = (pred["hi-80"] - pred["yhat"]).to_numpy()
+        np.testing.assert_allclose(got, expected, rtol=1e-10)
+
+    def test_constant_series_has_degenerate_interval(self):
+        df = to_panel(np.full(60, 3.0), unique_id="flat")
+        pred = GARCHVolatility().fit(df).predict(2, level=[80])
+        assert (pred["yhat"] == 0.0).all()
+        assert (pred["lo-80"] == 0.0).all() and (pred["hi-80"] == 0.0).all()
+
+    @staticmethod
+    def _garch_draw(rng, n, omega=2e-6, alpha=0.08, beta=0.90, burn=300):
+        """A GARCH(1,1) sample plus the true conditional sigma of the next step."""
+        total = n + burn + 1
+        r = np.zeros(total)
+        s2 = np.zeros(total)
+        s2[0] = omega / (1.0 - alpha - beta)
+        for t in range(1, total):
+            s2[t] = omega + alpha * r[t - 1] ** 2 + beta * s2[t - 1]
+            r[t] = np.sqrt(s2[t]) * rng.standard_normal()
+        return r[burn : burn + n], float(np.sqrt(s2[burn + n]))
+
+    def test_interval_is_not_calibrated_and_must_not_claim_to_be(self):
+        """The band under-covers badly at h=1 — the docstring must not promise more.
+
+        The class docstring used to say the band "is exact only at h = 1, where
+        sigma_{t+1} is known given the parameters" and that for h >= 2 it is
+        "conservative (too narrow)" (self-contradictory: too narrow is
+        ANTI-conservative). Both claims are false. ``yhat / sqrt(2n)`` is the
+        asymptotic sd of a sample standard deviation of i.i.d. normals; it
+        omits the estimation error in (omega, alpha, beta), which dominates
+        here. Measured against the data-generating conditional volatility, a
+        nominal 80% band covers ~50% at h = 1 — the horizon the docstring
+        called exact. This test fails if the interval is ever widened into
+        calibration (fine — then update the docstring) or if someone restores
+        an exactness claim on top of these numbers.
+        """
+        rng = np.random.default_rng(11)
+        hits = 0
+        reps = 25
+        for _ in range(reps):
+            r, true_next_sigma = self._garch_draw(rng, 250)
+            pred = GARCHVolatility().fit(to_panel(r)).predict(1, level=[80])
+            assert pred["lo-80"][0] > 0  # the positivity fix still holds
+            hits += bool(pred["lo-80"][0] <= true_next_sigma <= pred["hi-80"][0])
+        coverage = hits / reps
+        assert coverage < 0.70, f"nominal 80% band covered {coverage:.0%} at h=1"

@@ -40,6 +40,18 @@ _DEFAULT_SETTINGS: dict = {
 
 _SOURCE_DEFAULTS: dict = {"path": None, "mapping": None, "overrides": {}}
 
+#: How each known setting is consumed downstream: ``(kind, may be null)``.
+#: The console reads ``model`` as a registry name and coerces the rest with
+#: ``int()``, so a value that cannot do that kills the app during mount.
+#: Unlisted keys are left alone, so a newer version's settings still load.
+_SETTING_SPECS: dict[str, tuple[type, bool]] = {
+    "model": (str, False),
+    "h": (int, False),
+    "level": (int, False),
+    "refresh_seconds": (int, True),  # null and 0 both mean "manual refresh only"
+    "season_length": (int, True),  # null means "no seasonality"
+}
+
 
 def default_settings() -> dict:
     """A fresh copy of the default console settings."""
@@ -68,6 +80,48 @@ def _require_dicts(items, key: str, target: Path) -> list[dict]:
             )
         out.append(item)
     return out
+
+
+def _require_usable_settings(settings: dict, target: Path) -> dict:
+    """Check the known settings hold values the console can actually use.
+
+    Type-checking the ``settings`` container alone was not enough: the values
+    were merged verbatim, so a hand-edited ``"refresh_seconds": "every 5
+    minutes"`` loaded "successfully" and then killed the app during mount
+    with a bare ``ValueError`` from ``int()``. Raising here instead lets
+    ``terminal.app.main`` report it as a clean one-line exit, the same way it
+    already does for a wrong-typed ``sources``/``watch``/``alerts``.
+
+    Deliberately permissive: anything ``int()`` accepts (including ``"12"``
+    and ``80.0``) passes, nulls pass where the default is nullable, and
+    unknown keys are not inspected at all. The one deliberate exception is
+    ``bool``: it is an ``int`` subclass, so ``{"h": true}`` would coerce to a
+    1-period horizon and ``{"level": true}`` to a 1% confidence level — values
+    no one writing JSON booleans could have meant, so they are refused rather
+    than silently accepted.
+    """
+    for key, (kind, nullable) in _SETTING_SPECS.items():
+        if key not in settings:
+            continue
+        value = settings[key]
+        if value is None and nullable:
+            continue
+        if kind is str:
+            ok = isinstance(value, str)
+        else:
+            ok = not isinstance(value, bool)
+            if ok:
+                try:
+                    int(value)
+                except (TypeError, ValueError):
+                    ok = False
+        if not ok:
+            expected = "a string" if kind is str else "an integer"
+            raise ForecastOSError(
+                f"workspace file {target}: setting {key!r} must be "
+                f"{expected}, got {value!r}"
+            )
+    return settings
 
 
 @dataclass
@@ -114,7 +168,10 @@ class Workspace:
 
         Missing keys in the file are merged with defaults, so partial or
         older workspace files load cleanly. A file that is not valid JSON
-        (or not a JSON object) raises :class:`ForecastOSError` naming it.
+        (or not a JSON object) raises :class:`ForecastOSError` naming it, as
+        does a known setting holding a value the console cannot use (see
+        :func:`_require_usable_settings`) — better a named error here than a
+        traceback out of the app's mount.
         """
         resolved = cls.resolve_home(home)
         ws = cls(home=resolved)
@@ -139,7 +196,9 @@ class Workspace:
             for src in sources
         ]
         ws.watch = [str(uid) for uid in watch or []]
-        ws.settings = {**_DEFAULT_SETTINGS, **(settings or {})}
+        ws.settings = _require_usable_settings(
+            {**_DEFAULT_SETTINGS, **(settings or {})}, target
+        )
         ws.alerts = [dict(alert) for alert in alerts]
         return ws
 

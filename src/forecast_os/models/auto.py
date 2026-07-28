@@ -12,6 +12,7 @@ scoring falls back to a single 75/25 holdout per series.
 
 from __future__ import annotations
 
+import warnings
 from collections import Counter
 
 import numpy as np
@@ -36,13 +37,33 @@ _SEASONAL_BASE_CANDIDATES = ("naive", "drift", "ses", "window_average")
 
 #: Rows a walk-forward training slice must have beyond the largest candidate
 #: ``min_train_size`` before cross-validation is preferred to the holdout. The
-#: margin is a proxy for one understated declaration: :class:`AutoETS` declares
-#: ``min_train_size = 3`` but its AICc screen needs ``n - k - 1 > 0``, so it
-#: cannot actually be fitted on three rows. It only biases the *choice* between
-#: two scoring schemes — a CV slice inside the margin is kept anyway unless the
-#: holdout is strictly wider (see :meth:`AutoSelect.fit`), so no panel is
-#: rejected for being one row short of it.
+#: margin is slack against a candidate that declares a ``min_train_size`` it
+#: cannot really be fitted at (:class:`AutoETS` used to declare 3 while its
+#: AICc screen needs ``n - k - 1 > 0``, i.e. 4). It only biases the *choice*
+#: between two scoring schemes — a CV slice inside the margin is kept anyway
+#: unless the holdout is strictly wider (see :meth:`AutoSelect.fit`), so no
+#: panel is rejected for being one row short of it.
 _CV_TRAIN_MARGIN = 1
+
+#: Signed metrics (see :mod:`forecast_os.evaluation.metrics`): their best value
+#: is ZERO, not minus infinity, so :meth:`AutoSelect.fit` ranks them by
+#: ABSOLUTE value. A plain ``idxmin`` on the raw score would select the most
+#: severely under-forecasting candidate. This mirrors the ranking rule
+#: :meth:`forecast_os.Engine.compare` already applies to the same three names.
+#: A NEW signed metric added to metrics.py must be listed here; anything not
+#: listed is ranked as-is, which is correct for every lower-is-better point
+#: metric.
+_SIGNED_METRICS = frozenset({"bias", "pct_bias", "tracking_signal"})
+
+#: Metrics that need ``lo``/``hi`` columns AutoSelect's scoring pass never
+#: produces (it does not thread ``level`` into cross-validation), so they
+#: cannot be scored at all. Rejected in ``__init__`` rather than blowing up
+#: deep inside ``fit`` with advice the caller cannot act on. (``coverage`` is
+#: additionally not lower-is-better.)
+_INTERVAL_METRICS = frozenset({"coverage", "winkler", "pinball", "wis", "crps"})
+
+#: Point metrics named in the error raised for the interval metrics.
+_SUGGESTED_METRICS = "mae, rmse, mape, smape, mase, rmsse"
 
 #: Season length implied by the root of an inferred pandas frequency string
 #: (D->7, B->5, W->52, M/MS/ME->12, Q/QS/QE->4, H->24; anything else -> 1).
@@ -76,6 +97,17 @@ def _infer_panel_season_length(df: pd.DataFrame) -> int:
     return _SEASON_BY_FREQ.get(modal.split("-")[0], 1)
 
 
+def _scored_rows(frame: pd.DataFrame, names: list[str]) -> pd.DataFrame:
+    """Per-series count of rows each candidate column is actually scored on.
+
+    Mirrors :func:`~forecast_os.evaluation.metrics.evaluate`'s pairwise-complete
+    rule (it drops rows where either ``y`` or the model column is NaN), so the
+    counts say how much of the validation window each candidate covered.
+    """
+    scored = frame.dropna(subset=[TARGET_COL])
+    return scored.groupby(ID_COL)[names].count()
+
+
 @register("auto_select", family="ensemble")
 class AutoSelect(BaseForecaster):
     """Pick the best candidate model per series by validation score.
@@ -92,6 +124,20 @@ class AutoSelect(BaseForecaster):
     metric:
         Scoring metric (default ``"mase"``: scale-free, and safe for
         zero-crossing returns-like series where smape saturates at 2).
+        Must be a POINT metric. Lower-is-better metrics (``mae``, ``rmse``,
+        ``mape``, ``smape``, ``mase``, ``rmsse``) are ranked as scored: the
+        winner is the per-series argmin. The signed governance metrics
+        (``bias``, ``pct_bias``, ``tracking_signal``) are ranked by ABSOLUTE
+        value, since their best value is zero — the winner is the candidate
+        closest to unbiased, not the argmin of the raw signed score (which is
+        the most severely under-forecasting candidate). Note that
+        ``tracking_signal`` and ``pct_bias`` score ``nan`` for a perfect
+        forecast / an all-zero window; a candidate scoring ``nan`` is skipped,
+        and a series where every candidate scores ``nan`` falls back to
+        ranking on ``mae`` (as it does for any metric). The interval
+        metrics (``coverage``, ``winkler``, ``pinball``, ``wis``) are
+        rejected at construction: they cannot be scored because the
+        validation pass never requests ``lo``/``hi`` columns.
         MASE/RMSSE scaling follows the M4 convention: it uses only the rows
         before the first validation cutoff (or before the holdout split),
         never the full panel, with seasonality equal to the resolved ``m``.
@@ -123,6 +169,13 @@ class AutoSelect(BaseForecaster):
             candidates = tuple(candidates)
             if not candidates:
                 raise ValueError("AutoSelect requires at least one candidate model")
+        if metric in _INTERVAL_METRICS:
+            raise ValueError(
+                f"metric={metric!r} is an interval metric, but AutoSelect scores "
+                f"candidates on point forecasts only — its validation pass never "
+                f"requests lo/hi columns. Use a lower-is-better point metric "
+                f"({_SUGGESTED_METRICS})."
+            )
         if val_h < 1 or n_windows < 1:
             raise ValueError("val_h and n_windows must be positive integers")
         if season_length is not None and not isinstance(season_length, (int, np.integer)):
@@ -227,18 +280,48 @@ class AutoSelect(BaseForecaster):
             # (rows up to the first cutoff), matching the M4 convention.
             train_df = df[pos < n - span]
             scores = evaluate(cv, metrics=metrics_list, train_df=train_df, seasonality=scale_m)
+            covered = _scored_rows(cv, names)
         else:
-            scores = self._holdout_scores(df, resolved, scale_m, metrics_list)
+            scores, covered = self._holdout_scores(df, resolved, scale_m, metrics_list)
 
         score_cols = [c for c in scores.columns if c not in (ID_COL, "metric")]
         primary = scores[scores["metric"] == self.metric].set_index(ID_COL)[score_cols]
         fallback = scores[scores["metric"] == "mae"].set_index(ID_COL)[score_cols]
         winners: dict = {}
+        short_covered: set = set()
+        signed = self.metric in _SIGNED_METRICS
         for uid, row in primary.iterrows():
             vals = row.astype(float)
+            ranked_signed = signed
             if not vals.notna().any() and uid in fallback.index:
                 vals = fallback.loc[uid].astype(float)
-            winners[uid] = str(vals.idxmin()) if vals.notna().any() else names[0]
+                ranked_signed = False  # the mae fallback is already unsigned
+            # ``evaluate`` drops NaN rows per model column, so a candidate that
+            # forecast only part of its horizon is scored on the subset it did
+            # produce -- typically the easy near-horizon steps -- and can beat a
+            # candidate scored on the whole window. Those scores are not
+            # comparable, so drop the short-covering candidates from the argmin
+            # rather than let them compete. Candidates covering NOTHING already
+            # score NaN and are excluded by ``idxmin``; they are left alone.
+            cov = covered.loc[uid].reindex(vals.index) if uid in covered.index else None
+            if cov is not None and cov.notna().any():
+                short = cov.index[(cov > 0) & (cov < cov.max())]
+                if len(short):
+                    short_covered.update(map(str, short))
+                    vals = vals.where(~vals.index.isin(short))
+            # Signed metrics are best at zero, so rank them by magnitude: a raw
+            # ``idxmin`` on ``bias`` would crown the biggest under-forecaster.
+            ranking = vals.abs() if ranked_signed else vals
+            winners[uid] = str(ranking.idxmin()) if ranking.notna().any() else names[0]
+        if short_covered:
+            warnings.warn(
+                f"candidate model(s) {sorted(short_covered)} produced forecasts for "
+                f"only part of the validation window (NaN for some horizon steps) "
+                f"and were excluded from selection on the affected series; a "
+                f"forecaster must return a value for every step of its horizon",
+                UserWarning,
+                stacklevel=2,
+            )
 
         by_name = {m.name: m for m in resolved}
         self._fitted_ = {
@@ -254,8 +337,12 @@ class AutoSelect(BaseForecaster):
         resolved: list,
         seasonality: int,
         metrics_list: list[str],
-    ) -> pd.DataFrame:
-        """Score candidates on a per-series 75/25 holdout (short-panel fallback)."""
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Score candidates on a per-series 75/25 holdout (short-panel fallback).
+
+        Returns ``(scores, covered)`` where ``covered`` counts the holdout rows
+        each candidate was actually scored on (see :func:`_scored_rows`).
+        """
         n = df.groupby(ID_COL)[TARGET_COL].transform("size").to_numpy()
         hold = np.maximum(1, n // 4)
         pos = df.groupby(ID_COL).cumcount().to_numpy()
@@ -268,12 +355,14 @@ class AutoSelect(BaseForecaster):
             pred["_step"] = pred.groupby(ID_COL).cumcount()
             pred = pred.rename(columns={"yhat": m.name})
             test = test.merge(pred[[ID_COL, "_step", m.name]], on=[ID_COL, "_step"], how="left")
-        return evaluate(
-            test.drop(columns="_step"),
+        test = test.drop(columns="_step")
+        scores = evaluate(
+            test,
             metrics=metrics_list,
             train_df=train,
             seasonality=seasonality,
         )
+        return scores, _scored_rows(test, [m.name for m in resolved])
 
     def predict(self, h: int, level: list[int] | None = None) -> pd.DataFrame:
         self._check_is_fitted()

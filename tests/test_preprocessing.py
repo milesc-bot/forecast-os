@@ -164,6 +164,77 @@ def test_forward_transform_ignores_renamed_point_columns():
     assert (z["SES"] == 1.0).all()
 
 
+def test_inverse_leaves_fitted_covariate_columns_untouched():
+    """The inverse used to rewrite every numeric non-identifier column, so an
+    exogenous covariate that the forward transform never touched came back
+    mangled (marketing_spend 1000..1500 -> 3430..5138). fit/transform/
+    inverse_transform must round-trip to the identity on such columns."""
+    df = make_panel().assign(marketing_spend=np.linspace(1000.0, 1500.0, 10))
+    sc = StandardScaler()
+    z = sc.fit_transform(df)
+    # forward already leaves it alone; the inverse must agree
+    np.testing.assert_allclose(
+        z["marketing_spend"].to_numpy(), df["marketing_spend"].to_numpy()
+    )
+    back = sc.inverse_transform(z)
+    np.testing.assert_allclose(
+        back["marketing_spend"].to_numpy(), df["marketing_spend"].to_numpy()
+    )
+    np.testing.assert_allclose(back["y"].to_numpy(), df["y"].to_numpy(), rtol=1e-10)
+
+
+def test_inverse_covariate_protection_is_documented_as_fit_time_only():
+    """Pin the boundary of the covariate protection, which the module
+    docstring states: a covariate is recognised only if it was present at fit
+    time. A driver column that first appears in the inverse frame is
+    name-indistinguishable from a model point column renamed after the model
+    (cross-validation's "SES"), so the inverse still rewrites it. Fitting on
+    the frame that carries the covariate is what protects it."""
+    df = make_panel()
+    fc = pd.DataFrame(
+        {"unique_id": ["a", "a"], "ds": [5, 6], "yhat": [0.0, 1.0], "spend": [500.0, 600.0]}
+    )
+    unprotected = StandardScaler().fit(df).inverse_transform(fc)
+    assert unprotected["spend"].iloc[0] != pytest.approx(500.0)
+
+    protected = (
+        StandardScaler().fit(df.assign(spend=1.0)).inverse_transform(fc)
+    )
+    np.testing.assert_allclose(protected["spend"].to_numpy(), [500.0, 600.0])
+
+
+@pytest.mark.parametrize(
+    "make_transform",
+    [
+        lambda: StandardScaler(),
+        lambda: LogTransform(),
+        lambda: Differencer(d=1),
+        lambda: LogitTransform(lower=0.0, upper=200.0),
+    ],
+)
+def test_inverse_does_not_crash_on_integer_covariate(make_transform):
+    """An int64 covariate used to raise a bare pandas TypeError from the
+    inverse ("Invalid value ... for dtype 'int64'") because the inverse tried
+    to write floats into a column it had no business touching at all."""
+    df = make_panel().assign(promo=[0, 1, 0, 1, 0] * 2)
+    t = make_transform()
+    z = t.fit_transform(df)
+    back = t.inverse_transform(z)
+    assert back["promo"].tolist() == z["promo"].tolist()
+    assert back["promo"].dtype == df["promo"].dtype
+
+
+def test_inverse_widens_integer_value_column_to_float():
+    """A forecast frame whose point column happens to be integer-typed used to
+    raise a bare pandas TypeError; the inverse must widen it to float instead."""
+    sc = StandardScaler().fit(make_panel())
+    ya = make_panel().query("unique_id == 'a'")["y"].to_numpy()
+    mu, sd = ya.mean(), ya.std()
+    fc = pd.DataFrame({"unique_id": ["a", "a"], "ds": [5, 6], "yhat": [0, 1]})
+    inv = sc.inverse_transform(fc)
+    np.testing.assert_allclose(inv["yhat"].to_numpy(), [mu, mu + sd])
+
+
 def test_scaler_unseen_uid_inverse_raises():
     sc = StandardScaler().fit(make_panel())
     fc = pd.DataFrame({"unique_id": ["zzz"], "ds": [5], "yhat": [0.0]})
@@ -296,6 +367,77 @@ def test_differencer_shifted_in_range_slice_raises():
         diff.inverse_transform(fc)
 
 
+@pytest.mark.parametrize("ds_kind", ["numeric", "datetime"])
+def test_differencer_continuation_inverse_ignores_row_order(ds_kind):
+    """Integration is only defined in time order, but inverse_transform used to
+    cumsum in raw row order: the same three forecast rows gave {5: 16, 6: 22,
+    7: 29} sorted ascending and {5: 29, 6: 24, 7: 18} sorted descending. The
+    ds-ordered answer is the correct one for both, since 11 + 5 = 16, + 6 = 22,
+    + 7 = 29."""
+    df = make_panel()
+    diff = Differencer(d=1).fit(df)
+    ds = [5, 6, 7]
+    if ds_kind == "datetime":
+        df = df.assign(ds=list(pd.date_range("2024-01-01", periods=5, freq="D")) * 2)
+        diff = Differencer(d=1).fit(df)
+        ds = list(pd.date_range("2024-01-06", periods=3, freq="D"))
+    fc = pd.DataFrame({"unique_id": ["a"] * 3, "ds": ds, "yhat": [5.0, 6.0, 7.0]})
+
+    forward = diff.inverse_transform(fc)
+    reversed_ = diff.inverse_transform(fc.iloc[::-1].copy())
+    shuffled = diff.inverse_transform(fc.iloc[[1, 2, 0]].copy())
+
+    expected = {0: 16.0, 1: 22.0, 2: 29.0}
+    for out in (forward, reversed_, shuffled):
+        got = dict(zip(out["ds"], out["yhat"]))
+        for pos, ds_val in enumerate(ds):
+            assert got[ds_val] == pytest.approx(expected[pos])
+
+
+def test_differencer_in_sample_inverse_ignores_row_order():
+    """The full transformed training panel must invert to the same levels
+    whatever order its rows arrive in."""
+    df = make_panel()
+    diff = Differencer(d=1)
+    z = diff.fit_transform(df)
+    straight = diff.inverse_transform(z)
+    jumbled = diff.inverse_transform(
+        z.sample(frac=1.0, random_state=0).reset_index(drop=True)
+    )
+    key = ["unique_id", "ds"]
+    np.testing.assert_allclose(
+        straight.sort_values(key)["y"].to_numpy(),
+        jumbled.sort_values(key)["y"].to_numpy(),
+        rtol=1e-10,
+    )
+
+
+def test_differencer_inverse_null_ds_raises():
+    """A row with no ds cannot be placed in the integration order.
+
+    inverse_transform sorts each series by ds before integrating. numpy sorts
+    NaT/NaN last, so a null ds used to be integrated at the end and its cumsum
+    value scattered back into the row's original position, producing levels
+    that were silently wrong (e.g. [2, 3, 4, 20, 5, 6] instead of
+    [2, 3, 4, 5, 6, 7]). Integration is only defined in time order, so refuse
+    the frame instead — matching validate_panel, calendar_features, and
+    FiscalCalendar, which all reject a null ds.
+    """
+    df = pd.DataFrame(
+        {
+            "unique_id": ["a"] * 8,
+            "ds": pd.date_range("2024-01-01", periods=8, freq="MS"),
+            "y": np.arange(1.0, 9.0),
+        }
+    )
+    diff = Differencer(d=1)
+    z = diff.fit_transform(df)
+    broken = z.copy()
+    broken.loc[3, "ds"] = pd.NaT
+    with pytest.raises(ForecastOSError, match="ds"):
+        diff.inverse_transform(broken)
+
+
 def test_differencer_too_short_series_raises():
     df = pd.DataFrame({"unique_id": ["a"], "ds": [0], "y": [1.0]})
     with pytest.raises(ForecastOSError):
@@ -332,6 +474,41 @@ def test_calendar_cyclical_columns():
 def test_calendar_requires_datetime_ds():
     with pytest.raises(ForecastOSError):
         calendar_features(make_panel())
+
+
+def _nat_calendar_panel():
+    return pd.DataFrame(
+        {
+            "unique_id": ["a"] * 3,
+            "ds": pd.to_datetime(["2024-01-15", None, "2024-03-15"]),
+            "y": [1.0, 2.0, 3.0],
+        }
+    )
+
+
+def test_calendar_rejects_nat_ds_on_the_integer_branch():
+    """A NaT ``ds`` used to yield fabricated integers with ``cyclical=False``
+    (month=0, which does not exist, and dayofweek=0, indistinguishable from a
+    genuine Monday) because the float NaN was cast to int. There is no calendar
+    month for a missing timestamp, so refuse it rather than invent one."""
+    with pytest.raises(ForecastOSError, match="NaT"):
+        calendar_features(
+            _nat_calendar_panel(), features=("month", "dayofweek"), cyclical=False
+        )
+
+
+def test_calendar_nat_ds_propagates_nan_on_the_cyclical_branch():
+    """The cyclical (default) encoding never fabricated anything: NaN flows
+    through sin/cos and stays NaN, which is an honest answer that downstream
+    finiteness checks catch. The NaT guard must stay scoped to the integer
+    branch so this long-standing call keeps working."""
+    out = calendar_features(
+        _nat_calendar_panel(), features=("month", "dayofweek"), cyclical=True
+    )
+    assert np.isnan(out["month_sin"].iloc[1])
+    assert np.isnan(out["month_cos"].iloc[1])
+    assert np.isnan(out["dayofweek_sin"].iloc[1])
+    assert out["month_sin"].iloc[0] == pytest.approx(np.sin(2 * np.pi * 1 / 12))
 
 
 def test_calendar_unknown_feature_raises():
@@ -484,6 +661,30 @@ def test_logit_inverse_huge_logit_stays_strictly_inside_bounds():
     inv = lt.inverse_transform(fc)
     assert inv["yhat"].iloc[0] < 100.0
     assert inv["yhat"].iloc[1] > 0.0
+
+
+@pytest.mark.parametrize("lower, upper", [(0.0, 1.0), (0.5, 1.0), (20.0, 100.0)])
+def test_logit_inverse_stays_inside_bounds_with_nonzero_lower(lower, upper):
+    """The saturation clamp was applied to the sigmoid output rather than to
+    the rescaled value, so ``lo + (hi-lo)*(1 - epsneg)`` rounded straight back
+    to ``hi`` whenever ``lo != 0`` (lower=0.5, upper=1.0 returned exactly 1.0
+    and exactly 0.5). Every column must land strictly inside ``(lo, hi)``."""
+    df = rate_panel()
+    df["y"] = lower + (upper - lower) * df["y"]
+    lt = LogitTransform(lower=lower, upper=upper).fit(df)
+    fc = pd.DataFrame(
+        {
+            "unique_id": ["a"] * 2,
+            "ds": [5, 6],
+            "yhat": [40.0, -40.0],
+            "lo-80": [-1000.0, -1000.0],
+            "hi-80": [1000.0, 1000.0],
+        }
+    )
+    inv = lt.inverse_transform(fc)
+    for col in ("yhat", "lo-80", "hi-80"):
+        assert (inv[col] > lower).all(), col
+        assert (inv[col] < upper).all(), col
 
 
 def test_logit_per_series_dict_bounds():

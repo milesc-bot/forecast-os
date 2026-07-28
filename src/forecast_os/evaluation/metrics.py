@@ -8,19 +8,28 @@ under/over-forecasting that absolute-error metrics hide. Scaled metrics
 (``mase``, ``rmsse``) additionally need the training series and a seasonality
 ``m`` (the M4/M5 convention).
 
-Interval metrics (:func:`coverage`, :func:`winkler_score`, pinball, CRPS)
+Interval metrics (:func:`coverage`, :func:`winkler_score`, pinball, WIS)
 score ``lo``/``hi`` prediction-interval columns; lower is better everywhere
 except ``coverage``, which should sit close to its nominal ``level/100``.
+They *exclude* rows whose ``y``/``lo``/``hi`` is NaN rather than scoring
+them as misses, and return ``nan`` when no row is scoreable.
 
 :func:`evaluate` scores a :func:`~forecast_os.evaluation.backtest.cross_validation`
 output frame per series and per model. Interval metrics are requested through
 the same ``metrics`` list (``"coverage"``, ``"winkler"``, ``"pinball"``,
-``"crps"``) and discover each model's confidence levels from its
+``"wis"``) and discover each model's confidence levels from its
 ``{model}-lo-{level}`` / ``{model}-hi-{level}`` sibling columns.
+
+``"wis"`` was called ``"crps"`` through v0.9.0. The number never was the CRPS
+— it is the Weighted Interval Score, the quantile approximation to it, and on
+a handful of levels it sits materially BELOW the CRPS it approximates. The old
+name is still accepted and still scores, with a ``FutureWarning``, but the
+emitted row is labelled ``wis``.
 """
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable
 
 import numpy as np
@@ -125,6 +134,8 @@ def tracking_signal(y, yhat) -> float:
 
 
 def _naive_scale(y_train: np.ndarray, m: int, squared: bool) -> float:
+    if m < 1:
+        raise ValueError(f"m must be a positive integer, got {m}")
     y_train = np.asarray(y_train, dtype=float).ravel()
     if len(y_train) <= m:
         raise ValueError(f"training series (len {len(y_train)}) must be longer than m={m}")
@@ -158,10 +169,32 @@ def pinball_loss(y, q_pred, q: float) -> float:
     return float(np.mean(np.maximum(q * diff, (q - 1) * diff)))
 
 
-def coverage(y, lo, hi) -> float:
-    """Empirical coverage: fraction of actuals inside [lo, hi]."""
+def _scoreable_interval_rows(y, lo, hi) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Aligned ``(y, lo, hi)`` restricted to rows with no NaN in any of the three.
+
+    An unscoreable row is *excluded*, not counted: ``(y >= lo) & (y <= hi)``
+    and ``np.where(y < lo, ...)`` are both False for NaN, which would silently
+    turn "unknown" into a definite miss / a perfectly covered interval. This
+    matches what :func:`evaluate` already does (``_score_interval`` drops NaN
+    rows before scoring), so the direct-call and ``evaluate`` paths agree.
+    Infinite bounds are kept: they score correctly as-is (always covered, with
+    an infinite Winkler score).
+    """
     y, lo = _align(y, lo)
     _, hi = _align(y, hi)
+    ok = ~(np.isnan(y) | np.isnan(lo) | np.isnan(hi))
+    return y[ok], lo[ok], hi[ok]
+
+
+def coverage(y, lo, hi) -> float:
+    """Empirical coverage: fraction of actuals inside [lo, hi].
+
+    Rows where ``y``, ``lo`` or ``hi`` is NaN are excluded; ``nan`` is
+    returned when no row is scoreable.
+    """
+    y, lo, hi = _scoreable_interval_rows(y, lo, hi)
+    if y.size == 0:
+        return float("nan")
     return float(np.mean((y >= lo) & (y <= hi)))
 
 
@@ -172,11 +205,15 @@ def winkler_score(y, lo, hi, level: float) -> float:
     actual falls outside ``[lo, hi]``, a penalty of ``2/a`` times the distance
     to the violated bound, where ``a = 1 - level/100``. Lower is better;
     narrow intervals that still cover win.
+
+    Rows where ``y``, ``lo`` or ``hi`` is NaN are excluded; ``nan`` is
+    returned when no row is scoreable.
     """
     if not 0 < level < 100:
         raise ValueError(f"level must be in (0, 100), got {level}")
-    y, lo = _align(y, lo)
-    _, hi = _align(y, hi)
+    y, lo, hi = _scoreable_interval_rows(y, lo, hi)
+    if y.size == 0:
+        return float("nan")
     a = 1.0 - level / 100.0
     score = hi - lo
     score = score + np.where(y < lo, (2.0 / a) * (lo - y), 0.0)
@@ -194,11 +231,16 @@ _SIMPLE_METRICS: dict[str, Callable] = {
     "tracking_signal": tracking_signal,
 }
 _SCALED_METRICS: dict[str, Callable] = {"mase": mase, "rmsse": rmsse}
-_INTERVAL_METRICS = ("coverage", "winkler", "pinball", "crps")
+_INTERVAL_METRICS = ("coverage", "winkler", "pinball", "wis")
+
+#: Metric names accepted for backward compatibility, mapped to what they are.
+#: ``crps`` shipped through v0.9.0 for a number that is not the CRPS.
+_METRIC_ALIASES = {"crps": "wis"}
+
 
 _META_COLS = {ID_COL, TIME_COL, TARGET_COL, "cutoff"}
-# Stand-in for a series absent from train_df: _naive_scale raises on it, which
-# is the same error the old per-series .loc lookup produced for a missing id.
+# Stand-in for a series absent from train_df; evaluate() diagnoses it by name
+# before it can reach _naive_scale, whose "len 0" message blames ``m`` instead.
 _NO_TRAIN = np.empty(0, dtype=float)
 
 
@@ -239,18 +281,36 @@ def _score_interval(g: pd.DataFrame, col: str, lvl: int, metric: str) -> float:
     return 0.5 * (pinball_loss(y, lo, q_lo) + pinball_loss(y, hi, q_hi))
 
 
-def _score_crps(g: pd.DataFrame, col: str, levels: list[int]) -> float:
-    """Quantile-approximated CRPS: mean of 2x pinball over all implied quantiles."""
+def _score_wis(g: pd.DataFrame, col: str, levels: list[int]) -> float:
+    """Weighted Interval Score (Bracher et al. 2021).
+
+    ``[(1/2)|y - point| + sum_k (alpha_k/2) * winkler_k] / (K + 1/2)`` with
+    ``alpha_k = 1 - level_k/100``. The ``alpha_k/2`` weights are the ``dq`` of
+    ``CRPS = 2 * int_0^1 pinball_q dq``, so WIS is a quadrature rule for the
+    CRPS over the requested levels — but only a dense, evenly spaced level set
+    makes that quadrature accurate. Scoring a perfectly calibrated N(0, 1)
+    forecast against N(0, 1) draws (true CRPS ``1/sqrt(pi) = 0.564``), the
+    measured ``wis / crps`` ratio is 0.89 at ``level=[80]``, 0.61 at
+    ``[80, 95]``, 0.76 at ``[50, 80, 95]`` and 1.01 at 49 evenly spaced
+    levels. It is not even monotone in the level set — adding the 95% band to
+    ``[80]`` LOWERS the score, because the ``K + 1/2`` normaliser grows faster
+    than the ``alpha_k/2``-weighted term it adds. That is why this is emitted
+    as ``wis`` and not as ``crps``: on the level sets this library produces it
+    is a different, systematically smaller number than the CRPS, and comparing
+    it against a CRPS from properscoring/scoringrules is meaningless.
+    """
     interval_cols = [f"{col}-{side}-{lvl}" for lvl in levels for side in ("lo", "hi")]
     valid = g[[TARGET_COL, col, *interval_cols]].dropna()
     if len(valid) == 0:
         return float("nan")
     y = valid[TARGET_COL]
-    terms = []
+    total = 0.5 * mae(y, valid[col])
     for lvl in levels:
-        terms.append(2.0 * pinball_loss(y, valid[f"{col}-lo-{lvl}"], 0.5 - lvl / 200.0))
-        terms.append(2.0 * pinball_loss(y, valid[f"{col}-hi-{lvl}"], 0.5 + lvl / 200.0))
-    return float(np.mean(terms))
+        a = 1.0 - lvl / 100.0
+        total += (a / 2.0) * winkler_score(
+            y, valid[f"{col}-lo-{lvl}"], valid[f"{col}-hi-{lvl}"], lvl
+        )
+    return float(total / (len(levels) + 0.5))
 
 
 def _train_series_by_id(train_df: pd.DataFrame, scaled: list[str]) -> dict:
@@ -279,6 +339,40 @@ def _train_series_by_id(train_df: pd.DataFrame, scaled: list[str]) -> dict:
     }
 
 
+def _resolve_metric_aliases(metrics: Iterable[str]) -> list[str]:
+    """Map deprecated metric names onto current ones, warning once each.
+
+    ``crps`` scored the Weighted Interval Score, not the CRPS. The value is
+    kept (it is the right number for the name ``wis``) and the old spelling
+    keeps working, but the row is emitted under the honest name — a metric
+    labelled ``crps`` that is 0.6x the CRPS silently corrupts any comparison
+    against a library that reports the real thing. An alias that duplicates a
+    name already in the list collapses onto it rather than emitting two
+    identical rows.
+    """
+    resolved: list[str] = []
+    aliased: set[str] = set()
+    for name in metrics:
+        new = _METRIC_ALIASES.get(name)
+        if new is not None:
+            warnings.warn(
+                f"metric {name!r} is deprecated and renamed to {new!r}: the "
+                f"value scored is the Weighted Interval Score, which is NOT the "
+                f"CRPS (~0.6-0.9x it on typical level sets). The emitted row is "
+                f"labelled {new!r} — callers that select rows or columns by "
+                f"metric name (e.g. ForecastEngine.compare) must ask for "
+                f"{new!r}.",
+                FutureWarning,
+                stacklevel=3,
+            )
+            name = new
+            aliased.add(new)
+        if name in aliased and name in resolved:
+            continue
+        resolved.append(name)
+    return resolved
+
+
 def evaluate(
     cv_df: pd.DataFrame,
     metrics: Iterable[str] = ("mae", "rmse", "smape"),
@@ -300,14 +394,24 @@ def evaluate(
     metrics alike and requires ``cv_df`` to carry a ``cutoff`` column. Any
     other ``by`` value raises :class:`ValueError`.
 
-    Interval metrics — ``coverage``, ``winkler``, ``pinball``, ``crps`` — read
+    Interval metrics — ``coverage``, ``winkler``, ``pinball``, ``wis`` — read
     each model's ``{model}-lo-{level}`` / ``{model}-hi-{level}`` columns (as
     produced by ``cross_validation(..., level=[...])``). The first three emit
     one row per discovered level, named ``coverage-{l}`` / ``winkler-{l}`` /
     ``pinball-{l}``; ``pinball-{l}`` is the mean pinball loss at the two
-    implied tail quantiles ``0.5 -/+ l/200``. ``crps`` emits a single row with
-    the quantile-approximated CRPS: the mean over all implied quantiles (both
-    tails of every level) of twice the pinball loss.
+    implied tail quantiles ``0.5 -/+ l/200``. ``wis`` emits a single row with
+    the Weighted Interval Score (Bracher et al. 2021) over the ``K`` discovered
+    levels: ``[(1/2)|y - point| + sum_k (alpha_k/2) * winkler_k] / (K + 1/2)``
+    with ``alpha_k = 1 - level_k/100``.
+
+    ``wis`` is a quantile approximation to the CRPS and NOT the CRPS: it
+    converges to it only as the level set densifies, and on the level sets this
+    library produces it is much smaller — measured against a true CRPS of
+    ``1/sqrt(pi)``, 0.89x at ``level=[80]`` and 0.61x at ``[80, 95]``. It is
+    also not monotone in the level set. Compare it only across models scored on
+    identical levels, never against another library's CRPS. Requesting the
+    pre-v0.10.0 name ``crps`` still scores, with a ``FutureWarning``, and
+    the emitted row is labelled ``wis``.
     """
     if by not in (None, "cutoff"):
         raise ValueError(f"unknown by={by!r}; expected None or 'cutoff'")
@@ -322,7 +426,7 @@ def evaluate(
     model_cols = _model_columns(cv_df)
     if not model_cols:
         raise ValueError("cv_df has no model forecast columns")
-    metrics = list(metrics)
+    metrics = _resolve_metric_aliases(metrics)
     for name in metrics:
         if (
             name not in _SIMPLE_METRICS
@@ -364,10 +468,10 @@ def evaluate(
     for meta, g in groups:
         y_train = train_by_id.get(meta[ID_COL], _NO_TRAIN)
         for metric in metrics:
-            if metric == "crps":
-                row: dict = {**meta, "metric": "crps"}
+            if metric == "wis":
+                row: dict = {**meta, "metric": "wis"}
                 for col in model_cols:
-                    row[col] = _score_crps(g, col, levels_by_model[col])
+                    row[col] = _score_wis(g, col, levels_by_model[col])
                 rows.append(row)
             elif metric in _INTERVAL_METRICS:
                 for lvl in all_levels:
@@ -387,6 +491,13 @@ def evaluate(
                     elif metric in _SIMPLE_METRICS:
                         row[col] = _SIMPLE_METRICS[metric](valid[TARGET_COL], valid[col])
                     else:
+                        if y_train.size == 0:
+                            raise ValueError(
+                                f"train_df has no rows for series "
+                                f"{meta[ID_COL]!r}; scaled metrics "
+                                f"{sorted(m for m in metrics if m in _SCALED_METRICS)} "
+                                f"need the training history of every series in cv_df"
+                            )
                         row[col] = _SCALED_METRICS[metric](
                             valid[TARGET_COL], valid[col], y_train, m=seasonality
                         )

@@ -38,6 +38,38 @@ def stage_panel(
     return to_panel(records, id_cols=cols, date_col=date_col, freq=freq, sep=sep)
 
 
+def _split_stage_ids(
+    ids: pd.Series, stages: Sequence[str], sep: str
+) -> tuple[pd.Series, pd.Series]:
+    """Split ``"prefix<sep>stage"`` unique_ids into ``(prefix, stage)``.
+
+    A stage name may itself contain ``sep`` — ``"Negotiation/Review"`` is a
+    stock Salesforce picklist value — so a plain ``rpartition(sep)`` mangles it
+    into prefix ``"Negotiation"`` / stage ``"Review"``, which then reports the
+    real stage as absent and loses the prefix grouping. The REQUESTED stage
+    names therefore win: an id equal to a requested stage, or ending in ``sep``
+    plus a requested stage, is split at that boundary (longest match first).
+    Ids matching no requested stage keep the old ``rpartition`` behaviour, so
+    the "found stages" message still names the other stages in the panel.
+    """
+    ordered = sorted(set(stages), key=len, reverse=True)
+    prefix_of: dict[str, str] = {}
+    stage_of: dict[str, str] = {}
+    for uid in ids.unique():
+        for stage in ordered:
+            if uid == stage:
+                prefix_of[uid], stage_of[uid] = "", stage
+                break
+            if sep and uid.endswith(sep + stage):
+                prefix_of[uid] = uid[: -(len(sep) + len(stage))]
+                stage_of[uid] = stage
+                break
+        else:
+            prefix, _, stage = uid.rpartition(sep)
+            prefix_of[uid], stage_of[uid] = prefix, stage
+    return ids.map(prefix_of), ids.map(stage_of)
+
+
 def conversion_rates(
     stage_df: pd.DataFrame, stages: Sequence[str], sep: str = "/"
 ) -> pd.DataFrame:
@@ -56,6 +88,13 @@ def conversion_rates(
       undefined when nothing entered the upstream stage that period.
     - Periods missing from one stage's series but present in the other are
       treated as zero counts.
+    - A stage name may itself contain ``sep`` (Salesforce ships
+      ``"Negotiation/Review"``): ids are split against the requested ``stages``
+      first, so only the leading prefix is stripped.
+
+    Raises :class:`ForecastOSError` when a requested stage is absent from
+    ``stage_df``, and when no stage-id prefix holds both stages of any
+    consecutive pair (so no rate series could be emitted at all).
 
     The output has ``(unique_id, ds, y)`` columns; ``y`` may contain NaN, so
     pass ``allow_missing=True`` if you re-validate it as a panel.
@@ -66,8 +105,9 @@ def conversion_rates(
 
     # split "prefix/stage" ids into (prefix, stage); plain ids have prefix ""
     work = stage_df[[ID_COL, TIME_COL, TARGET_COL]].reset_index(drop=True).copy()
-    split = work[ID_COL].astype(str).str.rpartition(sep)
-    work["_prefix"], work["_stage"] = split[0], split[2]
+    work["_prefix"], work["_stage"] = _split_stage_ids(
+        work[ID_COL].astype(str), stages, sep
+    )
 
     found = set(work["_stage"])
     unknown = [s for s in stages if s not in found]
@@ -94,6 +134,21 @@ def conversion_rates(
                 rate = rate / np.where(top.to_numpy() == 0, 1.0, top.to_numpy())
             name = f"{a}->{b}" if prefix == "" else f"{prefix}{sep}{a}->{b}"
             frames.append(pd.DataFrame({ID_COL: name, TIME_COL: index, TARGET_COL: rate}))
+    if not frames:
+        # Every requested stage exists SOMEWHERE (the `unknown` guard above
+        # checks the panel as a whole), but rates are computed within a prefix
+        # group, so a pair whose two stages never share a prefix emits nothing.
+        # Without this the empty `frames` reached pd.concat and surfaced as a
+        # bare "No objects to concatenate" with no domain context.
+        held = {
+            str(prefix): sorted(set(g["_stage"]))
+            for prefix, g in work.groupby("_prefix", sort=True)
+        }
+        raise ForecastOSError(
+            f"no stage-id prefix holds both stages of any consecutive pair in "
+            f"{stages}; conversion rates are computed within a prefix group, and "
+            f"the prefixes hold {held}"
+        )
     out = pd.concat(frames, ignore_index=True)
     return out.sort_values([ID_COL, TIME_COL], kind="stable").reset_index(drop=True)
 

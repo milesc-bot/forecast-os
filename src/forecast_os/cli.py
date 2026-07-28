@@ -19,6 +19,10 @@ CSV in, CSV (or printed table) out::
 duplicate ``(unique_id, ds)`` rows (``count`` ignores target values), and
 ``--freq FREQ`` reindexes each series to a regular grid from its first to its
 last timestamp, filling gaps per ``--fill {zero,nan}`` (default ``zero``).
+``--fill nan`` leaves gap periods empty, which the ``(unique_id, ds, y)``
+contract then refuses: it names the gap periods it found (the first few) and
+exits rather than forecasting an incomplete target, so use it to find gaps,
+not to fill them. It applies to the ``--mapping`` path too.
 Timestamps need not land on the grid: each is bucketed into the period that
 contains it (a deal closed 2024-01-17 counts in the ``MS`` period
 2024-01-01), so nothing is dropped: two rows in one period then need
@@ -28,8 +32,8 @@ no period and is an error rather than a silent deletion.
 Alternatively ``--mapping NAME`` applies a named platform recipe (list them
 with ``forecast-os mappings``) that renames, filters, and aggregates the raw
 export in one step. It replaces the manual options above — combining it with
-``--id-col/--time-col/--target-col/--agg`` is an error — and ``--freq``
-becomes an override of the recipe's frequency.
+``--id-col/--time-col/--target-col/--agg`` is an error — while ``--freq`` and
+``--fill`` become overrides of the recipe's frequency and gap fill.
 
 Errors (bad files, unknown models, contract violations) print ``error: ...``
 to stderr and exit with status 2 — never a traceback.
@@ -97,6 +101,26 @@ def _require_dated_rows(df: pd.DataFrame, flag: str) -> None:
     )
 
 
+def _require_identified_rows(df: pd.DataFrame, flag: str) -> None:
+    """Reject rows whose unique_id is null: they name no series to group into.
+
+    A groupby drops null keys by default, so a deal with a blank owner cell
+    vanished from the panel along with its y. :func:`validate_panel` already
+    refuses such a row on the plain path ("every row must name the series it
+    belongs to"), so grouping here must not silently waive that check.
+    """
+    null = df[ID_COL].isna()
+    if not bool(null.any()):
+        return
+    labels = list(df.index[null][:5])
+    raise ValueError(
+        f"{flag} cannot group {int(null.sum())} row(s) with a null/blank "
+        f"unique_id (row label(s) {labels}); every row must name the series it "
+        "belongs to, so filter or fill them first — grouping them here would "
+        "silently lose their y"
+    )
+
+
 def _aggregate(df: pd.DataFrame, how: str) -> pd.DataFrame:
     """Collapse duplicate (unique_id, ds) rows; ``count`` ignores target values."""
     for col in (ID_COL, TIME_COL):
@@ -104,6 +128,7 @@ def _aggregate(df: pd.DataFrame, how: str) -> pd.DataFrame:
             raise ValueError(
                 f"--agg requires a {col!r} column; map one with --id-col/--time-col"
             )
+    _require_identified_rows(df, "--agg")
     _require_dated_rows(df, "--agg")
     if how == "count":
         counted = df.groupby([ID_COL, TIME_COL], as_index=False).size()
@@ -155,6 +180,11 @@ def _regularize(df: pd.DataFrame, freq: str, fill: str) -> pd.DataFrame:
     :func:`_bucket_ds`), so no row is ever dropped by the reindex. Gaps get
     ``y = 0.0`` (``fill="zero"``, the GTM default: a period with no rows is
     a period with no bookings) or ``NaN`` (``fill="nan"``).
+
+    ``fill="nan"`` raises when it actually creates a gap: every CLI consumer
+    validates the panel, which rejects a NaN target, so the only outcomes are
+    a bit-identical no-op (no gaps) or an error. Raising here says so in CLI
+    terms instead of deferring to a message about a library-only kwarg.
     """
     for col in (ID_COL, TIME_COL, TARGET_COL):
         if col not in df.columns:
@@ -162,6 +192,7 @@ def _regularize(df: pd.DataFrame, freq: str, fill: str) -> pd.DataFrame:
                 f"--freq requires a {col!r} column; map one with "
                 f"--id-col/--time-col/--target-col"
             )
+    _require_identified_rows(df, "--freq")  # the per-series groupby below drops them
     df = _bucket_ds(df, freq)  # idempotent: on-grid timestamps map to themselves
     frames = []
     for uid, g in df.groupby(ID_COL, sort=True):
@@ -184,7 +215,43 @@ def _regularize(df: pd.DataFrame, freq: str, fill: str) -> pd.DataFrame:
         frames.append(
             pd.DataFrame({ID_COL: uid, TIME_COL: grid, TARGET_COL: s.to_numpy(dtype=float)})
         )
-    return pd.concat(frames, ignore_index=True)
+    return _require_complete_target(pd.concat(frames, ignore_index=True))
+
+
+def _require_complete_target(df: pd.DataFrame) -> pd.DataFrame:
+    """Refuse a panel whose ``y`` has holes, naming the periods it found.
+
+    Only ``--fill nan`` can produce one. Every CLI consumer validates the
+    panel, and the contract rejects a NaN target unless ``allow_missing=True``
+    -- a library-only kwarg. Say so in terms the shell user can act on rather
+    than letting validate_panel point at a flag that does not exist here, and
+    list the offending ``(unique_id, ds)`` pairs (capped) so "it reports the
+    gaps it found" means the gaps, not just how many there were.
+    """
+    missing = df.loc[df[TARGET_COL].isna(), [ID_COL, TIME_COL]]
+    if missing.empty:
+        return df
+    shown = ", ".join(
+        f"{uid} @ {_format_ds(ds)}" for uid, ds in missing.head(5).to_numpy()
+    )
+    if len(missing) > 5:
+        shown += f", ... ({len(missing) - 5} more)"
+    raise ValueError(
+        f"--fill nan left {len(missing)} period(s) with no 'y' value: {shown}. "
+        "forecast and compare need a complete target, so this panel cannot be "
+        "used as-is. Pass --fill zero (a period with no rows is a period with "
+        "no bookings), or impute the gaps yourself "
+        "(forecast_os.preprocessing.Imputer) and feed the result back in"
+    )
+
+
+def _format_ds(value: Any) -> str:
+    """A gap timestamp for an error message: date only when it is midnight."""
+    try:
+        ts = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return ts.strftime("%Y-%m-%d" if ts == ts.normalize() else "%Y-%m-%d %H:%M:%S")
 
 
 def _prepare_panel(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
@@ -203,13 +270,20 @@ def _prepare_panel(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
         if conflicts:
             raise ValueError(
                 f"--mapping replaces the manual panel options; drop "
-                f"{', '.join(conflicts)} (--freq is the only --mapping override)"
+                f"{', '.join(conflicts)} (--freq and --fill are the only "
+                f"--mapping overrides)"
             )
         from .connectors import mappings  # noqa: F401  (registers platform recipes)
         from .connectors.base import apply_mapping
 
-        overrides = {"freq": args.freq} if args.freq else {}
-        return apply_mapping(df, args.mapping, **overrides)
+        overrides: dict[str, Any] = {"freq": args.freq} if args.freq else {}
+        if args.fill == "nan":
+            # --fill used to stop here, so `--mapping X --fill nan` quietly
+            # forecast the recipe's invented zeros -- exit 0 on exactly the
+            # panel the flag exists to flag. The recipe's own fill_value is
+            # left alone unless the user asked for gaps to stay empty.
+            overrides["fill_value"] = float("nan")
+        return _require_complete_target(apply_mapping(df, args.mapping, **overrides))
     rename = {}
     for source, target in (
         (args.id_col, ID_COL),
@@ -326,7 +400,7 @@ def _add_panel_options(p: argparse.ArgumentParser) -> None:
         "--mapping", default=None, metavar="NAME",
         help="named platform recipe (see `forecast-os mappings`) that renames, filters, "
         "and aggregates the raw export; replaces --id-col/--time-col/--target-col/--agg "
-        "(--freq still overrides the recipe's frequency)",
+        "(--freq and --fill still override the recipe's frequency and gap fill)",
     )
     p.add_argument("--id-col", default=None, help="input column to use as unique_id")
     p.add_argument("--time-col", default=None, help="input column to use as ds")
@@ -342,7 +416,9 @@ def _add_panel_options(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--fill", choices=("zero", "nan"), default="zero",
-        help="fill for gaps created by --freq (default: zero)",
+        help="fill for gaps created by --freq or by a --mapping recipe (default: "
+        "zero); 'nan' leaves gaps empty, which the panel contract rejects — it "
+        "names them instead of forecasting an incomplete target",
     )
 
 

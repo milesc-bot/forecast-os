@@ -36,8 +36,9 @@ REST and MCP surfaces never drift.
 ## MCP server
 
 `pip install "forecast-os-gtm[mcp]"`, register `forecast-os-mcp` with your MCP
-client, and an agent gets `preview_panel`, `forecast`, `compare`, and
-`quota_attainment` tools directly. See [connectors.md](connectors.md).
+client, and an agent gets six tools directly: `preview_panel`, `forecast`,
+`compare`, `quota`, `list_models`, and `list_mappings`. See
+[connectors.md](connectors.md).
 
 ## Foundation models
 

@@ -15,7 +15,10 @@ the canonical *leads x rate x deal-size* identity::
     bookings = top_of_funnel * prod(rate drivers) * acv
 
 where the *rate drivers* are every driver whose name ends in ``_rate`` (so
-``win_rate``, ``sql_rate``, ... all multiply in), ``acv`` (average contract
+``win_rate``, ``sql_rate``, ... all multiply in, and each must be non-negative —
+a driver bumped below zero raises, but one above 1.0 is allowed and multiplies
+in as-is, since ``expansion_rate``/``attach_rate``-style drivers are genuine
+multipliers rather than probabilities), ``acv`` (average contract
 value) turns a deal count into currency and defaults to ``1.0`` when absent,
 and any other driver (e.g. ``rep_count``) is carried for the caller's own use
 but does not enter the default bookings number. ``top_of_funnel`` is required.
@@ -161,6 +164,36 @@ class Scenario:
             raise ForecastOSError(f"{ACV!r} must be non-negative, got {acv}")
         return acv
 
+    def _rate_product(self) -> float:
+        """Product of the ``*_rate`` drivers, each validated to be non-negative.
+
+        The stages path validates every rate inside :func:`propagate`, so
+        ``project({"won": "win_rate"})`` has always refused a win_rate of -0.1.
+        The default path multiplied the same driver in unchecked, which turned
+        one ``bump(win_rate=-0.20)`` past zero into a silently NEGATIVE bookings
+        number (and a -200% pct_delta in :func:`compare_scenarios`). A negative
+        multiplier has no meaning in the identity, so it is rejected here too.
+
+        Only the lower bound is enforced. ``_rate`` is a *name* suffix, and it
+        cannot distinguish a conversion probability from a multiplier:
+        ``expansion_rate=1.15``, ``attach_rate=1.8`` and ``growth_rate=1.4`` are
+        ordinary GTM drivers for which the identity is perfectly well defined.
+        Bounding them at 1.0 would also be unescapable, since the ``_rate``
+        suffix is the only thing that makes a driver multiply in at all — a
+        rename to ``expansion_factor`` drops the factor from the projection
+        rather than preserving it. Values above 1 therefore multiply in as-is.
+        """
+        product = 1.0
+        for key, value in self.baseline_drivers.items():
+            if not key.endswith(RATE_SUFFIX):
+                continue
+            if value < 0.0:
+                raise ForecastOSError(
+                    f"rate driver {key!r} must be non-negative, got {value}"
+                )
+            product *= value
+        return product
+
     def stage_volumes(self, stages: Mapping[str, float | str]) -> pd.Series:
         """Per-stage deal volumes down a funnel chain, via :func:`propagate`.
 
@@ -212,15 +245,19 @@ class Scenario:
         acv``. With a ``stages`` chain, runs the volume through
         :meth:`stage_volumes` and multiplies the final stage's deal count by
         ``acv``. Returns a plain float.
+
+        Raises :class:`ForecastOSError` when ``top_of_funnel``, ``acv`` or a
+        ``*_rate`` driver is negative; both projection paths reject negatives
+        alike (the stages path via :func:`propagate`). The two paths differ on
+        the upper end: a ``*_rate`` driver above 1.0 multiplies in normally on
+        the default path (it may be a multiplier such as ``expansion_rate``),
+        while the ``stages`` path caps every rate at 1.0 because a funnel chain
+        cannot grow volume from one stage to the next.
         """
         top = self._require_top()
         acv = self._acv()
         if stages is None:
-            rate_product = 1.0
-            for key, value in self.baseline_drivers.items():
-                if key.endswith(RATE_SUFFIX):
-                    rate_product *= value
-            return top * rate_product * acv
+            return top * self._rate_product() * acv
         volumes = self.stage_volumes(stages)
         final = float(volumes.iloc[-1])
         return final * acv

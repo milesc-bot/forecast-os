@@ -4,6 +4,8 @@ Member models are local dummies; registry lookups use throwaway
 ``_test_``-prefixed names registered inside the tests.
 """
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -144,3 +146,96 @@ def test_clone_deep_clones_member_instance():
 def test_clone_passes_string_member_through():
     cf = ConformalForecaster(model="_test_conf_mean")
     assert cf.clone().model == "_test_conf_mean"
+
+
+# --- v0.10.0 audit regressions ---------------------------------------------
+
+
+def test_unattainable_level_warns_and_documents_the_coverage_cap():
+    """A level split conformal cannot reach was silently clamped to the max score.
+
+    ``q_level = min(1.0, (n + 1) * (lvl / 100) / n)`` substitutes the largest
+    calibration residual whenever ``ceil((n + 1) * lvl/100) > n``, so with
+    n_cal = 8 the 90/95/99% bands are all the *same* band and all cover at
+    most 8/9 = 88.9%. That is a real miscalibration for a class whose whole
+    value proposition is a finite-sample coverage guarantee, so it must not be
+    silent. The band itself is still returned (the widest one available) —
+    refusing the call would break short real-world series.
+    """
+    rng = np.random.default_rng(0)
+    cf = ConformalForecaster(model=_Zero()).fit(to_panel(rng.normal(size=32)))
+    assert len(cf._abs_resid_["series-0"]) == 8
+
+    with pytest.warns(UserWarning, match="level 99 needs >= 99 calibration residuals"):
+        pred = cf.predict(1, level=[99])
+    assert np.isfinite(pred[["lo-99", "hi-99"]].to_numpy()).all()
+
+    # level 80 needs ceil(9 * 0.8) = 8 <= 8 residuals: attainable, no warning
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cf.predict(1, level=[80])
+
+
+def test_unattainable_level_warning_names_the_series_and_the_cap():
+    rng = np.random.default_rng(4)
+    cf = ConformalForecaster(model=_Zero()).fit(to_panel(rng.normal(size=32)))
+    with pytest.warns(UserWarning) as rec:
+        cf.predict(1, level=[90, 95])
+    msg = str(rec[0].message)
+    assert "'series-0'" in msg and "has 8" in msg and "88.9%" in msg
+
+
+# --- remediation round 2 ----------------------------------------------------
+
+
+class _ExplodesOnFullRefit(PerSeriesForecaster):
+    """Member whose fit raises once the calibration head has been consumed.
+
+    ``ConformalForecaster.fit`` fits the member twice: once on the head to get
+    calibration residuals, once on the full panel to get the point forecasts.
+    This dummy lets the first fit through and blows up on the second (it fires
+    on the longest panel it is asked to fit), reproducing a refit that fails
+    only on the full series.
+    """
+
+    def __init__(self, boom_at: int = 0):
+        self.boom_at = boom_at
+
+    def _fit_series(self, y):
+        if len(y) >= self.boom_at:
+            raise ForecastOSError("full refit exploded")
+        return {"mu": float(np.mean(y))}
+
+    def _predict_series(self, state, h):
+        return np.full(h, state["mu"])
+
+
+def test_failed_refit_does_not_leave_a_half_updated_conformal_model():
+    """A fit that raises must not leave old forecasts wearing new interval widths.
+
+    ``fit`` published ``_abs_resid_`` (the NEW calibration) before the final
+    full refit and never cleared ``_is_fitted``. When that refit raised, the
+    object kept ``_is_fitted = True``, the OLD ``_model_`` and the NEW
+    residuals, so ``predict()`` still succeeded and returned stale point
+    forecasts wrapped in freshly calibrated widths — a silently wrong number
+    rather than a loud failure. A failed refit must leave the object unfitted
+    (and must not mutate the state of the previous successful fit).
+    """
+    first = to_panel(np.full(40, 100.0) + np.arange(40) % 3)
+    cf = ConformalForecaster(model=_Mean()).fit(first)
+    good = cf.predict(2, level=[80])
+    resid_before = {k: v.copy() for k, v in cf._abs_resid_.items()}
+
+    # 40 rows, 10 held out for calibration -> head is 30 rows, full panel is 40
+    cf.model = _ExplodesOnFullRefit(boom_at=40)
+    with pytest.raises(ForecastOSError, match="full refit exploded"):
+        cf.fit(to_panel(np.full(40, 500.0) + np.arange(40) % 3))
+
+    assert cf._is_fitted is False
+    with pytest.raises(NotFittedError):
+        cf.predict(2, level=[80])
+    # the previous fit's calibration was not overwritten by the failed one
+    for uid, r in resid_before.items():
+        np.testing.assert_allclose(cf._abs_resid_[uid], r)
+    cf._is_fitted = True
+    pd.testing.assert_frame_equal(cf.predict(2, level=[80]), good)

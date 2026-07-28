@@ -91,8 +91,12 @@ def sparkline(values, width: int = 12) -> str:
     """The last ``width`` values as a unicode block-character sparkline.
 
     Values are min-max scaled over the window's finite entries; NaN renders
-    as ``·`` and a constant window renders as a flat mid-height line.
+    as ``·`` and a constant window renders as a flat mid-height line. A
+    non-positive ``width`` asks for no values and renders as ``""`` (slicing
+    with ``[-0:]`` would otherwise return the whole series).
     """
+    if width <= 0:
+        return ""
     vals = np.asarray(list(values), dtype=float)[-width:]
     if vals.size == 0:
         return ""

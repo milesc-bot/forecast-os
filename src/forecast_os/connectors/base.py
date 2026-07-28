@@ -76,6 +76,49 @@ def _numeric_values(values: pd.Series, mapping_name: str, column: str) -> pd.Ser
     return numbers.mask(negative, -numbers).astype(float)
 
 
+def _check_no_collisions(
+    records: pd.DataFrame, out: pd.DataFrame, m: SchemaMapping, needed: list[str]
+) -> None:
+    """Raise when renames landed two source columns on one canonical name.
+
+    Recipes list several source variants per canonical name (``date`` AND
+    ``timestamp`` -> ``ts``) on the premise that renaming an absent column
+    is a no-op — sound only while at most one variant is present. An event
+    log carrying both a ``date`` partition column and a ``timestamp``
+    produces two ``ts`` columns, and pandas then fails deep inside the
+    shaping step with ``cannot assemble with duplicate keys`` or ``cannot
+    reindex on an axis with duplicate labels``, naming neither the mapping
+    nor the columns that collided. Only the columns this mapping actually
+    reads are checked, so unrelated duplicate labels elsewhere in the
+    export keep passing through as before.
+    """
+    interesting = set(needed) | set(m.filters)
+    collided = [c for c in dict.fromkeys(out.columns[out.columns.duplicated()])
+                if c in interesting]
+    if not collided:
+        return
+    parts = []
+    for name in collided:
+        sources = sorted(
+            src for src, dst in m.renames.items()
+            if dst == name and src in records.columns
+        )
+        if name in records.columns and name not in m.renames:
+            sources.append(name)
+        parts.append(
+            f"{name!r} <- {sources}"
+            if len(sources) > 1
+            else f"{name!r} (already duplicated in the records)"
+        )
+    raise DataContractError(
+        f"mapping {m.name!r} produced duplicate column(s) after renames "
+        f"{m.renames}: {'; '.join(parts)}. These records carry more than one "
+        f"variant of the same field. Keep one: override renames= without the "
+        f"variant you do not want, or drop the extra column from the records "
+        f"before applying the mapping"
+    )
+
+
 @dataclass(frozen=True)
 class SchemaMapping:
     """Declarative recipe: platform export shape -> (unique_id, ds, y) panel.
@@ -88,13 +131,14 @@ class SchemaMapping:
     ``date_format`` describe numeric date columns (epoch unit or strftime
     format — see :func:`~forecast_os.gtm.events.to_panel`). Any
     :func:`~forecast_os.gtm.events.to_panel` argument can be overridden at
-    apply time.
+    apply time; ``id_cols`` accepts a bare string for a single column,
+    exactly as :func:`~forecast_os.gtm.events.to_panel` does.
     """
 
     name: str
     description: str
     date_col: str
-    id_cols: tuple[str, ...] = ()
+    id_cols: tuple[str, ...] | str = ()
     value_col: str | None = None
     renames: dict[str, str] = field(default_factory=dict)
     filters: dict[str, tuple] = field(default_factory=dict)
@@ -123,13 +167,17 @@ class SchemaMapping:
                 f"expected a DataFrame of records, got {type(records).__name__}"
             )
         out = records.rename(columns=m.renames)
-        needed = [*m.id_cols, m.date_col] + ([m.value_col] if m.value_col else [])
+        # to_panel takes a bare string for a single id column; accept the same
+        # here, or `id_cols="owner"` is iterated into ['o','w','n','e','r'].
+        ids = [m.id_cols] if isinstance(m.id_cols, str) else list(m.id_cols)
+        needed = [*ids, m.date_col] + ([m.value_col] if m.value_col else [])
         missing = [c for c in needed if c not in out.columns]
         if missing:
             raise DataContractError(
                 f"mapping {m.name!r} needs column(s) {missing} after renames "
                 f"{m.renames}; records have {sorted(out.columns.astype(str))[:12]}"
             )
+        _check_no_collisions(records, out, m, needed)
         for col, allowed in m.filters.items():
             if col not in out.columns:
                 raise DataContractError(
@@ -148,7 +196,7 @@ class SchemaMapping:
         if m.value_col is not None and m.agg != "count":
             values = _numeric_values(out[m.value_col], m.name, m.value_col)
             out = out.assign(**{m.value_col: values})
-        id_cols = list(m.id_cols) if m.id_cols else None
+        id_cols = ids if ids else None
         if id_cols is None:
             out = out.assign(_series=m.name)
             id_cols = ["_series"]

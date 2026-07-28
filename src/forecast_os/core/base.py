@@ -146,15 +146,69 @@ def load(path: str | PathLike) -> BaseForecaster:
     return payload["model"]
 
 
+#: How far from a whole number a confidence level may land and still be read as
+#: that whole number. Levels are routinely derived arithmetically
+#: (``100 * (1 - alpha)``), and float64 error on a value in (0, 100) is bounded
+#: by ~1e-13 — ``100 * (1 - 0.34)`` is ``65.99999999999999``, which is 66. The
+#: tolerance is six orders of magnitude above that error and far below any
+#: fractional level a caller could mean, so it separates representation noise
+#: from a genuine request for 99.9.
+_LEVEL_INT_TOL = 1e-9
+
+
 def _check_level(level: list[int] | tuple[int, ...] | None) -> list[int]:
+    """Validate confidence levels: whole numbers strictly inside (0, 100).
+
+    A level that is a whole number to within ``_LEVEL_INT_TOL`` is rounded to
+    it, so ``100 * (1 - 0.34)`` still names the 66% interval. Genuinely
+    fractional levels are rejected rather than truncated: truncating ``99.9``
+    to ``99`` would serve an interval ~22% narrower than asked for under a
+    ``lo-99``/``hi-99`` label the caller never requested, and truncating
+    ``0.5`` to ``0`` would produce the zero-width ``lo-0`` columns that this
+    same guard rejects when written as ``level=[0]``. The output column names
+    are ``lo-{level}``/``hi-{level}``, so a level must be expressible as an
+    integer to be honoured at all.
+    """
     if level is None:
         return []
     out = []
     for lvl in level:
         if not (0 < lvl < 100):
             raise ValueError(f"confidence levels must be in (0, 100), got {lvl}")
-        out.append(int(lvl))
+        rounded = round(float(lvl))
+        if abs(float(lvl) - rounded) >= _LEVEL_INT_TOL:
+            raise ValueError(
+                f"confidence levels must be whole number percentages, got {lvl}; "
+                f"an interval is labelled lo-{{level}}/hi-{{level}}, so a "
+                f"fractional level cannot be honoured"
+            )
+        # A level inside (0, 100) that rounds onto a bound (1e-10, 99.9999...)
+        # would be served as the zero-width lo-0 / the unrepresentable lo-100.
+        if not 0 < rounded < 100:
+            raise ValueError(f"confidence levels must be in (0, 100), got {lvl}")
+        out.append(int(rounded))
     return sorted(out)
+
+
+def _rms(v: np.ndarray, denom: int) -> float:
+    """``sqrt(sum(v**2) / denom)``, computed without overflowing on large ``v``.
+
+    Squaring before reducing overflows float64 once any element exceeds
+    ~1.3e154, which turned a panel of finite values around 1e200 into
+    ``sigma = inf`` and infinite interval bounds around a finite ``yhat``.
+    The straightforward sum is kept for the overwhelmingly common case so the
+    pinned interval widths are bit-identical; only when it overflows is the
+    vector rescaled by its largest magnitude and the factor multiplied back.
+    """
+    with np.errstate(over="ignore"):
+        ss = float(np.sum(v**2))
+    if np.isfinite(ss):
+        return float(np.sqrt(ss / denom))
+    scale = float(np.max(np.abs(v)))
+    if not np.isfinite(scale) or scale == 0.0:
+        # Genuinely non-finite input; propagate rather than invent a number.
+        return float(np.sqrt(ss / denom))
+    return scale * float(np.sqrt(np.sum((v / scale) ** 2) / denom))
 
 
 class BaseForecaster(ABC):
@@ -214,7 +268,11 @@ class BaseForecaster(ABC):
         payload = {
             "forecast_os_version": _package_version(),
             "class": f"{type(self).__module__}.{type(self).__qualname__}",
-            "registry_name": getattr(type(self), "registry_name", None),
+            # Own-class attribute only: register() stamps ``registry_name`` on
+            # the decorated class, so an inherited lookup would make an
+            # unregistered subclass file itself under its parent's name — an
+            # envelope whose 'class' and 'registry_name' disagree.
+            "registry_name": type(self).__dict__.get("registry_name"),
             "model": self,
         }
         with open(path, "wb") as f:
@@ -306,11 +364,17 @@ class PerSeriesForecaster(BaseForecaster):
             )
 
     def fit(self, df: pd.DataFrame) -> PerSeriesForecaster:
+        # A fit that raises part-way must not leave the object looking fitted:
+        # the per-series loop can fail on the second series (too short, bad
+        # state) after the first has been stored, and a stale _is_fitted would
+        # let predict() silently return forecasts for a subset of the panel.
+        # State is built in a local and published only once the loop completes.
+        self._is_fitted = False
         df = validate_panel(df)
         self._exog_features: list[str] = self._resolve_exog_features(df)
         if self._exog_features:
             self._check_finite_exog(df, self._exog_features, "the fit panel")
-        self._series_state: dict[Any, dict] = {}
+        series_state: dict[Any, dict] = {}
         for uid, g in df.groupby(ID_COL, sort=True):
             y = g[TARGET_COL].to_numpy(dtype=float)
             if len(y) < self.min_train_size:
@@ -335,10 +399,10 @@ class PerSeriesForecaster(BaseForecaster):
             # Uncentered rms with an n-1 denominator: systematic forecast bias
             # widens the intervals instead of being hidden by mean-centering.
             if resid.size >= 2:
-                sigma = float(np.sqrt(np.sum(resid**2) / (resid.size - 1)))
+                sigma = _rms(resid, resid.size - 1)
             elif len(y) >= 3:
                 d = np.diff(y)
-                sigma = float(np.sqrt(np.sum(d**2) / (d.size - 1)))
+                sigma = _rms(d, d.size - 1)
             else:
                 sigma = 1.0
             state["fitted"] = fitted
@@ -347,7 +411,8 @@ class PerSeriesForecaster(BaseForecaster):
             state["_last_ds"] = g[TIME_COL].iloc[-1]
             state["_step"] = infer_step(g[TIME_COL])
             state["_sigma"] = max(sigma, 1e-12)
-            self._series_state[uid] = state
+            series_state[uid] = state
+        self._series_state: dict[Any, dict] = series_state
         self._is_fitted = True
         return self
 

@@ -4,6 +4,11 @@ All functions accept array-likes of simple per-period returns and raise
 ``ValueError`` on empty input. Ratio metrics (sharpe/sortino/calmar) return
 ``nan`` when their denominator is ~0; ``rf`` is a per-period risk-free rate.
 VaR/CVaR follow the positive-loss convention (a 5% loss -> 0.05).
+
+NaNs are not dropped. Every metric except ``hit_rate`` and
+``directional_accuracy`` returns ``nan`` if the input contains one; those two
+compare elementwise, so a NaN counts as a non-hit rather than propagating.
+Clean the returns yourself if you need NaNs excluded rather than propagated.
 """
 
 from __future__ import annotations
@@ -102,19 +107,42 @@ def directional_accuracy(y, yhat) -> float:
 
 
 def value_at_risk(returns, level: float = 0.95) -> float:
-    """Historic VaR at ``level``: the (1-level) return quantile as a loss (>= 0)."""
+    """Historic VaR at ``level``: the (1-level) return quantile as a loss (>= 0).
+
+    Returns ``nan`` if the returns contain a NaN: the ``>= 0`` floor must never
+    turn "unknown risk" into "no risk".
+    """
     r = _to_returns(returns)
     level = _check_level(level)
-    return float(max(0.0, -np.quantile(r, 1.0 - level)))
+    loss = -float(np.quantile(r, 1.0 - level))
+    if np.isnan(loss):  # max(0.0, nan) is 0.0 — do not report that as no risk
+        return loss
+    return float(max(0.0, loss))
+
+
+def _tail_tol(r: np.ndarray) -> float:
+    """Relative tolerance keeping floating-point boundary points in the tail.
+
+    Scaled by the data's own magnitude so expected shortfall stays positively
+    homogeneous; an absolute tolerance would swamp returns of tiny magnitude.
+    """
+    finite = np.abs(r[np.isfinite(r)])
+    return _EPS * float(np.max(finite)) if finite.size else 0.0
 
 
 def conditional_var(returns, level: float = 0.95) -> float:
-    """Expected shortfall: mean loss over the (1-level) tail (>= 0)."""
+    """Expected shortfall: mean loss over the (1-level) tail (>= 0).
+
+    Returns ``nan`` if the returns contain a NaN (see :func:`value_at_risk`).
+    """
     r = _to_returns(returns)
     level = _check_level(level)
     q = float(np.quantile(r, 1.0 - level))
-    tail = r[r <= q + _EPS]  # tolerance keeps boundary points in the tail
-    return float(max(0.0, -np.mean(tail)))
+    if np.isnan(q):  # an all-False tail mask would mean an empty-slice nan mean
+        return q
+    tail = r[r <= q + _tail_tol(r)]
+    loss = -float(np.mean(tail))
+    return loss if np.isnan(loss) else float(max(0.0, loss))
 
 
 def calmar_ratio(returns, periods: int = 252) -> float:

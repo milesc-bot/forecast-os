@@ -231,6 +231,121 @@ def test_cleaning_still_converts_mixed_width_numeric_columns():
     assert pd.api.types.is_numeric_dtype(out["amount"])
 
 
+def test_cleaning_exempts_zero_padded_identifier_columns():
+    """Regression: ['00190','0190','190'] converted to [190,190,190].
+
+    The cleaner exists to rescue money-formatted text ("$1,234.50"), but an
+    all-digit column with leading zeros is an identifier — a GL/account
+    code, a cost centre, a zip code — where the padding distinguishes
+    distinct entities. Converting merged three separate series into one,
+    silently, with the panel still validating. The 8-digit YYYYMMDD
+    exemption already concedes the principle; a leading zero is the same
+    signal.
+    """
+    records = pd.DataFrame(
+        {
+            "account": ["00190", "0190", "190", "00191", "00192"],
+            "money": ["$1,000", "$2,000", "$3,000", "$4,000", "$5,000"],
+        }
+    )
+    out = _clean_numeric_text(records)
+    assert list(out["account"]) == ["00190", "0190", "190", "00191", "00192"]
+    # a genuine money column next to it still converts
+    assert list(out["money"]) == [1000.0, 2000.0, 3000.0, 4000.0, 5000.0]
+
+
+def test_cleaning_exempts_zero_padded_string_dtype_columns():
+    """Same rescue on a pandas StringDtype column: ParquetSource has no
+    read kwargs at all, so a Parquet string id column had no escape hatch."""
+    records = pd.DataFrame(
+        {"account": pd.array(["00190", "0190", "190"], dtype="string")}
+    )
+    out = _clean_numeric_text(records)
+    assert list(out["account"]) == ["00190", "0190", "190"]
+
+
+def test_cleaning_exempts_signed_and_currency_prefixed_zero_padded_values():
+    """Regression: the exemption was fullmatched against the RAW value while
+    the conversion strips sign/currency/whitespace first, so ``"0190"`` was
+    exempt but ``"-0190"``, ``"+0190"``, ``"$0190"`` and ``" 0190"`` all
+    collapsed to 190 — the very merge the guard exists to prevent, applied
+    inconsistently within one column."""
+    for values in (
+        ["-0190", "-0250"],
+        ["+0190", "+0250"],
+        ["$0190", "$0250"],
+        [" 0190", " 0250"],
+    ):
+        out = _clean_numeric_text(pd.DataFrame({"account": values}))
+        assert not pd.api.types.is_numeric_dtype(out["account"]), values
+        assert list(out["account"]) == values
+
+
+def test_cleaning_still_converts_decimals_below_one():
+    """"0.5" is a quantity, not a padded identifier — only whole numbers
+    written with a leading zero are exempt."""
+    records = pd.DataFrame({"rate": ["0.5", "0.25", "1.5", "0.75"]})
+    out = _clean_numeric_text(records)
+    assert list(out["rate"]) == [0.5, 0.25, 1.5, 0.75]
+
+
+def test_csv_source_keeps_zero_padded_ids_as_distinct_series(tmp_path):
+    """dtype=str is the documented defence for id columns; the cleaner was
+    undoing it, collapsing five accounts into three."""
+    path = tmp_path / "gl.csv"
+    path.write_text(
+        "account,date\n"
+        "00190,2026-01-01\n"
+        "0190,2026-01-01\n"
+        "190,2026-01-01\n"
+        "00191,2026-01-01\n"
+        "00192,2026-01-01\n"
+    )
+    records = CSVSource(path, read_csv_kwargs={"dtype": str}).fetch()
+    assert list(records["account"]) == ["00190", "0190", "190", "00191", "00192"]
+    panel = apply_mapping(records, "generic_events", id_cols=("account",))
+    assert set(panel[ID_COL]) == {"00190", "0190", "190", "00191", "00192"}
+
+
+def test_default_csv_read_parses_zero_padded_ids_before_the_cleaner_sees_them(tmp_path):
+    """The exemption cannot rescue a DEFAULT ``read_csv`` — say so, and pin it.
+
+    ``pd.read_csv`` collapses a pure zero-padded column to int64 on its own,
+    so ``_clean_numeric_text`` is handed ``[190, 190, 190]`` and its
+    text-only guard never runs. The docstrings promised CSVSource preserved
+    GL/account codes outright; they now state the precondition
+    (``read_csv_kwargs={"dtype": str}``) that this test demonstrates. The
+    same holds for the older ``YYYYMMDD`` exemption.
+    """
+    path = tmp_path / "gl.csv"
+    path.write_text("account,event_date\n00190,20260101\n0190,20260102\n190,20260103\n")
+
+    default = CSVSource(path).fetch()
+    assert pd.api.types.is_integer_dtype(default["account"])
+    assert list(default["account"]) == [190, 190, 190]  # pandas parsed, not the cleaner
+    assert pd.api.types.is_integer_dtype(default["event_date"])
+
+    as_text = CSVSource(path, read_csv_kwargs={"dtype": str}).fetch()
+    assert list(as_text["account"]) == ["00190", "0190", "190"]
+    assert list(as_text["event_date"]) == ["20260101", "20260102", "20260103"]
+
+
+def test_zero_padded_value_column_still_aggregates_numerically(tmp_path):
+    """The exemption leaves the column as text, but a mapping's value column
+    is coerced by SchemaMapping.apply anyway — so zero-padded amounts (an
+    unusual but legal export) still sum, they are just not guessed at read
+    time."""
+    path = tmp_path / "deals.csv"
+    path.write_text(
+        "closedate,amount,dealstage\n"
+        "2026-01-05,0100,closedwon\n"
+        "2026-01-20,0250,closedwon\n"
+    )
+    records = CSVSource(path, read_csv_kwargs={"dtype": str}).fetch()
+    assert list(records["amount"]) == ["0100", "0250"]
+    assert list(apply_mapping(records, "hubspot_deals")[TARGET_COL]) == [350.0]
+
+
 def test_cleaning_is_conservative_on_mixed_columns():
     records = pd.DataFrame(
         {

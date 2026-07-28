@@ -14,8 +14,12 @@ no fitted state and works on any panel. Two schemes are supported:
   and 5 weeks. Anchors are 52 or 53 weeks apart; in a 53-week year the
   extra week extends Q4's final 5-week period (a 4-4-6 quarter).
 
-All date arithmetic is on normalized (midnight) timestamps; non-datetime
-inputs raise :class:`ForecastOSError`.
+All date arithmetic is on normalized (midnight) timestamps. Timezone-aware
+``ds`` values are read as local wall clock — the zone is dropped after
+normalizing, since a deal closing at 23:00 local on the last day of a quarter
+belongs to that quarter — so :meth:`FiscalCalendar.quarter_end` always returns
+naive timestamps. Non-datetime inputs and ``NaT`` raise
+:class:`ForecastOSError`.
 """
 
 from __future__ import annotations
@@ -121,7 +125,23 @@ class FiscalCalendar:
             raise ForecastOSError(
                 f"FiscalCalendar requires datetime values; got dtype {idx.dtype}"
             )
-        return pd.DatetimeIndex(idx).normalize()
+        idx = pd.DatetimeIndex(idx)
+        # A missing timestamp falls in no fiscal quarter; without this the
+        # int cast in fiscal_year turns it into year 0 and fiscal_quarter then
+        # dies with a bare stdlib formatting error.
+        n_nat = int(idx.isna().sum())
+        if n_nat:
+            raise ForecastOSError(
+                f"FiscalCalendar requires a timestamp on every value; "
+                f"got {n_nat} NaT. Drop or repair those rows first."
+            )
+        idx = idx.normalize()
+        if idx.tz is not None:
+            # Fiscal buckets are wall-clock buckets, and every anchor built
+            # below is naive: keeping the zone makes idx.to_numpy() an object
+            # array and every comparison a TypeError.
+            idx = idx.tz_localize(None)
+        return idx
 
     def _label_year(self, year: np.ndarray, month: np.ndarray) -> np.ndarray:
         """Fiscal year by the month-based rule (ends-in labeling)."""

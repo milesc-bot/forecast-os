@@ -344,6 +344,30 @@ def test_intervals_present_and_ordered(method):
         assert (pred["yhat"] <= pred[f"hi-{lvl}"] + 1e-9).all()
 
 
+@pytest.mark.parametrize("method", METHODS)
+def test_interval_contract_is_ordering_and_nesting_not_additivity(method):
+    """Pins what predict() promises for lo/hi when intervals are requested.
+
+    The class docstring used to open with a blanket "coherent to
+    floating-point accuracy: children sum to their parent", which reads as a
+    promise about every column. It is only true of ``yhat``: under
+    ``mint_ols`` the per-column OLS projection can invert a leaf band, and the
+    ordering guard that repairs it necessarily breaks additivity (no per-row
+    repair can keep both). The docstring is now scoped, and this test pins the
+    three things that ARE guaranteed for every method — yhat coherence even
+    when levels are requested, ``lo <= yhat <= hi``, and monotone nesting
+    across levels — so the guard's real contract is covered rather than the
+    one the old wording implied.
+    """
+    pred = HierarchicalReconciler(method=method).fit(_rep_panel()).predict(6, level=[50, 90])
+    _assert_coherent(pred, col="yhat", atol=1e-8)
+    for lvl in (50, 90):
+        assert (pred[f"lo-{lvl}"] <= pred["yhat"] + 1e-9).all()
+        assert (pred["yhat"] <= pred[f"hi-{lvl}"] + 1e-9).all()
+    assert (pred["lo-90"] <= pred["lo-50"] + 1e-9).all()
+    assert (pred["hi-50"] <= pred["hi-90"] + 1e-9).all()
+
+
 # -- flat panels ----------------------------------------------------------------
 
 

@@ -25,7 +25,8 @@ def validate_panel(df: pd.DataFrame, allow_missing: bool = False) -> pd.DataFram
 
     Returns a copy sorted by (unique_id, ds) with ``y`` coerced to float.
     Raises :class:`DataContractError` on missing columns, unparseable types,
-    duplicate (unique_id, ds) pairs, or NaN targets (unless ``allow_missing``).
+    duplicate (unique_id, ds) pairs, infinite targets, or NaN targets (unless
+    ``allow_missing``, which covers NaN only — never inf).
     """
     if not isinstance(df, pd.DataFrame):
         raise DataContractError(f"expected a pandas DataFrame, got {type(df).__name__}")
@@ -50,12 +51,26 @@ def validate_panel(df: pd.DataFrame, allow_missing: bool = False) -> pd.DataFram
         pd.api.types.is_datetime64_any_dtype(ds)
         or pd.api.types.is_numeric_dtype(ds)
     ):
-        try:
-            out[TIME_COL] = pd.to_datetime(ds)
-        except (ValueError, TypeError) as exc:
-            raise DataContractError(
-                f"column 'ds' must be datetime-like or numeric: {exc}"
-            ) from exc
+        # An object column holding actual Python ints/floats is a numeric ds
+        # that merely lost its dtype (records/mixed construction, astype(object)).
+        # Without this, it falls through to to_datetime and pandas reads the
+        # integers as nanoseconds since the epoch, so ds = [0, 1, 2] silently
+        # becomes 1970-01-01 00:00:00.000000000..002 — a different time axis
+        # from the identical values as int64. Inference is restricted to real
+        # numbers so numeric-LOOKING strings (e.g. '2024') keep parsing as dates.
+        if pd.api.types.infer_dtype(ds, skipna=True) in (
+            "integer",
+            "floating",
+            "mixed-integer-float",
+        ):
+            out[TIME_COL] = pd.to_numeric(ds)
+        else:
+            try:
+                out[TIME_COL] = pd.to_datetime(ds)
+            except (ValueError, TypeError) as exc:
+                raise DataContractError(
+                    f"column 'ds' must be datetime-like or numeric: {exc}"
+                ) from exc
 
     # Null keys are rejected up front, and never waived by allow_missing (which
     # concerns a missing observation, not a row that fails to say what it is).
@@ -82,6 +97,20 @@ def validate_panel(df: pd.DataFrame, allow_missing: bool = False) -> pd.DataFram
         first = out.loc[dup, [ID_COL, TIME_COL]].iloc[0]
         raise DataContractError(
             f"duplicate (unique_id, ds) pair: ({first[ID_COL]!r}, {first[TIME_COL]!r})"
+        )
+    # inf is not a missing observation, it is an unusable one: it survives
+    # isna(), then poisons every downstream reduction silently (sigma = inf
+    # gives infinite interval bounds around a finite yhat; smoothing models
+    # return inf or NaN forecasts with no error). Covariate columns are already
+    # held to a finiteness standard by _check_finite_exog; the target is not
+    # held to a weaker one, and allow_missing never waives this.
+    y_arr = out[TARGET_COL].to_numpy(dtype=float)
+    n_inf = int(np.isinf(y_arr).sum())
+    if n_inf:
+        raise DataContractError(
+            f"column 'y' contains {n_inf} non-finite value(s) (inf/-inf); "
+            f"repair or drop those rows first (see forecast_os.preprocessing). "
+            f"allow_missing covers NaN only"
         )
     if not allow_missing and out[TARGET_COL].isna().any():
         n = int(out[TARGET_COL].isna().sum())

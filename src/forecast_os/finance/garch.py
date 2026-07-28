@@ -220,6 +220,28 @@ class GARCHVolatility(PerSeriesForecaster):
 
     Each series is z-score standardized before MLE and the volatility path is
     rescaled back, so the model is safe on arbitrary scales (levels or returns).
+
+    Because ``yhat`` is a volatility, ``fitted_values()`` is not a like-for-like
+    comparison for this model: its ``y`` column is the input series while its
+    ``fitted`` column is that series' conditional volatility. Residuals from it
+    are not forecast errors.
+
+    ``predict(..., level=[...])`` puts a *relative* band around ``yhat``,
+    ``sd(sigma_hat) ~ sigma_hat / sqrt(2n)`` for ``n`` observations, so the band
+    scales with the volatility rather than with the level of the series and its
+    lower bound stays positive.
+
+    That expression is the asymptotic standard error of a sample standard
+    deviation of i.i.d. draws, so it is an order-of-magnitude scale, **not a
+    calibrated interval at any horizon**: it omits the estimation error in
+    ``(omega, alpha, beta)`` and the dispersion of the conditional-variance
+    path, which together dominate a GARCH volatility forecast. Measured on
+    simulated GARCH(1,1) returns (omega=2e-6, alpha=0.08, beta=0.90, n=300), a
+    nominal 80% band covers the true conditional volatility about 50% of the
+    time at ``h = 1`` and degrades with the horizon (~39% at ``h = 3``, ~33% at
+    ``h = 5``); on i.i.d. Gaussian returns it reaches only ~70%. The band is
+    anti-conservative everywhere — do not rely on it where calibrated coverage
+    matters.
     """
 
     min_train_size = _MIN_OBS
@@ -240,3 +262,20 @@ class GARCHVolatility(PerSeriesForecaster):
         if state["garch"] is None:
             return np.zeros(h)
         return state["sd"] * state["garch"].forecast_volatility(h)
+
+    def _predict_sigma(self, state: dict, h: int) -> np.ndarray:
+        """Relative scale for the volatility forecast, ``yhat / sqrt(2n)``.
+
+        The base class default residualizes ``y`` against ``state["fitted"]``,
+        which for this model is a volatility rather than a fit of ``y`` — the
+        resulting scale tracks the level of the series and drives the lower
+        interval bound negative for a strictly positive quantity. The estimate
+        of a standard deviation from ``n`` observations has relative standard
+        error ``1 / sqrt(2n)``, which keeps the band in the right units and its
+        lower bound positive while ``z < sqrt(2n)`` — every conventional level,
+        given ``n >= _MIN_OBS``. It is not a calibrated standard error for a
+        GARCH conditional-variance forecast; see the class docstring for the
+        coverage it actually delivers.
+        """
+        n = int(np.asarray(state["_y"]).size)
+        return np.asarray(self._predict_series(state, h), dtype=float) / np.sqrt(2.0 * n)

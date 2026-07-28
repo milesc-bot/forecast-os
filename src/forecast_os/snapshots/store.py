@@ -21,6 +21,7 @@ with the install hint when pyarrow is missing.
 from __future__ import annotations
 
 import json
+import os
 from os import PathLike
 from pathlib import Path
 from typing import Any
@@ -116,8 +117,26 @@ class SnapshotStore:
         return frame
 
     def _write_manifest(self, entries: list[dict[str, Any]]) -> None:
-        with open(self._manifest_path, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2)
+        """Replace ``manifest.json`` atomically (all-or-nothing).
+
+        The manifest indexes EVERY snapshot in the store, so rewriting it in
+        place would put the whole index at risk on each append: a crash or
+        ENOSPC part-way through the dump would leave a truncated file and
+        orphan every snapshot already written. Instead the new manifest goes to
+        a sibling temp file that is flushed and fsynced, then ``os.replace``d
+        over the real one — rename is atomic within a filesystem, so a reader
+        sees either the complete old manifest or the complete new one.
+        """
+        tmp_path = self._manifest_path.with_name(_MANIFEST_NAME + ".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(entries, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._manifest_path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     @staticmethod
     def _validate_frame(frame: pd.DataFrame, kind: str) -> pd.DataFrame:
@@ -272,7 +291,10 @@ class SnapshotStore:
         )
 
     def history(
-        self, kind: str = "panel", series: str | list[str] | None = None
+        self,
+        kind: str = "panel",
+        series: str | list[str] | None = None,
+        latest_only: bool = False,
     ) -> pd.DataFrame:
         """Every ``kind`` snapshot stacked, with an added ``as_of`` column.
 
@@ -281,8 +303,21 @@ class SnapshotStore:
         carry — deal-grain ``deals`` snapshots have neither ``unique_id`` nor
         ``ds`` and are sorted by ``as_of`` alone. Returns an empty frame when
         the store holds no matching snapshots.
+
+        The store is append-only, so an ``as_of`` that was snapshotted more
+        than once appears ONCE PER REVISION in the default output — unlike
+        :meth:`load`, which resolves an ``as_of`` to its latest snapshot. That
+        matters downstream: stacking a revised as-of into
+        :func:`~forecast_os.snapshots.analysis.accuracy_over_time` scores both
+        the original and the revision for that cohort. Pass
+        ``latest_only=True`` for the ``load``-consistent view, which keeps only
+        the last snapshot recorded for each ``as_of``.
         """
         entries = [e for e in self._read_manifest() if e["kind"] == kind]
+        if latest_only:
+            # manifest is append-ordered, so the last entry per as_of wins,
+            # exactly as load() resolves a repeated as_of
+            entries = list({e["as_of"]: e for e in entries}.values())
         if not entries:
             return pd.DataFrame()
         if series is not None and isinstance(series, str):

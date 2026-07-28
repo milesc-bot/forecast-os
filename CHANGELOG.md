@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.10.0 (2026-07-27)
+
+Correctness release, part two. v0.9.0 shipped the must-fix tier of a
+whole-repository adversarial audit; this closes the remaining 65 findings.
+The theme again is silence — numbers that were wrong without saying so, and
+docstrings that promised more than the code delivered.
+
+Every fix carries a regression test naming the defect it prevents. 1836 tests
+pass, up from 1561.
+
+### Breaking — a metric was renamed because its name was false
+
+- **`crps` is now `wis`.** The number this library scored under the name
+  `crps` was never the Continuous Ranked Probability Score — it is the
+  Weighted Interval Score (Bracher et al. 2021), a quadrature rule for the
+  CRPS that is only accurate on a dense level set. On the level sets
+  forecast-os actually produces it understates the true CRPS badly: the
+  measured `wis / crps` ratio is **0.89** at `level=[80]`, **0.61** at
+  `[80, 95]`, and **0.76** at `[50, 80, 95]` (1.01 with 49 levels). A number
+  labelled `crps` that is 0.6x the CRPS silently corrupts any comparison
+  against another library.
+
+  The value is unchanged — only the name and the claims are. `metrics=['crps']`
+  still scores everywhere (`evaluate`, `ForecastEngine.compare`, the CLI, the
+  MCP tools) and emits a `FutureWarning`, but the returned row is labelled
+  `wis`, **so callers that select rows or columns by metric name must ask for
+  `wis`**. Renaming was chosen over computing a true CRPS because CRPS is not
+  identifiable from K nested intervals plus a median without inventing an
+  interpolation assumption. The measured ratios are pinned in the test suite,
+  so the understatement is documented rather than hidden.
+
+### Breaking — input that was silently mishandled is now rejected
+
+- **Non-integral confidence levels** raise instead of truncating. `level=[99.9]`
+  used to serve an interval ~22% narrower than requested under a `lo-99` label
+  nobody asked for. Whole-number levels that arrive with float rounding error
+  (`100 * (1 - 0.34)`) are still accepted.
+- **`±inf` in `y`** is rejected by `validate_panel`, and `allow_missing` does
+  not waive it — it covers NaN only. Infinite targets propagated to
+  `sigma = inf` and infinite interval bounds around a finite `yhat`.
+- **`seasonality` / `m` must be a positive integer**; `evaluate` raises rather
+  than silently producing a meaningless scaled metric.
+- **`AutoSelect(metric=...)` rejects signed metrics** (`bias`, `pct_bias`,
+  `tracking_signal`) at construction: argmin over a signed metric selects the
+  most negatively-biased model, not the best one.
+- **`AutoETS` requires 4 observations**, not 3. `min_train_size = 3` was
+  unreachable — every 3-row series already failed with "no ETS candidate
+  could be fitted".
+- **REST/MCP**: `seasonality < 1` and a non-finite `quota` now return HTTP 400
+  rather than a 200 carrying a meaningless number.
+
+### Fixed — silently wrong numbers
+
+- **`value_at_risk` / `conditional_var` reported zero risk** when the input
+  contained a NaN, while every other metric in the module propagated it.
+- **Strategy backtests annualized everything as daily.** `periods=252` was
+  hard-coded, so weekly/monthly panels got nonsense Sharpe, Sortino and CAGR.
+  Now inferred from `ds` (and honouring `step_size`), with a `periods=`
+  override.
+- **Monte Carlo drift** applied the Itô correction to a drift its own docs
+  described as a log return, biasing every simulated path. The front-page
+  README example fed it log returns, exactly as the corrected docstring says
+  not to; both are fixed.
+- **Conformal intervals under-covered** when the nominal level was
+  unattainable from the calibration set — it silently capped at the largest
+  residual. It now warns instead of quietly serving a narrower band.
+- **RidgeLag reported its one-step residual sigma at every horizon**, so
+  multi-step intervals never widened with `h`.
+- **`SchemaMapping.apply` string-concatenated** two source columns renamed onto
+  one canonical name instead of raising.
+- **Zero-padded identifiers** (`"007"`) were destroyed by the numeric-text
+  cleaner, silently merging distinct series.
+
+### Fixed — credentials, and requests going where they should not
+
+- **REST connectors no longer send `headers` off-origin.** A `next_url` in a
+  paginated response could name any host and receive the `Authorization`
+  bearer token. Headers are now withheld across an origin change, with a
+  warning naming both origins, and a `next_url` with a non-http(s) scheme is
+  rejected rather than handed to `requests`.
+- **`POST /forecast` no longer returns a 500 with a traceback** for malformed
+  `model_params`. The module docstring and `docs/serving.md` both promised
+  "never a 500 traceback"; overrides that survived construction and failed
+  inside `fit()` escaped every handler. Present since the REST surface shipped.
+
+### Also
+
+Failed fits no longer leave a model marked fitted on a partial panel
+(`PerSeriesForecaster` and `ConformalForecaster`); residual sigma no longer
+overflows to `inf` on large finite targets; an object-dtype integer `ds` is no
+longer reinterpreted as nanoseconds since the epoch; a hand-edited
+`workspace.json` no longer kills the TUI at startup; and the terminal's stale
+worker results can no longer overwrite a newer refresh.
+
 ## 0.9.0 (2026-07-27)
 
 Correctness release. An adversarial audit of the whole repository found 73

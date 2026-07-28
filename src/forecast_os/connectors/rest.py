@@ -18,9 +18,10 @@ call end to end::
 
 from __future__ import annotations
 
+import re
 import warnings
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import pandas as pd
 
@@ -80,6 +81,47 @@ def _check_pagination(pagination: dict | None) -> None:
         raise ValueError(f"pagination style {style!r} requires key(s) {missing}")
 
 
+def _snippet(text: str) -> str:
+    """The first ``_SNIPPET_LEN`` characters of a response body, elided."""
+    return text[:_SNIPPET_LEN] + ("..." if len(text) > _SNIPPET_LEN else "")
+
+
+#: Ports that are implied by the scheme, so ``https://h/`` and
+#: ``https://h:443/`` name the same origin.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+#: Headers withheld off-origin: explicit credentials, plus any header whose
+#: name reads as a secret (``X-Api-Key``, ``X-Auth-Token``, ``X-CSRF-Token``).
+_CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
+_CREDENTIAL_NAME_RE = re.compile(r"auth|key|token|secret|password|credential|session", re.I)
+
+
+def _origin(url: str) -> str:
+    """A URL's security origin: ``scheme://host:port``, normalized.
+
+    Lowercased, userinfo dropped, and the port always explicit — filled in
+    from the scheme default when absent — so ``https://api.example.com/v``
+    and ``https://api.example.com:443/v`` compare equal. They are the same
+    host, and Django REST Framework builds its absolute ``next`` link from
+    the ``Host`` header: a proxy forwarding ``Host: api.example.com:443``
+    made every page-2 link look off-origin and lose its credentials.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port or _DEFAULT_PORTS.get(scheme)
+    except ValueError:
+        # an unparseable port ("https://h:abc/"): compare the raw netloc, which
+        # can still match itself but never a well-formed origin
+        return f"{scheme}://{parts.netloc.lower()}"
+    return f"{scheme}://{(parts.hostname or '').lower()}:{port}"
+
+
+def _is_credential_header(name: str) -> bool:
+    """Whether a header name carries a credential rather than a preference."""
+    return name.lower() in _CREDENTIAL_HEADERS or bool(_CREDENTIAL_NAME_RE.search(name))
+
+
 def _dot_get(obj: Any, path: str) -> Any:
     """Navigate a dot-path (``"a.b.c"``) into nested dicts; None when absent."""
     cur = obj
@@ -96,7 +138,11 @@ class RestSource(Source):
     Parameters
     ----------
     url : endpoint to GET.
-    headers : HTTP headers sent with every request (e.g. auth).
+    headers : HTTP headers sent with every request. On a pagination link
+        that leaves ``url``'s origin the credential ones (``Authorization``,
+        ``Cookie``, ``X-Api-Key``-style names) are withheld, with a warning,
+        so a bearer token never reaches a host the response body picked;
+        the rest (``Accept``, versioning) still travel.
     params : base query parameters sent with every request.
     records_path : dot-path into the JSON body to the list of records
         (e.g. ``"data.items"``). ``None`` means the body IS the list.
@@ -105,18 +151,23 @@ class RestSource(Source):
 
             {"style": "cursor", "cursor_param": ..., "cursor_path": ...}
             {"style": "offset", "offset_param": ...}
-            {"style": "page", "page_param": ...}
+            {"style": "page", "page_param": ..., "first_page": 1}
             {"style": "next_url", "next_path": ...}
             {"style": "has_more", "more_path": "has_more",
              "cursor_param": "starting_after", "id_field": "id"}
 
         ``cursor`` reads the next cursor from a body dot-path and stops when
         it is absent. ``offset`` / ``page`` bump their parameter and stop
-        when a page returns fewer than ``page_size`` records. ``next_url``
+        when a page returns fewer than ``page_size`` records; ``offset``
+        starts at 0 and ``page`` at ``first_page`` (default 1, sent
+        explicitly on the first request — set ``"first_page": 0`` for a
+        0-indexed API, or its first page is never fetched). ``next_url``
         follows an absolute or relative link read from the body and stops
-        when it is absent. ``has_more`` (Stripe-style) sends the last
-        record's ``id_field`` as ``cursor_param`` while the body's
-        ``more_path`` flag is true.
+        when it is absent; a link that leaves the endpoint's origin is
+        followed without the credential ``headers`` (see above) and a
+        non-http(s) link is refused. ``has_more`` (Stripe-style) sends the last record's
+        ``id_field`` as ``cursor_param`` while the body's ``more_path``
+        flag is true.
     page_size : records per full page — the short-page stop rule for the
         ``offset`` and ``page`` styles.
     max_pages : hard cap on pages fetched; hitting it warns and truncates.
@@ -161,17 +212,33 @@ class RestSource(Source):
 
         Nested record fields are flattened by :func:`pandas.json_normalize`
         (``{"a": {"b": 1}}`` becomes column ``a.b``); an endpoint with no
-        records yields an empty DataFrame.
+        records yields an empty DataFrame. A ``null`` entry in the record
+        list still becomes a blank row, but it no longer reaches
+        :meth:`_prepare_record`, where it crashed the HubSpot and Salesforce
+        presets with ``'NoneType' object has no attribute 'items'``.
         """
         frames: list[pd.DataFrame] = []
         url = self.url
         params: dict | None = dict(self.params) if self.params else {}
+        if self.pagination is not None and self.pagination["style"] == "page":
+            # send the first page number explicitly: the next-page arithmetic
+            # has to know which page came back, and omitting the parameter
+            # forced it to guess 1 (skipping page 0 on a 0-indexed API)
+            params.setdefault(
+                self.pagination["page_param"], self.pagination.get("first_page", 1)
+            )
         pages = 0
         while True:
             body = self._get_json(url, params)
             records = self._extract_records(body)
-            if records:
-                frames.append(pd.json_normalize([self._prepare_record(r) for r in records]))
+            # null/NA entries are accepted but hold no fields: normalize them to
+            # {} (still a blank row) instead of handing them to _prepare_record,
+            # which needs a dict
+            prepared = [
+                self._prepare_record(r) if isinstance(r, dict) else {} for r in records
+            ]
+            if prepared:
+                frames.append(pd.json_normalize(prepared))
             pages += 1
             nxt = self._next_request(body, records, url, params)
             if nxt is None:
@@ -205,25 +272,84 @@ class RestSource(Source):
             self._default_session = requests.Session()
         return self._default_session
 
+    def _headers_for(self, url: str) -> dict | None:
+        """``self.headers``, minus credentials when the URL is off-origin.
+
+        ``next_url`` pagination follows a link chosen by the *response
+        body*, so the body can name any host — or hand back an ``http``
+        link for an ``https`` endpoint, which a misconfigured reverse proxy
+        does by accident. Attaching ``self.headers`` unconditionally then
+        hands the bearer token to that host in cleartext. ``requests``
+        strips Authorization across a cross-host redirect for exactly this
+        reason, so the hand-rolled hop does the same — and, like
+        ``requests``, it strips only the credential headers
+        (``Authorization``, ``Cookie``, ``X-Api-Key``-style names). Content
+        negotiation (``Accept``, an API-version header) still travels:
+        dropping it flipped a legitimate CDN page link to an HTML response
+        and turned a working fetch into a parse error. Off-origin links are
+        still followed (signed/CDN page links are legitimate) — just
+        unauthenticated, and loudly.
+        """
+        if not self.headers:
+            return self.headers
+        target, base = _origin(url), _origin(self.url)
+        if target == base:
+            return self.headers
+        kept = {k: v for k, v in self.headers.items() if not _is_credential_header(k)}
+        withheld = sorted(set(self.headers) - set(kept))
+        if withheld:
+            warnings.warn(
+                f"{type(self).__name__} pagination left the configured origin "
+                f"({base} -> {target}); credential header(s) {withheld} are "
+                f"not sent off-origin",
+                UserWarning,
+                stacklevel=4,
+            )
+        return kept or None
+
     def _get_json(self, url: str, params: dict | None) -> Any:
         """GET one page and return the parsed JSON body; raise on non-2xx."""
         resp = self._get_session().get(
-            url, headers=self.headers, params=params or None, timeout=self.timeout
+            url, headers=self._headers_for(url), params=params or None, timeout=self.timeout
         )
         if not 200 <= resp.status_code < 300:
-            text = resp.text
-            snippet = text[:_SNIPPET_LEN] + ("..." if len(text) > _SNIPPET_LEN else "")
-            raise ForecastOSError(f"GET {url} failed with HTTP {resp.status_code}: {snippet}")
-        return resp.json()
+            raise ForecastOSError(
+                f"GET {url} failed with HTTP {resp.status_code}: {_snippet(resp.text)}"
+            )
+        try:
+            return resp.json()
+        except ValueError as exc:
+            # a maintenance page / captive portal / proxy interstitial served
+            # with a 200; every other server-shape problem here is a
+            # ForecastOSError, so this one must be too
+            raise ForecastOSError(
+                f"GET {url} returned HTTP {resp.status_code} with a body that "
+                f"is not JSON: {_snippet(resp.text)}"
+            ) from exc
 
     def _extract_records(self, body: Any) -> list:
-        """The list of records inside one page's body, via ``records_path``."""
+        """The list of records inside one page's body, via ``records_path``.
+
+        Each entry must be a JSON object or ``null`` (an empty record, which
+        :meth:`fetch` drops); anything else — a bare id, a nested list — is
+        a shape the flattener cannot use and raises here rather than later.
+        """
         data = body if self.records_path is None else _dot_get(body, self.records_path)
+        where = f"at {self.records_path!r} in" if self.records_path else "as"
         if not isinstance(data, list):
-            where = f"at {self.records_path!r} in" if self.records_path else "as"
             raise ForecastOSError(
                 f"expected a list of records {where} the response body; "
                 f"got {type(data).__name__}"
+            )
+        for i, record in enumerate(data):
+            if isinstance(record, dict) or record is None:
+                continue
+            if isinstance(record, float) and record != record:  # NaN is NA-like
+                continue
+            raise ForecastOSError(
+                f"expected every record {where} the response body to be a JSON "
+                f"object (or null); item {i} is a {type(record).__name__} "
+                f"({_snippet(repr(record))})"
             )
         return data
 
@@ -248,13 +374,19 @@ class RestSource(Source):
         if style == "page":
             if len(records) < self.page_size:
                 return None
-            page = int((params or {}).get(p["page_param"], 1)) + 1
+            page = int((params or {}).get(p["page_param"], p.get("first_page", 1))) + 1
             return url, {**(params or {}), p["page_param"]: page}
         if style == "next_url":
             nxt = _dot_get(body, p["next_path"])
             if not nxt:
                 return None
-            return urljoin(url, nxt), None
+            target = urljoin(url, nxt)
+            if urlsplit(target).scheme.lower() not in ("http", "https"):
+                raise ForecastOSError(
+                    f"next-page link {nxt!r} resolves to {target!r}, which is "
+                    f"not an http(s) URL; refusing to follow it"
+                )
+            return target, None
         # style == "has_more" (styles are validated at construction)
         if not _dot_get(body, p.get("more_path", "has_more")) or not records:
             return None
@@ -276,13 +408,23 @@ class HubSpotSource(RestSource):
     ``properties`` dict into top-level columns (alongside ``id`` /
     ``createdAt``) so mappings can reference property names directly.
     Default mapping: ``"hubspot_deals"``.
+
+    HubSpot returns only the properties you ask for, so ``hubspot_owner_id``
+    is requested by default: the ``hubspot_deals`` recipe pre-renames it to
+    ``owner``, and without it the documented
+    ``to_panel(id_cols=("owner",))`` split fails on a missing column.
     """
 
     def __init__(
         self,
         token: str,
         object: str = "deals",
-        properties: tuple[str, ...] = ("amount", "dealstage", "closedate"),
+        properties: tuple[str, ...] = (
+            "amount",
+            "dealstage",
+            "closedate",
+            "hubspot_owner_id",
+        ),
         base_url: str = "https://api.hubapi.com",
         page_size: int = 100,
         max_pages: int = 100,

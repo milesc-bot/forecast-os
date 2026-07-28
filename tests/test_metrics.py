@@ -1,5 +1,7 @@
 """Hand-computed tests for evaluation.metrics."""
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -484,7 +486,7 @@ def test_evaluate_pinball_rows():
 
 
 def _degenerate_interval_frame():
-    """lo == yhat == hi at every level: crps collapses to point-forecast MAE."""
+    """lo == yhat == hi at every level: wis collapses to point-forecast MAE."""
     df = pd.DataFrame(
         {
             "unique_id": ["a"] * 4,
@@ -502,17 +504,17 @@ def _degenerate_interval_frame():
     return df
 
 
-def test_evaluate_crps_degenerate_equals_point_pinball_mean():
+def test_evaluate_wis_degenerate_equals_point_pinball_mean():
     df = _degenerate_interval_frame()
-    res = evaluate(df, metrics=("crps",))
-    assert list(res["metric"]) == ["crps"]
+    res = evaluate(df, metrics=("wis",))
+    assert list(res["metric"]) == ["wis"]
     # implied quantiles of levels {80, 95}: 0.1/0.9 and 0.025/0.975
     y, yhat = df["y"], df["m1"]
     expected = np.mean(
         [2 * pinball_loss(y, yhat, q) for q in (0.1, 0.9, 0.025, 0.975)]
     )
     assert res["m1"].iloc[0] == pytest.approx(expected)
-    # degenerate intervals make crps the point MAE (here 1.0)
+    # degenerate intervals make wis the point MAE (here 1.0)
     assert res["m1"].iloc[0] == pytest.approx(mae(y, yhat))
     # a forecast equal to y scores exactly 0
     assert res["m2"].iloc[0] == pytest.approx(0.0, abs=1e-12)
@@ -569,5 +571,195 @@ def test_interval_metrics_drop_nan_bounds_consistently():
     assert out["winkler-80"] == 2.0  # width only, no violations
 
     all_nan = df.assign(**{"m-lo-80": np.nan, "m-hi-80": np.nan})
-    out2 = evaluate(all_nan, metrics=["coverage", "winkler", "crps"]).set_index("metric")["m"]
+    out2 = evaluate(all_nan, metrics=["coverage", "winkler", "wis"]).set_index("metric")["m"]
     assert out2.isna().all()
+
+
+# --- v0.10.0 audit regressions ---------------------------------------------
+
+
+def test_evaluate_wis_scores_the_point_forecast():
+    """The interval score used to ignore the point column entirely.
+
+    ``_score_crps`` selected the model's point column into ``valid`` for the
+    dropna but never scored it, so two models sharing lo/hi columns scored
+    identically no matter how far apart their point forecasts were. The
+    Weighted Interval Score carries a ``(1/2)|y - point|`` median term, so the
+    worse point forecast must now score worse.
+    """
+    y = np.arange(8.0)
+    df = pd.DataFrame(
+        {
+            "unique_id": "a",
+            "ds": pd.date_range("2024-01-01", periods=8),
+            "cutoff": pd.Timestamp("2023-12-31"),
+            "y": y,
+            "good": y,
+            "awful": y + 97.5,
+        }
+    )
+    for model in ("good", "awful"):
+        df[f"{model}-lo-80"] = y - 1.2816
+        df[f"{model}-hi-80"] = y + 1.2816
+    res = evaluate(df, metrics=("wis",))
+    assert res["awful"].iloc[0] > res["good"].iloc[0]
+
+
+def test_evaluate_wis_is_the_weighted_interval_score():
+    """Hand-computed WIS; the old uniform mean-of-pinball weighting is wrong.
+
+    The previous formula averaged ``2 * pinball`` over the level-implied
+    quantiles with uniform 1/K weights. Those quantiles are all tail, so the
+    number came out at ~0.4-0.9x the true CRPS and moved non-monotonically
+    with the requested level set. WIS weights interval k by ``alpha_k / 2``
+    (the correct ``dq`` weight) and divides by ``K + 1/2``.
+    """
+    df = pd.DataFrame(
+        {
+            "unique_id": "a",
+            "ds": pd.date_range("2024-01-01", periods=2),
+            "cutoff": pd.Timestamp("2023-12-31"),
+            "y": [0.0, 10.0],
+            "m": [0.0, 0.0],
+            "m-lo-80": [-1.0, -1.0],
+            "m-hi-80": [1.0, 1.0],
+        }
+    )
+    # alpha = 0.2; interval scores 2 and 2 + (2/0.2)*9 = 92 -> mean 47
+    # 0.1 * 47 + 0.5 * mean(|y - 0|) = 4.7 + 2.5 = 7.2, over K + 1/2 = 1.5
+    res = evaluate(df, metrics=("wis",))
+    assert res["m"].iloc[0] == pytest.approx(4.8)
+
+
+def _calibrated_normal_frame(levels):
+    """N(0, 1) draws scored against the exact N(0, 1) predictive distribution.
+
+    The true CRPS of this forecast is 1/sqrt(pi) = 0.5642, so the frame
+    measures how far the emitted score sits from the CRPS at a given level set.
+    """
+    from scipy.stats import norm
+
+    rng = np.random.default_rng(7)
+    y = rng.normal(0.0, 1.0, 40000)
+    data = {"unique_id": "a", "ds": np.arange(y.size), "cutoff": 0, "y": y, "m": 0.0}
+    for lvl in levels:
+        a = 1.0 - lvl / 100.0
+        data[f"m-lo-{lvl}"] = norm.ppf(a / 2)
+        data[f"m-hi-{lvl}"] = norm.ppf(1 - a / 2)
+    return pd.DataFrame(data)
+
+
+@pytest.mark.parametrize(
+    "levels, ratio",
+    [
+        ([80], 0.89),  # the ForecastEngine default level
+        ([80, 95], 0.61),  # adding a level LOWERS the score: not monotone
+        ([50, 80, 95], 0.76),
+        (list(range(2, 99, 2)), 1.01),  # dense: quadrature is finally accurate
+    ],
+)
+def test_wis_is_not_the_crps_on_the_level_sets_this_library_produces(levels, ratio):
+    """Pins the documented ``wis / crps`` ratios, sparse level sets included.
+
+    WIS is exact as WIS, but it is only a quadrature rule for the CRPS and the
+    quadrature is poor on a handful of levels — 0.61x the true CRPS at
+    ``[80, 95]``. The predecessor test only measured the 49-level regime, where
+    the ratio is 1.01, and so validated the metric exactly where no default
+    code path exercises it. These ratios are why the metric is emitted as
+    ``wis`` rather than as ``crps``; if a future change makes it track the CRPS
+    at sparse levels, this test fails and the name should be revisited.
+    """
+    true_crps = 1 / np.sqrt(np.pi)
+    got = evaluate(_calibrated_normal_frame(levels), metrics=("wis",))["m"].iloc[0]
+    assert got / true_crps == pytest.approx(ratio, abs=0.01)
+
+
+# --- remediation round 2 ----------------------------------------------------
+
+
+def test_the_emitted_interval_score_is_named_wis_not_crps():
+    """The number is the Weighted Interval Score, so that is what it is called.
+
+    Emitting it as ``crps`` mislabelled a value measured at 0.61x the true
+    CRPS on ``level=[80, 95]``, which silently corrupts any comparison against
+    properscoring/scoringrules — the whole point of a named, standard score.
+    """
+    res = evaluate(_degenerate_interval_frame(), metrics=("wis",))
+    assert list(res["metric"]) == ["wis"]
+
+
+def test_deprecated_crps_name_still_scores_and_warns():
+    """v0.9.0's ``metrics=['crps']`` must keep working, under the honest label."""
+    df = _degenerate_interval_frame()
+    with pytest.warns(FutureWarning, match="renamed to 'wis'"):
+        res = evaluate(df, metrics=("crps",))
+    assert list(res["metric"]) == ["wis"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        pd.testing.assert_frame_equal(res, evaluate(df, metrics=("wis",)))
+
+
+@pytest.mark.parametrize("metrics", [("crps", "wis"), ("wis", "crps")])
+def test_alias_and_new_name_together_emit_one_row(metrics):
+    """Asking for both spellings must not double the rows they share."""
+    with pytest.warns(FutureWarning):
+        res = evaluate(_degenerate_interval_frame(), metrics=metrics)
+    assert list(res["metric"]) == ["wis"]
+
+
+def test_coverage_excludes_nan_rows():
+    """coverage() used to count NaN rows as interval misses.
+
+    ``(y >= lo) & (y <= hi)`` is False for NaN, so an unknown actual or an
+    unknown bound silently read as a miss and understated coverage. Rows with
+    a non-finite y/lo/hi are now excluded, matching what evaluate() already
+    does via ``_score_interval``'s dropna; an all-unusable input returns nan.
+    """
+    assert coverage([1, 2], [0, 0], [3, 3]) == 1.0
+    assert coverage([1, np.nan], [0, 0], [3, 3]) == 1.0
+    assert coverage([1, 2], [0, np.nan], [3, np.nan]) == 1.0
+    assert np.isnan(coverage([np.nan, np.nan], [0, 0], [3, 3]))
+    # a genuine miss still counts
+    assert coverage([1, 9, np.nan], [0, 0, 0], [3, 3, 3]) == pytest.approx(0.5)
+
+
+def test_winkler_score_excludes_nan_rows():
+    """winkler_score() had the identical NaN-swallowing bug.
+
+    ``np.where(y < lo, ...)`` is False for NaN, so a NaN row scored as a
+    perfectly covered interval and quietly pulled the mean down.
+    """
+    assert winkler_score([1, np.nan], [0, 0], [3, 3], level=80) == pytest.approx(3.0)
+    assert winkler_score([1, 2], [0, np.nan], [3, np.nan], level=80) == pytest.approx(3.0)
+    assert np.isnan(winkler_score([np.nan], [0], [3], level=80))
+
+
+@pytest.mark.parametrize("m", [0, -1, -3])
+def test_scaled_metrics_reject_nonpositive_seasonality(m):
+    """m <= 0 used to slip past the ``len(y_train) <= m`` guard.
+
+    m=0 surfaced a raw numpy broadcast error; m<0 silently produced a
+    meaningless scale (mase([6,7],[6.5,8],[1..5], m=-1) returned 0.1875). A
+    seasonal period is >= 1 by definition, so reject it the way pinball_loss
+    and winkler_score range-check their arguments.
+    """
+    with pytest.raises(ValueError, match="m must be a positive integer"):
+        mase([6, 7], [6.5, 8], [1, 2, 3, 4, 5], m=m)
+    with pytest.raises(ValueError, match="m must be a positive integer"):
+        rmsse([6, 7], [6.5, 8], [1, 2, 3, 4, 5], m=m)
+    with pytest.raises(ValueError, match="m must be a positive integer"):
+        evaluate(_cv_frame(), metrics=("mase",), train_df=_train_frame(), seasonality=m)
+
+
+def test_evaluate_missing_train_series_names_the_series():
+    """A series in cv_df but absent from train_df blamed the seasonality arg.
+
+    The empty training slice fell through to _naive_scale, which raised
+    'training series (len 0) must be longer than m=1' — a message naming m and
+    never naming the series or train_df. Diagnose it at the call site instead.
+    """
+    cv = _cv_frame()
+    train = _train_frame()
+    train = train[train["unique_id"] != "a"]
+    with pytest.raises(ValueError, match=r"train_df has no rows for series 'a'"):
+        evaluate(cv, metrics=("mase",), train_df=train)

@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import warnings
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from ..connectors.base import apply_mapping, list_mappings
@@ -70,6 +72,36 @@ def _tool_errors(fn):
     return wrapper
 
 
+def _not_a_boolean(value: Any, name: str) -> Any:
+    """Return ``value`` unless it is a boolean, which is never a number here.
+
+    ``bool`` is an ``int`` subclass, so ``int(True) == 1``: without this
+    guard a client sending ``h=true`` gets a silent one-step forecast,
+    ``seasonality=true`` swaps the seasonal-naive MASE denominator for a
+    naive one, ``level=true`` reports a 1% interval, and ``quota=true``
+    scores against a target of 1.0. Every other coercion these tools accept
+    (``"2"``, ``2.0``) is kept — only the boolean one is nonsense.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, not a boolean")
+    return value
+
+
+def _a_number(value: Any, name: str) -> Any:
+    """``_not_a_boolean`` plus a real-number check, for values passed on untouched.
+
+    ``level`` reaches ``predict`` uncoerced so the model layer's own whole-number
+    check stays visible on this surface. That left a string level to fail as a raw
+    ``TypeError`` from a comparison deep inside ``_check_level`` — which escapes
+    the ``ValueError``-only error decorator and surfaces as a 500 traceback rather
+    than the documented 400.
+    """
+    _not_a_boolean(value, name)
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{name} must be a number, got {type(value).__name__}")
+    return value
+
+
 def _records_out(frame: pd.DataFrame) -> list[dict[str, Any]]:
     """A DataFrame as plain JSON-able row dicts (datetimes become ISO strings)."""
     return json.loads(frame.to_json(orient="records", date_format="iso"))
@@ -103,26 +135,69 @@ def _build_panel(
     With ``mapping`` the records go through the named (or given) recipe;
     without one they must already carry the contract columns, and ``ds`` is
     parsed to datetimes when needed.
+
+    Everything here runs on caller-supplied values, so arithmetic and type
+    errors raised while shaping them are client errors, not server faults:
+    they are re-raised as ``ValueError`` (which the REST layer renders as a
+    400) rather than escaping as e.g. ``ZeroDivisionError`` from ``freq="0D"``
+    or ``TypeError`` from a series id that is a nested object.
     """
     frame = _load_records(csv_path=csv_path, records=records)
-    if mapping is not None:
-        return apply_mapping(frame, mapping, **overrides)
-    if overrides:
-        raise ValueError(
-            f"panel override(s) {sorted(overrides)} need a mapping; records "
-            f"passed without one must already be (unique_id, ds, y) rows"
-        )
-    if TIME_COL in frame.columns and not (
-        pd.api.types.is_numeric_dtype(frame[TIME_COL])
-        or pd.api.types.is_datetime64_any_dtype(frame[TIME_COL])
-    ):
-        frame = frame.assign(**{TIME_COL: pd.to_datetime(frame[TIME_COL])})
-    return validate_panel(frame)
+    try:
+        if mapping is not None:
+            return apply_mapping(frame, mapping, **overrides)
+        if overrides:
+            raise ValueError(
+                f"panel override(s) {sorted(overrides)} need a mapping; records "
+                f"passed without one must already be (unique_id, ds, y) rows"
+            )
+        if TIME_COL in frame.columns and not (
+            pd.api.types.is_numeric_dtype(frame[TIME_COL])
+            or pd.api.types.is_datetime64_any_dtype(frame[TIME_COL])
+        ):
+            frame = frame.assign(**{TIME_COL: pd.to_datetime(frame[TIME_COL])})
+        return validate_panel(frame)
+    except (ArithmeticError, TypeError) as exc:
+        raise ValueError(f"cannot shape these records into a panel: {exc}") from exc
 
 
 def _panel_overrides(freq: str | None, agg: str | None) -> dict[str, str]:
     """The panel-shaping overrides actually set (None means "use the mapping's")."""
     return {k: v for k, v in (("freq", freq), ("agg", agg)) if v is not None}
+
+
+def _compare_failures(
+    requested: list[Any], board: pd.DataFrame, caught: list[warnings.WarningMessage]
+) -> list[str]:
+    """One message per requested model that is missing from the leaderboard.
+
+    The board is the source of truth: a requested model that did not survive
+    the backtest is a failure, whether or not its warning was captured.
+    :meth:`ForecastEngine.compare` explains each drop in a
+    ``"model X failed: ..."`` warning, which is used here for its reason text
+    only — reading the warning list *as* the failure list was wrong twice
+    over. Warning capture mutates process-global state, so an overlapping
+    request's ``catch_warnings`` block could swallow the explanation and leave
+    a model silently absent; and every other warning raised during the
+    backtest (numpy overflow, deprecations) was reported as a model failure
+    even when the whole field ran.
+    """
+    survived = set(board.index)
+    messages = [str(w.message) for w in caught]
+    failures: list[str] = []
+    seen: set[str] = set()
+    for name in requested:
+        # Only registry names map onto the board index. ForecastEngine also
+        # accepts model instances and (name, params) specs; those are outside
+        # this tool's documented list[str] contract and cannot be matched to a
+        # board row, so they are skipped rather than reported as failures.
+        if not isinstance(name, str) or name in survived or name in seen:
+            continue
+        seen.add(name)
+        prefix = f"model {name} failed: "
+        explained = next((m for m in messages if m.startswith(prefix)), None)
+        failures.append(explained or f"model {name} failed: reason unavailable")
+    return failures
 
 
 # -- tool functions (pure logic; registered with FastMCP in main) --------------
@@ -216,8 +291,22 @@ def forecast_tool(
         forecaster = get_model(model, **(model_params or {}))
     except TypeError as exc:
         raise ValueError(f"invalid model_params for model {model!r}: {exc}") from exc
-    levels = [80] if level is None else [int(lvl) for lvl in level]
-    pred = forecaster.fit(panel).predict(int(h), level=levels or None)
+    # levels reach predict() uncoerced: int() here truncated 99.9 to 99 and
+    # served a ~22% narrower interval under a label nobody asked for, hiding
+    # the model layer's own whole-number check from this surface entirely.
+    levels = [80] if level is None else [_a_number(lvl, "level") for lvl in level]
+    try:
+        pred = forecaster.fit(panel).predict(int(_not_a_boolean(h, "h")), level=levels or None)
+    except (TypeError, AttributeError) as exc:
+        # Constructor overrides that survive get_model() can still be the wrong
+        # TYPE and only blow up deep inside fit()/predict() (season_length="x",
+        # lags=true, models=[1]). Those are caller mistakes, and the documented
+        # contract for this surface is a 400 with a message — never a 500 with a
+        # traceback. With no model_params there is nothing caller-supplied to
+        # blame, so a genuine internal fault still propagates untouched.
+        if not model_params:
+            raise
+        raise ValueError(f"invalid model_params for model {model!r}: {exc}") from exc
     return _records_out(pred)
 
 
@@ -248,25 +337,32 @@ def compare_tool(
     seasonal-naive yardstick instead. Interval metrics such as
     ``coverage``/``winkler`` also need ``level``. Returns ``leaderboard``
     (one row per surviving model, best first — feed the winner's ``model``
-    name back into ``forecast``) and ``failures`` (warning messages
-    explaining every model that failed backtesting and is therefore absent
-    from the leaderboard; empty when all models ran).
+    name back into ``forecast``) and ``failures`` (one message per requested
+    model that failed backtesting and is therefore absent from the
+    leaderboard; empty when all models ran).
     """
     panel = _build_panel(csv_path, records, mapping, **_panel_overrides(freq, agg))
+    season = int(_not_a_boolean(seasonality, "seasonality"))
+    if season < 1:
+        raise ValueError(
+            f"seasonality must be a positive integer (the seasonal period, "
+            f"e.g. 12 for monthly data), got {season}"
+        )
+    requested = list(models) if models else list(_DEFAULT_COMPARE_MODELS)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         board = ForecastEngine().compare(
             panel,
-            h=int(h),
-            n_windows=int(n_windows),
+            h=int(_not_a_boolean(h, "h")),
+            n_windows=int(_not_a_boolean(n_windows, "n_windows")),
             metrics=list(metrics) if metrics else ["mase"],
-            seasonality=int(seasonality),
-            models=list(models) if models else list(_DEFAULT_COMPARE_MODELS),
-            level=level,
+            seasonality=season,
+            models=requested,
+            level=None if level is None else [_not_a_boolean(lvl, "level") for lvl in level],
         )
     return {
         "leaderboard": _records_out(board.reset_index()),
-        "failures": [str(w.message) for w in caught],
+        "failures": _compare_failures(requested, board, caught),
     }
 
 
@@ -299,10 +395,34 @@ def quota_tool(
     forecast total — ``quota``, and ``p_attain`` in [0, 1]) and
     ``unmatched_quota_keys`` (quota keys naming no forecast series, e.g.
     typos; empty when every key matched). Errors only when NO quota key
-    matches any series.
+    matches any series or a quota is not a number (a non-numeric value, or
+    NaN). Infinities are numbers and are scored, not rejected: ``+inf``
+    gives ``p_attain`` 0.0 and ``-inf`` gives 1.0, though the echoed
+    ``quota`` field comes back as JSON ``null`` (infinity has no JSON
+    spelling).
     """
+    raw_targets = list(quota.values()) if isinstance(quota, dict) else [quota]
+    for target in raw_targets:
+        _not_a_boolean(target, "quota")
+    try:
+        # coerce BEFORE testing: math.isnan() on the caller's raw value raised
+        # an uncaught TypeError for quota="100", a string every other layer
+        # (attainment_probability, pydantic) accepts and floats happily.
+        targets = [float(target) for target in raw_targets]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"quota must be a number, got {quota!r}") from exc
+    if any(math.isnan(target) for target in targets):
+        # NaN scores p_attain as NaN -- serialised as JSON null, which is not
+        # the probability in [0, 1] this tool promises. An infinite quota is
+        # answerable (0.0 / 1.0), so it is left alone.
+        raise ValueError(f"quota must be a number, got {quota!r}")
     panel = _build_panel(csv_path, records, mapping, **_panel_overrides(freq, agg))
-    pred = get_model(model).fit(panel).predict(int(h), level=[int(level)])
+    # level reaches predict() uncoerced so a fractional level is rejected there
+    # rather than truncated here; the interval column labels then follow the
+    # same rounding predict() used to name them.
+    _not_a_boolean(level, "level")
+    pred = get_model(model).fit(panel).predict(int(_not_a_boolean(h, "h")), level=[level])
+    label = int(round(float(level)))
     unmatched: list[str] = []
     if isinstance(quota, dict):
         scored = pred[pred[ID_COL].isin(quota)]
@@ -314,7 +434,7 @@ def quota_tool(
         unmatched = sorted(set(quota) - set(scored[ID_COL]))
         pred = scored
     return {
-        "rows": _records_out(attainment_probability(pred, quota, level=int(level))),
+        "rows": _records_out(attainment_probability(pred, quota, level=label)),
         "unmatched_quota_keys": unmatched,
     }
 

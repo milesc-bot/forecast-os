@@ -146,3 +146,68 @@ class TestPropagate:
     def test_empty_rates_raises(self):
         with pytest.raises(ValueError, match="rates"):
             propagate(self._top(), {})
+
+
+class TestConversionRatesEmptyAndSeparatorInStageName:
+    """Regressions for the bare pandas concat crash and `sep`-mangled stage names
+    (v0.9.0 audit SHOULD-2).
+
+    ``conversion_rates`` checks stage presence panel-WIDE but emits rate series
+    per prefix group, so a pair whose two stages never share a prefix left
+    ``frames`` empty and pandas raised "No objects to concatenate" with no domain
+    context. Separately, ids were split with a blind ``rpartition(sep)``, which
+    mangles a stage name that itself contains ``sep`` — Salesforce's stock
+    ``"Negotiation/Review"`` picklist value became prefix "Negotiation" / stage
+    "Review", so the real stage name was reported missing and the mangled one hit
+    the concat crash.
+    """
+
+    def test_disjoint_prefix_groups_raise_a_domain_error(self):
+        df = pd.DataFrame(
+            {
+                ID_COL: ["east/lead", "west/mql"],
+                TIME_COL: pd.to_datetime(["2024-01-01", "2024-01-01"]),
+                TARGET_COL: [10.0, 5.0],
+            }
+        )
+        with pytest.raises(ForecastOSError, match="prefix"):
+            conversion_rates(df, stages=["lead", "mql"])
+
+    def test_stage_name_containing_sep_round_trips_through_stage_panel(self):
+        records = pd.DataFrame(
+            {
+                "stage": ["Qualification"] * 4 + ["Negotiation/Review"] * 2,
+                "created": ["2024-01-05"] * 4 + ["2024-01-20"] * 2,
+            }
+        )
+        panel = stage_panel(records, stage_col="stage", date_col="created")
+        rates = conversion_rates(panel, stages=["Qualification", "Negotiation/Review"])
+        assert set(rates[ID_COL]) == {"Qualification->Negotiation/Review"}
+        assert rates[TARGET_COL].iloc[0] == pytest.approx(0.5)
+
+    def test_prefix_plus_stage_name_containing_sep(self):
+        ds = pd.to_datetime(["2024-01-01"])
+        df = pd.DataFrame(
+            {
+                ID_COL: ["east/Qualification", "east/Negotiation/Review"],
+                TIME_COL: list(ds) * 2,
+                TARGET_COL: [8.0, 2.0],
+            }
+        )
+        rates = conversion_rates(df, stages=["Qualification", "Negotiation/Review"])
+        assert set(rates[ID_COL]) == {"east/Qualification->Negotiation/Review"}
+        assert rates[TARGET_COL].iloc[0] == pytest.approx(0.25)
+
+    def test_unknown_stage_message_is_not_confused_by_a_sep_in_the_name(self):
+        ds = pd.to_datetime(["2024-01-01"])
+        df = pd.DataFrame(
+            {
+                ID_COL: ["Qualification", "Negotiation/Review"],
+                TIME_COL: list(ds) * 2,
+                TARGET_COL: [8.0, 2.0],
+            }
+        )
+        # 'Review' alone is not a stage in this panel; the error must say so
+        # rather than the concat crash the mangled split used to produce.
+        with pytest.raises(ForecastOSError, match="Review"):
+            conversion_rates(df, stages=["Qualification", "Review"])

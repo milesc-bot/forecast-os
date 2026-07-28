@@ -28,7 +28,7 @@ with the ``forecast-os[serve]`` install hint when the extra is missing.
 from __future__ import annotations
 
 import argparse
-from typing import Any
+from typing import Annotated, Any
 
 import forecast_os
 
@@ -52,7 +52,7 @@ try:
     from fastapi.encoders import jsonable_encoder
     from fastapi.exceptions import RequestValidationError
     from fastapi.responses import JSONResponse
-    from pydantic import BaseModel, ConfigDict
+    from pydantic import BaseModel, BeforeValidator, ConfigDict
 
     _HAS_FASTAPI = True
 except ImportError:  # tests exercise this path by monkeypatching the flag
@@ -79,6 +79,28 @@ def _preview_overrides(freq: str | None, agg: str | None) -> dict[str, str]:
 
 
 if _HAS_FASTAPI:
+
+    def _not_a_boolean(value: Any) -> Any:
+        """Reject a JSON boolean where a number belongs.
+
+        ``bool`` is an ``int`` subclass, so pydantic's lax mode happily reads
+        ``"h": true`` as ``h=1`` and returns a 200 with one forecast row —
+        silently answering a question the caller did not ask. The same hole
+        is worse on the siblings: ``"level": true`` reports attainment
+        against a 1% interval instead of 80%, ``"seasonality": true`` swaps
+        the seasonal-naive MASE denominator for a naive one, and
+        ``"quota": true`` scores against a target of 1.0. Other lax
+        coercions (``"2"``, ``2.0``) stay: only the boolean one is nonsense.
+        """
+        if isinstance(value, bool):
+            raise ValueError("must be a number, not a boolean")
+        return value
+
+    #: An integer field that does not quietly accept ``true``/``false``.
+    _StrictInt = Annotated[int, BeforeValidator(_not_a_boolean)]
+
+    #: A float field that does not quietly accept ``true``/``false``.
+    _StrictFloat = Annotated[float, BeforeValidator(_not_a_boolean)]
 
     class PreviewRequest(BaseModel):
         """Body for ``POST /preview`` — mirrors :func:`preview_panel`.
@@ -108,8 +130,8 @@ if _HAS_FASTAPI:
         mapping: str | None = None
         model: str = "auto_select"
         model_params: dict[str, Any] | None = None
-        h: int = 12
-        level: list[int] | None = None
+        h: _StrictInt = 12
+        level: list[_StrictInt] | None = None
         freq: str | None = None
         agg: str | None = None
 
@@ -119,11 +141,11 @@ if _HAS_FASTAPI:
         records: list[dict[str, Any]]
         mapping: str | None = None
         models: list[str] | None = None
-        h: int = 12
-        n_windows: int = 3
+        h: _StrictInt = 12
+        n_windows: _StrictInt = 3
         metrics: list[str] | None = None
-        level: list[int] | None = None
-        seasonality: int = 1
+        level: list[_StrictInt] | None = None
+        seasonality: _StrictInt = 1
         freq: str | None = None
         agg: str | None = None
 
@@ -135,9 +157,9 @@ if _HAS_FASTAPI:
         records: list[dict[str, Any]]
         mapping: str | None = None
         model: str = "reconciled"
-        h: int = 12
-        quota: float | dict[str, float]
-        level: int = 80
+        h: _StrictInt = 12
+        quota: _StrictFloat | dict[str, _StrictFloat]
+        level: _StrictInt = 80
         freq: str | None = None
         agg: str | None = None
 

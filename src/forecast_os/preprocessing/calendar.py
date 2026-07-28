@@ -29,7 +29,9 @@ def calendar_features(
 
     With ``cyclical=True`` each feature becomes a ``{f}_sin``/``{f}_cos``
     pair (period-aware encoding); otherwise the raw integer column ``{f}``
-    is appended. Raises :class:`ForecastOSError` when ``ds`` is not datetime.
+    is appended. Raises :class:`ForecastOSError` when ``ds`` is not datetime,
+    and — on the ``cyclical=False`` branch only — when it carries a ``NaT``.
+    The cyclical encoding propagates ``NaT`` as ``NaN`` sin/cos values.
     """
     if TIME_COL not in df.columns:
         raise ForecastOSError(f"frame must contain the {TIME_COL!r} column")
@@ -38,6 +40,19 @@ def calendar_features(
             f"calendar_features requires a datetime {TIME_COL!r} column; "
             f"got dtype {df[TIME_COL].dtype}"
         )
+    # A missing timestamp has no month and no weekday. Left alone the integer
+    # branch casts NaN to 0, fabricating a month that does not exist and a
+    # Monday indistinguishable from a real one, so refuse it there. The
+    # cyclical branch fabricates nothing — NaN flows through sin/cos and stays
+    # NaN — so it keeps accepting NaT, as it always has.
+    if not cyclical:
+        n_nat = int(df[TIME_COL].isna().sum())
+        if n_nat:
+            raise ForecastOSError(
+                f"calendar_features(cyclical=False) requires a {TIME_COL!r} value "
+                f"on every row (the integer encoding would turn {n_nat} NaT into "
+                f"a fabricated 0). Drop or repair those rows first."
+            )
     out = df.copy()
     dt = out[TIME_COL].dt
     for f in features:

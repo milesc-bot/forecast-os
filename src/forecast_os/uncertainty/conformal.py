@@ -7,9 +7,18 @@ calibration scores. The member is then refitted on the full series, and
 intervals at level ``l`` are its point forecast plus/minus the
 finite-sample-corrected order statistic of that series' scores
 (the ``ceil((n + 1) * l/100)``-th smallest score).
+
+That order statistic does not exist when ``ceil((n + 1) * l/100) > n`` — split
+conformal has no finite valid bound at level ``l`` with only ``n`` calibration
+residuals, and empirical coverage saturates at ``n / (n + 1)``. The widest
+available band (the largest calibration score) is returned in that case, with a
+``UserWarning`` naming the series and the level: level ``l`` needs at least
+``ceil(l / (100 - l))`` residuals (9 for 90%, 19 for 95%, 99 for 99%).
 """
 
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -57,6 +66,14 @@ class ConformalForecaster(BaseForecaster):
         return type(self)(**params)
 
     def fit(self, df: pd.DataFrame) -> ConformalForecaster:
+        # A fit that raises part-way must not leave the object looking fitted.
+        # fit() consumes the member twice — once on the calibration head, once
+        # on the full panel — so a failure in the second fit used to leave the
+        # PREVIOUS fit's _model_ paired with THIS fit's calibration scores, and
+        # predict() went on to serve stale point forecasts inside freshly
+        # calibrated widths. State is built in locals and published only once
+        # both fits have succeeded.
+        self._is_fitted = False
         df = validate_panel(df)
         proto = get_model(self.model) if isinstance(self.model, str) else self.model.clone()
 
@@ -78,7 +95,7 @@ class ConformalForecaster(BaseForecaster):
         pred["_step"] = pred.groupby(ID_COL).cumcount()
         cal = cal.merge(pred[[ID_COL, "_step", "yhat"]], on=[ID_COL, "_step"], how="left")
 
-        self._abs_resid_: dict = {}
+        abs_resid: dict = {}
         for uid, g in cal.groupby(ID_COL, sort=True):
             r = np.abs(g[TARGET_COL].to_numpy(float) - g["yhat"].to_numpy(float))
             r = r[np.isfinite(r)]
@@ -86,9 +103,11 @@ class ConformalForecaster(BaseForecaster):
                 raise ForecastOSError(
                     f"{self.name}: no finite calibration residuals for series {uid!r}"
                 )
-            self._abs_resid_[uid] = r
+            abs_resid[uid] = r
 
-        self._model_ = proto.clone().fit(df)
+        model = proto.clone().fit(df)
+        self._abs_resid_: dict = abs_resid
+        self._model_ = model
         self._is_fitted = True
         return self
 
@@ -98,15 +117,32 @@ class ConformalForecaster(BaseForecaster):
             raise ValueError(f"h must be a positive integer, got {h!r}")
         levels = _check_level(level)
         out = self._model_.predict(int(h))[[ID_COL, TIME_COL, "yhat"]].copy()
+        capped: list[tuple[int, object, int]] = []
         for lvl in levels:
             q = {}
             for uid, scores in self._abs_resid_.items():
                 # Finite-sample-corrected order statistic: without the
                 # (n + 1)/n inflation the plain empirical quantile undercovers.
                 n = scores.size
+                if np.ceil((n + 1) * (lvl / 100)) > n:
+                    # The required order statistic is past the largest score:
+                    # min() below clamps to it, so coverage caps at n/(n + 1).
+                    capped.append((lvl, uid, n))
                 q_level = min(1.0, (n + 1) * (lvl / 100) / n)
                 q[uid] = float(np.quantile(scores, q_level, method="higher"))
             width = out[ID_COL].map(q).to_numpy(dtype=float)
             out[f"lo-{lvl}"] = out["yhat"] - width
             out[f"hi-{lvl}"] = out["yhat"] + width
+        if capped:
+            lvl, uid, n = capped[0]
+            extra = f" (and {len(capped) - 1} more series/level pairs)" if len(capped) > 1 else ""
+            warnings.warn(
+                f"{self.name}: level {lvl} needs >= {int(np.ceil(lvl / (100 - lvl)))} "
+                f"calibration residuals but series {uid!r} has {n}{extra}; the "
+                f"interval is capped at the largest residual, so its coverage "
+                f"saturates at {n}/{n + 1} = {100 * n / (n + 1):.1f}%, not {lvl}%. "
+                f"Use longer series, raise level_calibration_fraction/"
+                f"min_calibration, or request a lower level.",
+                stacklevel=2,
+            )
         return out

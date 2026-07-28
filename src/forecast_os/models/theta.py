@@ -86,10 +86,15 @@ class Theta(PerSeriesForecaster):
         return forecast
 
     def _predict_sigma(self, state: dict, h: int) -> np.ndarray:
-        # The theta=0 trend line is deterministic, so only the SES component
-        # (combination weight w = 1/theta) accumulates forecast-error
-        # variance. Approximate by scaling the SES horizon-growth term by w,
-        # using the SES alpha fitted on the theta line.
-        w = 1.0 / self.theta
+        # The combination weights cancel on the stochastic component, so the
+        # horizon-growth coefficient is alpha itself — NOT alpha * w.
+        # SES is linear in its input, so with q = theta*x + (1-theta)*L (L the
+        # deterministic OLS line) the SES level splits as
+        # ell^q_n = theta*ell^x_n + (1-theta)*m_n, m = SES(L). Substituting into
+        # w*ell^q_n + (1-w)*L_{n+k} with w = 1/theta gives
+        # ell^x_n + (1-w)*(L_{n+k} - m_n): the SES level of the ORIGINAL series
+        # at the same alpha, plus a deterministic drift. The psi weights are
+        # therefore (1, alpha, alpha, ...) as for plain SES, and `_sigma` is
+        # already the residual std of the recombined fit in original units.
         k = np.arange(1, h + 1)
-        return state["_sigma"] * np.sqrt(1 + (k - 1) * (state["alpha_"] * w) ** 2)
+        return state["_sigma"] * np.sqrt(1 + (k - 1) * state["alpha_"] ** 2)
