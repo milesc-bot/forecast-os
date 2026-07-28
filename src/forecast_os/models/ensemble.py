@@ -88,6 +88,17 @@ class Ensemble(BaseForecaster):
         arithmetically identical to the column-wise weighted mean whenever
         every weight is non-negative, and keeps ``lo <= yhat <= hi`` (and
         nesting across levels) by construction otherwise.
+
+        Read that band as a conservative UPPER BOUND, not as a calibrated
+        interval: ``sum_i |w_i| * hw_i`` is the width you would get if the
+        members' errors were perfectly correlated and every weight pulled the
+        same way. Because the normalized weights sum to 1, any negative weight
+        makes ``sum_i |w_i| > 1``. The width is ``sum_i |w_i| * hw_i``, so that sum
+        is the inflation factor only when the members share a half-width; in
+        general it is the weighted sum. Either way the growth has no
+        upper limit — a Granger-Ramanathan-typical ``[1.5, -0.5]`` doubles it,
+        and ``[3, -2]`` widens it roughly 5-fold. The width is therefore not a
+        forecast standard deviation and should not be read as one.
         """
         self._check_is_fitted()
         if not isinstance(h, (int, np.integer)) or h < 1:

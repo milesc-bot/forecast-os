@@ -10,8 +10,8 @@ series are the leaves and the only aggregate is the total.
 :class:`HierarchicalReconciler` wraps any registered forecaster and returns
 forecasts for ALL nodes whose POINT forecasts are coherent — for every
 parent, the children's ``yhat`` sums exactly to the parent's. Interval
-bounds are a separate per-column projection and are not additive; see
-:class:`HierarchicalReconciler` for what they do guarantee.
+bounds are a separate per-column projection and are not guaranteed to be
+additive; see :class:`HierarchicalReconciler` for what they do guarantee.
 """
 
 from __future__ import annotations
@@ -163,6 +163,15 @@ class HierarchicalReconciler(BaseForecaster):
     quantiles are not a statistical property anyway (the quantile of a sum is
     not the sum of the quantiles). Do not sum children's ``lo``/``hi`` and
     expect the parent's.
+
+    ``bottom_up`` is the one mapping where they do happen to line up: its leaf
+    columns are the member's own bands pushed through the same summing matrix
+    as ``yhat``, so when those bands are ordered the guard has nothing to
+    repair. That is a property of the mapping, not part of the contract — only
+    ``yhat`` is. It does **not** extend to ``top_down``, whose leaf bands are
+    ``prop * total`` rather than the member's columns, so a proportion derived
+    from ``yhat`` can leave them non-additive even when every member band is
+    ordered.
     """
 
     def __init__(self, model="auto_ets", method="mint_ols", sep="/", total_id="total"):

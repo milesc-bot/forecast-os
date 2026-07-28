@@ -134,6 +134,18 @@ def tracking_signal(y, yhat) -> float:
 
 
 def _naive_scale(y_train: np.ndarray, m: int, squared: bool) -> float:
+    """In-sample seasonal-naive scale: mean |or squared| ``m``-lag difference.
+
+    The guard below states the contract on ``m`` but only ENFORCES the lower
+    bound, which is the half that used to produce wrong answers quietly
+    (``m=-1`` returned a meaningless scale, ``m=0`` a raw numpy error).
+    Integrality is left to the slice: a non-integral ``m >= 1`` reaches
+    ``y_train[m:]`` and surfaces as ``TypeError: slice indices must be
+    integers``, which already names the problem. Do not tighten this into an
+    ``isinstance`` check — anything with ``__index__`` (``np.int64`` and the
+    integer types pandas hands back among them) slices fine today and must
+    keep working.
+    """
     if m < 1:
         raise ValueError(f"m must be a positive integer, got {m}")
     y_train = np.asarray(y_train, dtype=float).ravel()

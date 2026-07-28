@@ -126,6 +126,20 @@ class SnapshotStore:
         a sibling temp file that is flushed and fsynced, then ``os.replace``d
         over the real one — rename is atomic within a filesystem, so a reader
         sees either the complete old manifest or the complete new one.
+
+        This protects READERS; it does not make the store multi-writer safe.
+        The temp file has a fixed name (``manifest.json.tmp``), so two
+        processes appending to the same store concurrently write to the same
+        temp file. Whichever writer's ``os.replace`` runs first consumes it, so the other's
+        ``os.replace`` then fails with ``FileNotFoundError`` — no error or
+        unlink required, just two successful writers racing. Interleaved writes
+        to the shared temp can also leave it holding a blend of both manifests,
+        which ``os.replace`` then installs whole: readers still never see a
+        partial file, but the complete file they see may be neither writer's.
+        The append itself
+        is an unsynchronized read-modify-write of the whole manifest, so
+        concurrent appends lose entries regardless. Serialize writes to a
+        store; the store assumes a single writer.
         """
         tmp_path = self._manifest_path.with_name(_MANIFEST_NAME + ".tmp")
         try:

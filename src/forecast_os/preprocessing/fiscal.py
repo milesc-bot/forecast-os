@@ -20,6 +20,19 @@ normalizing, since a deal closing at 23:00 local on the last day of a quarter
 belongs to that quarter — so :meth:`FiscalCalendar.quarter_end` always returns
 naive timestamps. Non-datetime inputs and ``NaT`` raise
 :class:`ForecastOSError`.
+
+One class of zone is not supported: where a DST transition lands **on**
+midnight, the local midnight of that day does not exist, and normalizing a
+tz-aware ``ds`` covering it raises the timezone backend's own nonexistent-time
+error rather than a :class:`ForecastOSError`. The exception type follows the
+installed pandas: pandas 3 is zoneinfo-backed and raises
+``ValueError: ... is a nonexistent time due to daylight savings time``, while
+pandas 2.x is pytz-backed and raises ``pytz.exceptions.NonExistentTimeError``,
+which is *not* a ``ValueError`` — so catch both, or catch ``Exception``
+(America/Havana 2018-03-11, America/Santiago
+2019-09-08, America/Sao_Paulo 2018-11-04, ...). Drop the zone yourself first —
+``df["ds"].dt.tz_localize(None)`` keeps the wall clock these buckets are
+defined on — for such panels.
 """
 
 from __future__ import annotations

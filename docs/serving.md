@@ -31,7 +31,12 @@ curl -s localhost:8000/forecast -H 'content-type: application/json' -d '{
 
 Contract violations return HTTP 400 with `{"error": "..."}` — never a
 traceback. Handlers are thin wrappers over the shared tool functions, so the
-REST and MCP surfaces never drift.
+two surfaces stay in step by construction — with one deliberate exception:
+`POST /preview` does **not** accept `preview_panel`'s `csv_path`. Over HTTP that
+parameter would let an unauthenticated request read any file the server process
+can reach and fetch arbitrary URLs (it is handed to `pandas.read_csv`, which
+resolves both). MCP is a local, trusted transport, so it keeps the affordance;
+the REST body takes `records` only.
 
 ## MCP server
 

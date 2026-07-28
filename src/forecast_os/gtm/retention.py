@@ -142,7 +142,14 @@ def _pooled_curve(curves: list[np.ndarray]) -> np.ndarray:
     mean ratio is clipped into [0, 1], the same noisy-up-tick convention
     :func:`_sbg_mle` uses), uses every cohort at every position it actually
     observes, and returns the identical curve when all cohorts share one
-    curve. Position 0 is measured against the age-0 anchor of 1.0 that
+    MONOTONE NONINCREASING curve. That clip is why the qualifier is needed:
+    :func:`cohort_panel` accepts non-monotone curves (measurement noise
+    happens), and a shared curve with an up-tick comes back flattened at that
+    position, with every LATER level lowered by the swallowed increment — e.g.
+    three copies of ``[0.80, 0.85, 0.70, 0.68]`` pool to
+    ``[0.80, 0.80, 0.659, 0.64]``.
+
+    Position 0 is measured against the age-0 anchor of 1.0 that
     :func:`_survival_curve` already divided out; a position no usable cohort
     reaches carries forward flat.
     """

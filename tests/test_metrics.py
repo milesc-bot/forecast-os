@@ -801,6 +801,23 @@ def test_scaled_metrics_reject_nonpositive_seasonality(m):
         evaluate(_cv_frame(), metrics=("mase",), train_df=_train_frame(), seasonality=m)
 
 
+def test_seasonality_guard_enforces_the_lower_bound_not_integrality():
+    """Pins what ``_naive_scale``'s guard actually enforces, per its docstring.
+
+    The message states the contract ("a positive integer"); only ``m < 1`` is
+    checked there. An index-like ``m`` such as ``np.int64`` must keep working,
+    and a non-integral ``m >= 1`` is left to the slice, which names the
+    problem itself.
+    """
+    assert mase([6, 7], [6.5, 8], [1, 2, 3, 4, 5], m=np.int64(2)) == pytest.approx(
+        mase([6, 7], [6.5, 8], [1, 2, 3, 4, 5], m=2)
+    )
+    with pytest.raises(TypeError, match="slice indices"):
+        mase([6, 7], [6.5, 8], [1, 2, 3, 4, 5], m=1.5)
+    with pytest.raises(TypeError, match="slice indices"):
+        rmsse([6, 7], [6.5, 8], [1, 2, 3, 4, 5], m=2.0)
+
+
 def test_evaluate_missing_train_series_names_the_series():
     """A series in cv_df but absent from train_df blamed the seasonality arg.
 

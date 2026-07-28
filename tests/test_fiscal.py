@@ -246,6 +246,38 @@ def test_tz_aware_ds_matches_naive_wall_clock(scheme):
     assert out_aware["ds"].dt.tz is not None
 
 
+@pytest.mark.parametrize(
+    ("zone", "day"),
+    [("America/Havana", "2018-03-11"), ("America/Santiago", "2019-09-08")],
+)
+def test_midnight_dst_zone_raises_and_documented_workaround_succeeds(zone, day):
+    """Pins the module docstring's one exception to tz-aware support: where a
+    DST transition lands on midnight, that day's local midnight does not exist,
+    so ``normalize()`` raises the tz backend's own nonexistent-time error (NOT a
+    ForecastOSError). The documented workaround — drop the zone yourself,
+    keeping the wall clock — must give the wall-clock answer.
+
+    The exception TYPE is pandas-version dependent and must not be pinned to
+    one: pandas 3 is zoneinfo-backed and raises ``ValueError``, pandas 2 is
+    pytz-backed and raises ``pytz.exceptions.NonExistentTimeError``, which is
+    not a ``ValueError`` subclass. Asserting ``ValueError`` alone passed on the
+    dev venv and failed on the supported pandas floor — the same
+    version-conditional break that shipped as 0.10.0.
+    """
+    cal = FiscalCalendar(start_month=2, scheme="4-4-5")
+    aware = pd.to_datetime([f"{day} 12:00"]).tz_localize(zone)
+    with pytest.raises(Exception) as excinfo:
+        cal.fiscal_quarter(aware)
+    # Whatever the backend calls it, it must not be our own error type (which
+    # would imply we had handled the case) and must name the offending day.
+    assert not isinstance(excinfo.value, ForecastOSError)
+    assert day in str(excinfo.value)
+    naive = aware.tz_localize(None)
+    np.testing.assert_array_equal(
+        cal.fiscal_quarter(naive), cal.fiscal_quarter(pd.to_datetime([f"{day} 12:00"]))
+    )
+
+
 @pytest.mark.parametrize("scheme", ["calendar", "4-4-5"])
 def test_nat_ds_raises_instead_of_fabricating_a_fiscal_year(scheme):
     """``fiscal_year`` used to return 0 for a NaT row (NaN cast to int) and

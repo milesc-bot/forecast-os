@@ -445,6 +445,32 @@ def test_periods_validated():
         StrategyBacktester(ConstForecaster(), periods=2.5)
 
 
+def test_non_finite_periods_get_the_documented_message():
+    """``nan``/``inf`` must fail the guard, not crash inside it.
+
+    Regression: the guard evaluated ``int(periods) != periods`` first, and
+    ``int()`` itself cannot handle those two values, so ``periods=nan`` escaped
+    with ``ValueError: cannot convert float NaN to integer`` and
+    ``periods=inf`` with an ``OverflowError`` — while every other bad value
+    (0, -5, 2.5, '252') got the intended message. Both were rejected either
+    way; only the diagnostic was wrong.
+    """
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="periods must be None or an integer >= 1"):
+            StrategyBacktester(ConstForecaster(), periods=bad)
+
+
+def test_valid_periods_types_still_accepted():
+    """The finiteness guard must not narrow what the constructor takes."""
+    from decimal import Decimal
+
+    assert StrategyBacktester(ConstForecaster(), periods=12).periods == 12
+    assert StrategyBacktester(ConstForecaster(), periods=12.0).periods == 12
+    assert StrategyBacktester(ConstForecaster(), periods=Decimal("252")).periods == 252
+    assert StrategyBacktester(ConstForecaster(), periods=np.int64(52)).periods == 52
+    assert StrategyBacktester(ConstForecaster(), periods=None).periods is None
+
+
 def _daily_panel(ds):
     import pandas as pd
 
@@ -565,6 +591,29 @@ def test_inferred_periods_honor_the_frequency_multiple():
     assert _infer_periods(panel("BME")) == 12
     assert _infer_periods(panel("BQE")) == 4
     assert _infer_periods(panel("BYE")) == 1
+
+
+def test_documented_fallbacks_and_modal_step():
+    """Pin the two fallbacks the class docstring names, and *modal* meaning modal.
+
+    The table stops at seconds, so sub-second units take the 252 fallback, as
+    do irregular datetimes (semi-month ends resolve to a Timedelta, not a
+    frequency string). A mixed-frequency panel is annualized at its most common
+    step — applied to every series in it, including the odd one out.
+    """
+    import pandas as pd
+
+    from forecast_os.finance.backtest import _infer_periods
+
+    def panel(freq, uid="asset-0"):
+        return pd.DataFrame(
+            {ID_COL: uid, "ds": pd.date_range("2020-01-01", periods=60, freq=freq), "y": 0.01}
+        )
+
+    assert _infer_periods(panel("ms")) == 252
+    assert _infer_periods(panel("SME")) == 252
+    mixed = pd.concat([panel("D", "a"), panel("D", "b"), panel("ME", "c")], ignore_index=True)
+    assert _infer_periods(mixed) == 252  # two daily series outvote the monthly one
 
 
 def test_intraday_panel_reports_the_multiplied_periods_end_to_end():

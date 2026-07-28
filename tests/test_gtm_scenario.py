@@ -257,6 +257,28 @@ class TestRateDriverValidationOnTheDefaultPath:
         with pytest.raises(ValueError):  # propagate's own check, via stage_volumes
             bad.project({"won": "win_rate"})
 
+    def test_the_two_paths_reject_negatives_differently(self):
+        """Pins the two divergences ``project.__doc__`` now spells out.
+
+        They agree that a negative rate the chain USES is fatal, and nothing
+        more: the exception types are unrelated, and an unreferenced negative
+        rate driver is fatal only on the default path.
+        """
+        # (a) the stages path's ValueError is NOT a ForecastOSError, so one
+        # `except ForecastOSError` does not cover both paths.
+        assert not issubclass(ForecastOSError, ValueError)
+        with pytest.raises(ValueError) as exc:
+            self._s(-0.1).project({"won": "win_rate"})
+        assert not isinstance(exc.value, ForecastOSError)
+
+        # (b) the stages path only judges the rates its chain names.
+        unreferenced = Scenario(
+            {"top_of_funnel": 1000, "win_rate": 0.3, "churn_rate": -0.1}
+        )
+        assert unreferenced.project({"won": "win_rate"}) == pytest.approx(300.0)
+        with pytest.raises(ForecastOSError, match="churn_rate"):
+            unreferenced.project()
+
     def test_compare_scenarios_surfaces_the_error_rather_than_a_minus_200_pct(self):
         base = Scenario({"top_of_funnel": 1000, "win_rate": 0.10, "acv": 10000})
         with pytest.raises(ForecastOSError, match="win_rate"):

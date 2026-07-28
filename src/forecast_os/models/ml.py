@@ -146,6 +146,26 @@ class RidgeLag(PerSeriesForecaster):
         ``models/arima.py``. Fourier and exogenous columns are deterministic
         given the future clock and ``X_future``, so only the ``lags`` leading
         weights enter; de-standardized, phi_j = w[j] * y_std / x_std[j].
+
+        No stability screen is applied to the fitted polynomial. If it has a
+        root inside the unit circle — which short, noisy panels at the default
+        ``lags=14`` can produce — ``psi`` grows geometrically and ``psi**2``
+        overflows to ``inf``, after which the recursion mixes infinities of
+        both signs and returns ``nan``. That is only reachable at horizons in
+        the low thousands, where the recursive point forecast in
+        ``_predict_series`` is itself heading for overflow.
+
+        The bounds degrade first, and by a wide margin: because ``psi**2``
+        overflows at roughly the square root of the value ``psi`` itself does,
+        ``lo``/``hi`` go infinite at about *half* the horizon at which ``yhat``
+        does. Measured on 30-row random walks at ``h=5000`` (seeds 1/2/4):
+        ``lo`` infinite at 1299/2140/1704 against ``yhat`` at 2583/4262/3393.
+        They then turn ``nan`` on the *same* row as ``yhat``
+        (2590/4264/3400), since ``lo = yhat - z * sigma`` inherits it.
+
+        So a run of finite ``yhat`` with infinite bounds is the expected
+        signature, not a bug. The bounds are not clipped, because an explosive
+        fit makes the point forecast meaningless shortly after anyway.
         """
         m = self.lags
         phi = state["w"][:m] * state["y_std"] / state["x_std"][:m]

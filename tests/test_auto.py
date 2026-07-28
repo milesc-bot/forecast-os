@@ -223,7 +223,7 @@ def test_signed_metric_argmin_would_pick_the_sandbagger():
     assert abs(row["_test_last"]) < abs(row["_test_under"])  # |bias| argmin = honest
 
 
-@pytest.mark.parametrize("metric", ["coverage", "winkler", "pinball", "crps"])
+@pytest.mark.parametrize("metric", ["coverage", "winkler", "pinball", "wis", "crps"])
 def test_interval_metrics_rejected(metric):
     """Interval metrics cannot be scored: AutoSelect never requests lo/hi.
 
@@ -231,6 +231,10 @@ def test_interval_metrics_rejected(metric):
     lo/hi columns ... pass level=[...]', advice the caller has no way to act
     on because AutoSelect's validation pass does not thread ``level`` into
     cross_validation. Reject at construction with an accurate reason instead.
+
+    The list is exactly what the ``metric`` docstring promises is rejected,
+    including ``wis`` and its pre-v0.10.0 alias ``crps`` — the spelling a
+    v0.9.0 caller is most likely to still be passing.
     """
     with pytest.raises(ValueError, match="interval metric"):
         AutoSelect(candidates=(_LastDummy(),), metric=metric)

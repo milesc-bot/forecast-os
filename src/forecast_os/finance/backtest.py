@@ -42,8 +42,16 @@ _SIGMA_EPS = 1e-12
 #: string; a multi-unit step like ``"4h"`` divides its unit's rate by the
 #: multiple. Daily and business-daily both map to the 252 trading-day
 #: convention, which is also the fallback for any step this table does not
-#: cover (numeric ``ds``, irregular datetimes, sub-hourly units), preserving the
-#: historical default.
+#: cover (numeric ``ds``, irregular datetimes such as semi-month ends, and
+#: sub-second units, and any other alias not listed — business-hour and
+#: week-of-month steps included), preserving the historical default.
+#:
+#: The intraday rows are a deliberate hybrid: a 24-hour day (as on a crypto/FX
+#: tape) crossed with the 252-day equity trading year, i.e. bars arrive around
+#: the clock but only on 252 days a year. That is a convention, not a
+#: measurement — neither self-consistent alternative
+#: (6.5*252 = 1638 for a US equity session, 24*365 = 8760 for a 24/7 tape) is
+#: right for every tape. Pass ``periods`` explicitly if yours is one of those.
 _PERIODS_BY_FREQ = {
     "D": 252,
     "B": 252,
@@ -160,7 +168,11 @@ class StrategyBacktester:
     seconds, business-anchored month/quarter/year ends included), divided by the
     step's multiple where it has one (``"4h"`` -> 1512, ``"2W"`` -> 26) and
     rounded to at least 1 — so steps coarser than a year (``"2YE"``, ``"3QS"``)
-    all annualize as 1. It falls back to 252 for numeric ``ds``, irregular
+    all annualize as 1. The intraday rates cross a 24-hour day with the 252-day
+    trading year; see :data:`_PERIODS_BY_FREQ`, and pass ``periods`` yourself
+    for a 6.5-hour equity session or a 24/7 tape. Note also that *modal* means
+    a mixed-frequency panel is annualized at its most common step, applied to
+    every series in it. It falls back to 252 for numeric ``ds``, irregular
     datetimes and any unit outside that list, and is then divided by
     :meth:`run`'s ``step_size`` so it describes the strategy's own return series
     rather than the panel's bar spacing. The resolved value is reported on
@@ -187,8 +199,16 @@ class StrategyBacktester:
             raise ValueError(f"kelly_fraction must be finite and > 0, got {kelly_fraction!r}")
         if not np.isfinite(max_leverage) or max_leverage <= 0:
             raise ValueError(f"max_leverage must be finite and > 0, got {max_leverage!r}")
-        if periods is not None and (int(periods) != periods or periods < 1):
-            raise ValueError(f"periods must be None or an integer >= 1, got {periods!r}")
+        if periods is not None:
+            try:
+                integral = int(periods) == periods
+            except (ValueError, OverflowError):
+                # int() itself rejects nan (ValueError) and +/-inf
+                # (OverflowError); those are bad ``periods`` like any other and
+                # deserve this guard's message, not the converter's.
+                integral = False
+            if not integral or periods < 1:
+                raise ValueError(f"periods must be None or an integer >= 1, got {periods!r}")
         self.periods = None if periods is None else int(periods)
         self.model = model
         self.threshold = float(threshold)

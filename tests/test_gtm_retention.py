@@ -613,6 +613,20 @@ class TestPooledFitOnARaggedCohortTriangle:
         curves = [s[1:] / s[0]] * 4
         np.testing.assert_allclose(_pooled_curve(curves), s[1:], rtol=1e-12)
 
+    def test_identical_non_monotone_cohorts_are_flattened_at_the_uptick(self):
+        """The "identical curve back" guarantee holds only for MONOTONE curves.
+
+        ``cohort_panel`` allows a non-monotone curve (measurement noise), and
+        the [0, 1] ratio clip flattens any up-tick and carries the swallowed
+        increment into every later level. Pins the documented convention so
+        nobody reads the backward-compat test above as unconditional.
+        """
+        c = np.array([0.80, 0.85, 0.70, 0.68])
+        pooled = _pooled_curve([c, c, c])
+        np.testing.assert_allclose(pooled, [0.80, 0.80, 0.7 * 0.8 / 0.85, 0.64], rtol=1e-12)
+        assert np.all(np.diff(pooled) <= 1e-12)  # still a survival curve
+        assert float(np.max(np.abs(pooled - c))) == pytest.approx(0.05)
+
     def test_borrowing_cohorts_forecast_closer_to_their_own_truth(self):
         panel = self._ragged_panel()
         model = ShiftedBetaGeometric().fit(panel)

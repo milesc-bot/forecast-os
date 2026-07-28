@@ -226,6 +226,16 @@ class GARCHVolatility(PerSeriesForecaster):
     ``fitted`` column is that series' conditional volatility. Residuals from it
     are not forecast errors.
 
+    The same caveat applies to every accuracy and interval metric scored
+    against ``y`` — including :meth:`~forecast_os.engine.ForecastEngine.compare`
+    and cross-validation leaderboards. ``coverage``/``winkler`` ask how often a
+    band around the *volatility* contains a *return*, which is not a question
+    about this model's quality: on a plain returns panel a nominal 80% band
+    reports a ``coverage-80`` at or near zero (0.0 on a simulated daily returns
+    panel), because the band is a narrow positive interval around sigma while
+    ``y`` straddles zero. Read the leaderboard row
+    for ``garch`` as inapplicable, not as a regression.
+
     ``predict(..., level=[...])`` puts a *relative* band around ``yhat``,
     ``sd(sigma_hat) ~ sigma_hat / sqrt(2n)`` for ``n`` observations, so the band
     scales with the volatility rather than with the level of the series and its

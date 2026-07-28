@@ -223,7 +223,12 @@ class RestSource(Source):
         if self.pagination is not None and self.pagination["style"] == "page":
             # send the first page number explicitly: the next-page arithmetic
             # has to know which page came back, and omitting the parameter
-            # forced it to guess 1 (skipping page 0 on a 0-indexed API)
+            # forced it to assume the server had returned page 1 and ask for
+            # 2 -- so a 0-indexed API, whose first response was page 0, never
+            # saw a request for page 1. Seeding the parameter makes the
+            # arithmetic exact instead of assumed; it does not by itself suit
+            # the page numbering to the API, which is what first_page is for
+            # (the default 1 still never fetches a 0-indexed API's page 0).
             params.setdefault(
                 self.pagination["page_param"], self.pagination.get("first_page", 1)
             )

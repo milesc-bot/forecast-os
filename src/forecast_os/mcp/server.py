@@ -75,12 +75,19 @@ def _tool_errors(fn):
 def _not_a_boolean(value: Any, name: str) -> Any:
     """Return ``value`` unless it is a boolean, which is never a number here.
 
-    ``bool`` is an ``int`` subclass, so ``int(True) == 1``: without this
-    guard a client sending ``h=true`` gets a silent one-step forecast,
-    ``seasonality=true`` swaps the seasonal-naive MASE denominator for a
-    naive one, ``level=true`` reports a 1% interval, and ``quota=true``
-    scores against a target of 1.0. Every other coercion these tools accept
-    (``"2"``, ``2.0``) is kept — only the boolean one is nonsense.
+    ``bool`` is an ``int`` subclass, so ``int(True) == 1``: unguarded, ``h=true``
+    is a silent one-step forecast, ``seasonality=true`` swaps the seasonal-naive
+    MASE denominator for a naive one, ``level=true`` reports a 1% interval, and
+    ``quota=true`` scores against a target of 1.0. Every other coercion these
+    tools accept (``"2"``, ``2.0``) is kept — only the boolean one is nonsense.
+
+    Note which surfaces this actually covers. It runs in the tool body, so it
+    protects direct Python callers; the REST layer gets the same protection
+    earlier, from ``serve.app._StrictInt``. It does **not** protect the MCP
+    wire: FastMCP validates against the annotation and coerces a JSON boolean
+    to ``int`` before the body runs, so an MCP client sending ``h=true`` still
+    gets the one-step forecast. Closing that would mean annotating the tool
+    parameters themselves, not checking inside.
     """
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a number, not a boolean")
@@ -136,11 +143,17 @@ def _build_panel(
     without one they must already carry the contract columns, and ``ds`` is
     parsed to datetimes when needed.
 
-    Everything here runs on caller-supplied values, so arithmetic and type
-    errors raised while shaping them are client errors, not server faults:
-    they are re-raised as ``ValueError`` (which the REST layer renders as a
-    400) rather than escaping as e.g. ``ZeroDivisionError`` from ``freq="0D"``
-    or ``TypeError`` from a series id that is a nested object.
+    Shaping runs on caller-supplied values, so the arithmetic and type errors
+    it raises are almost always client errors, not server faults: they are
+    re-raised as ``ValueError`` (which the REST layer renders as a 400) rather
+    than escaping as e.g. ``ZeroDivisionError`` from ``freq="0D"`` or
+    ``TypeError`` from a series id that is a nested object.
+
+    The catch selects on exception type, not on origin, so it is broader than
+    those cases: a ``TypeError`` from a genuine bug inside ``apply_mapping``,
+    ``to_panel``, or ``validate_panel`` is relabelled the same way and reported
+    to the caller as a 400 blaming their records, instead of surfacing as the
+    500 an internal fault deserves.
     """
     frame = _load_records(csv_path=csv_path, records=records)
     try:
@@ -419,7 +432,12 @@ def quota_tool(
     panel = _build_panel(csv_path, records, mapping, **_panel_overrides(freq, agg))
     # level reaches predict() uncoerced so a fractional level is rejected there
     # rather than truncated here; the interval column labels then follow the
-    # same rounding predict() used to name them.
+    # same rounding predict() used to name them. Unlike forecast_tool this
+    # keeps the boolean-only guard, so a non-numeric level (level="80") is not
+    # rejected here and instead fails inside _check_level's comparison as a
+    # raw TypeError, which _tool_errors does not convert to a ValueError. Both
+    # wire surfaces declare level as an int and coerce "80" before the call, so
+    # that gap is reachable only by calling this function directly in Python.
     _not_a_boolean(level, "level")
     pred = get_model(model).fit(panel).predict(int(_not_a_boolean(h, "h")), level=[level])
     label = int(round(float(level)))

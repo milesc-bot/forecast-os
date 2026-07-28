@@ -107,8 +107,17 @@ def test_mu_is_the_arithmetic_drift_not_the_log_return_drift():
     assert np.log(gross).mean() == pytest.approx(mu - 0.5 * sigma**2, abs=2e-4)
 
 
-def test_from_returns_on_simple_returns_is_unbiased_against_the_source():
-    """Calibrating from simple returns reproduces the observed mean gross return."""
+def test_from_returns_on_simple_returns_matches_the_source_to_first_order():
+    """Calibrating from simple returns reproduces the observed mean gross return.
+
+    Only to first order, which is what the docstrings now say: ``from_returns``
+    sets ``mu = mean(r)`` and ``E[S_t/S_{t-1}] = exp(mu)``, so the simulated
+    mean step is ``exp(m)`` rather than the observed ``1 + m``. On this daily
+    series that gap is ~3e-7 (m**2/2 with m = 7.9e-4; well inside the ``rel``
+    below, which is sized for
+    Monte Carlo noise, not for the bias); the exact calibration is
+    ``mu = log1p(m)``.
+    """
     rng = np.random.default_rng(3)
     prices = 30.0 * np.exp(np.cumsum(0.0004 + 0.012 * rng.standard_normal(2000)))
     simple = np.diff(prices) / prices[:-1]
@@ -116,6 +125,11 @@ def test_from_returns_on_simple_returns_is_unbiased_against_the_source():
     sim = MonteCarloSimulator.from_returns(simple, seed=0)
     gross = sim.simulate(prices[-1], 1, 200_000)[:, 0] / prices[-1]
     assert gross.mean() == pytest.approx(1.0 + simple.mean(), rel=3e-3)
+    # the convention itself, free of sampling noise: mu is mean(r), not log1p
+    assert sim.mu == pytest.approx(float(np.mean(simple)), rel=1e-12)
+    assert np.exp(sim.mu) - (1.0 + simple.mean()) == pytest.approx(
+        0.5 * simple.mean() ** 2, rel=1e-3
+    )
 
     # the log-return calibration is the biased one, low by ~sigma^2/2 per step
     log_sim = MonteCarloSimulator.from_returns(np.diff(np.log(prices)), seed=0)
@@ -144,3 +158,29 @@ def test_log_calibration_shortfall_matches_the_documented_magnitude():
         100.0, h, 20_000
     )[:, -1]
     assert 1.0 - np.median(biased) / np.median(correct) == pytest.approx(analytic, rel=1e-6)
+
+
+def test_simple_return_calibration_gap_matches_the_documented_magnitude():
+    """Pin the numbers the module docstring quotes for the first-order gap.
+
+    ``from_returns`` sets ``mu = m``, so the simulated mean net step is
+    ``exp(m) - 1`` against an observed ``m``; the relative overstatement of the
+    drift is ``(exp(m) - 1) / m - 1``. The docstring's value is those numbers:
+    +0.03% on daily returns, +4.1% at m = 0.08, +16.6% at m = 0.30.
+    ``mu = log1p(m)`` removes the gap exactly, at any m.
+    """
+
+    def gap(m):
+        return (np.exp(m) - 1.0) / m - 1.0
+
+    assert gap(0.0006) == pytest.approx(0.0003, rel=2e-2)
+    assert gap(0.08) == pytest.approx(0.04109, rel=1e-3)
+    assert gap(0.30) == pytest.approx(0.16620, rel=1e-3)
+    for m in (0.0006, 0.08):  # ~ m/2 in relative terms, up to O(m^2)
+        assert gap(m) == pytest.approx(0.5 * m, rel=0.05)
+    for m in (0.0006, 0.08, 0.30):
+        assert np.exp(np.log1p(m)) == pytest.approx(1.0 + m, rel=1e-15)
+
+    # and the calibrator really does take the first-order route
+    m = 0.08
+    assert MonteCarloSimulator.from_returns([m, m, m]).mu == pytest.approx(m, rel=1e-12)

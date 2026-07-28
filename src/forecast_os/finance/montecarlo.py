@@ -15,6 +15,16 @@ after ``h`` steps (about -1.25% on a one-year daily fan at 1% daily vol; it
 takes ~2.9% daily vol to reach -10% over the same year); add ``sigma^2/2``
 back to ``mu`` yourself if you only have log returns.
 
+That match is first-order, not exact: :meth:`MonteCarloSimulator.from_returns`
+sets ``mu = mean(r)``, and since ``E[S_t/S_{t-1}] = exp(mu)`` the simulated
+mean gross step is ``exp(m)``, not the observed ``1 + m`` — equivalently the
+mean *net* step is ``exp(m) - 1`` where the data showed ``m``. That overstates
+the drift by ``(exp(m) - 1) / m - 1``, roughly ``m / 2`` in relative terms:
++0.03% on daily returns (``m = 0.0006``), but +4.1% at ``m = 0.08`` and +16.6%
+at ``m = 0.30``. The exact calibration is ``mu = log1p(m)``, so pass
+``mu=float(np.log1p(np.mean(r)))`` yourself when calibrating from monthly,
+annual or crypto-scale per-period returns.
+
 All randomness flows through ``np.random.default_rng(seed)``; a fresh
 generator per call makes repeated simulations reproducible.
 """
@@ -50,6 +60,14 @@ class MonteCarloSimulator:
         :mod:`forecast_os.finance`. Passing log returns biases every simulated
         path down by ``sigma^2/2`` per step, because :meth:`simulate` applies
         the Ito correction to ``mu``.
+
+        ``mu`` is set to ``mean(returns) = m`` as-is, which reproduces the
+        observed mean gross return ``1 + m`` only to first order in ``m``: the
+        simulated mean gross step is ``exp(m)``, so the drift is overstated by
+        ``(exp(m) - 1) / m - 1`` — 0.03% on daily returns, but +4.1% at
+        ``m = 0.08``. For monthly, annual or crypto-scale returns construct the
+        simulator directly with ``mu=float(np.log1p(np.mean(returns)))``, which
+        is exact; see the module docstring.
         """
         r = np.asarray(returns, dtype=float).ravel()
         if r.size == 0:

@@ -438,6 +438,23 @@ def test_differencer_inverse_null_ds_raises():
         diff.inverse_transform(broken)
 
 
+def test_differencer_inverse_missing_ds_column_raises_domain_error():
+    """A frame with no ds column used to die with a bare ``KeyError: 'ds'`` from
+    the null-ds guard, one line after the sibling unique_id check raises a
+    ForecastOSError. Both required columns get the same domain error."""
+    df = pd.DataFrame(
+        {
+            "unique_id": ["a"] * 6,
+            "ds": pd.date_range("2020-01-01", periods=6, freq="D"),
+            "y": [1.0, 2.0, 4.0, 7.0, 11.0, 16.0],
+        }
+    )
+    diff = Differencer(d=1)
+    z = diff.fit_transform(df)
+    with pytest.raises(ForecastOSError, match="ds"):
+        diff.inverse_transform(z.drop(columns=["ds"]))
+
+
 def test_differencer_too_short_series_raises():
     df = pd.DataFrame({"unique_id": ["a"], "ds": [0], "y": [1.0]})
     with pytest.raises(ForecastOSError):

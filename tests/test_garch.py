@@ -452,3 +452,36 @@ class TestGARCHVolatilityIntervals:
             hits += bool(pred["lo-80"][0] <= true_next_sigma <= pred["hi-80"][0])
         coverage = hits / reps
         assert coverage < 0.70, f"nominal 80% band covered {coverage:.0%} at h=1"
+
+
+def test_interval_metrics_against_y_are_inapplicable_to_this_model():
+    """Pin the leaderboard caveat the class docstring now carries.
+
+    ``compare(metrics=["coverage"])`` scores a band around a *volatility*
+    against *returns*, so it asks a question the model does not answer: the
+    band is a narrow strictly-positive interval around sigma while ``y``
+    straddles zero, and coverage-80 lands at or near 0 (0.0 on this panel)
+    where a point-forecast model like ``naive`` sits near nominal. This is a
+    property of the metric, not a regression in the model — the docstring says
+    so, and this test fails if the docstring's claim ever stops being true.
+    """
+    import pandas as pd
+
+    from forecast_os.engine import ForecastEngine
+
+    rng = np.random.default_rng(0)
+    n = 120
+    df = pd.DataFrame(
+        {
+            ID_COL: "a",
+            "ds": pd.date_range("2020-01-01", periods=n, freq="D"),
+            "y": 0.001 + 0.02 * rng.standard_normal(n),
+        }
+    )
+    out = ForecastEngine(models=["garch", "naive"]).compare(
+        df, h=6, metrics=["coverage"], level=[80]
+    )
+    cov_garch = float(out.loc["garch", "coverage-80"])
+    cov_naive = float(out.loc["naive", "coverage-80"])
+    assert cov_garch <= 0.2, f"garch coverage-80 was {cov_garch}"
+    assert cov_garch < cov_naive

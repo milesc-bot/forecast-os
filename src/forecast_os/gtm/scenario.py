@@ -167,7 +167,8 @@ class Scenario:
     def _rate_product(self) -> float:
         """Product of the ``*_rate`` drivers, each validated to be non-negative.
 
-        The stages path validates every rate inside :func:`propagate`, so
+        The stages path validates each rate its chain names inside
+        :func:`propagate` (as a ``ValueError``), so
         ``project({"won": "win_rate"})`` has always refused a win_rate of -0.1.
         The default path multiplied the same driver in unchecked, which turned
         one ``bump(win_rate=-0.20)`` past zero into a silently NEGATIVE bookings
@@ -246,13 +247,20 @@ class Scenario:
         :meth:`stage_volumes` and multiplies the final stage's deal count by
         ``acv``. Returns a plain float.
 
-        Raises :class:`ForecastOSError` when ``top_of_funnel``, ``acv`` or a
-        ``*_rate`` driver is negative; both projection paths reject negatives
-        alike (the stages path via :func:`propagate`). The two paths differ on
-        the upper end: a ``*_rate`` driver above 1.0 multiplies in normally on
-        the default path (it may be a multiplier such as ``expansion_rate``),
-        while the ``stages`` path caps every rate at 1.0 because a funnel chain
-        cannot grow volume from one stage to the next.
+        Both paths raise :class:`ForecastOSError` for a negative
+        ``top_of_funnel`` or ``acv``. They differ on the rates, in two ways.
+        WHICH rates: the default path checks every ``*_rate`` driver in the
+        mapping, the ``stages`` path only the rates its chain actually
+        references, so a negative driver the chain never names is rejected by
+        the default path and ignored by the stages path. WHAT is raised: the
+        default path raises :class:`ForecastOSError`, while the stages path
+        rejects rates inside :func:`propagate`, which raises a plain
+        :class:`ValueError` — not a ``ForecastOSError`` subclass, so an
+        ``except ForecastOSError`` around a stages projection will not catch
+        it. The bounds differ too: a ``*_rate`` driver above 1.0 multiplies in
+        normally on the default path (it may be a multiplier such as
+        ``expansion_rate``), while the ``stages`` path rejects any rate above 1.0
+        because a funnel chain cannot grow volume from one stage to the next.
         """
         top = self._require_top()
         acv = self._acv()

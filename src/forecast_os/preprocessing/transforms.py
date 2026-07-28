@@ -339,8 +339,11 @@ class Differencer(BaseTransform):
             return x
 
         self._check_is_fitted()
-        if ID_COL not in df.columns:
-            raise ForecastOSError(f"frame must contain the {ID_COL!r} column")
+        # ds is as required here as unique_id: integration is ordered by it, and
+        # without this check the null-ds guard below dies with a bare KeyError.
+        for col in (ID_COL, TIME_COL):
+            if col not in df.columns:
+                raise ForecastOSError(f"frame must contain the {col!r} column")
         out = df.copy()
         # Integration below is ordered by ds, and a null ds has no place in
         # that order: numpy sorts it last, so the row would be integrated at

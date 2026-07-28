@@ -260,6 +260,35 @@ def test_compare_distinct_parameterizations_keep_distinct_labels():
     assert board.loc["const_low", "mae"] != board.loc["const_high", "mae"]
 
 
+def test_compare_index_feeds_back_into_forecast_except_on_collision():
+    """Pins what compare()'s docstring promises about its index labels.
+
+    An unambiguous registry-name label really is feedable into forecast(). The
+    collision fallback is ``model.name`` (an alias), which names one specific
+    parameterization rather than a registry entry, so forecast() cannot resolve
+    it — the docstring says so rather than promising every label round-trips.
+    """
+    _register_dummies()
+    df = _make_panel(const=5.0, length=40)
+    board = ForecastEngine().compare(
+        df, h=4, n_windows=2, metrics=("mae",), models=["_test_engine_const"]
+    )
+    assert list(board.index) == ["_test_engine_const"]
+    out = ForecastEngine().forecast(df, h=2, models=[board.index[0]])
+    assert len(out) == 2 * 2
+
+    low = _ConstA(value=1.0)
+    low.alias = "const_low"
+    high = _ConstA(value=99.0)
+    high.alias = "const_high"
+    collided = ForecastEngine().compare(
+        df, h=4, n_windows=2, metrics=("mae",), models=[low, high]
+    )
+    assert sorted(collided.index) == ["const_high", "const_low"]
+    with pytest.raises(ValueError, match="unknown model 'const_"):
+        ForecastEngine().forecast(df, h=2, models=[collided.index[0]])
+
+
 # -- parameterized model specs ---------------------------------------------------
 
 

@@ -181,12 +181,16 @@ class ForecastEngine:
 
         Returns a leaderboard with one column per metric (best model first).
         The board is indexed by each model's registry name when its class was
-        registered (falling back to ``model.name``), so an index entry can be
-        fed straight back into :meth:`forecast`. When one registry name is
+        registered (falling back to ``model.name``), so such an index entry can
+        be fed straight back into :meth:`forecast`. When one registry name is
         claimed by two or more of the models being compared — two
         parameterizations of one class, told apart by ``alias`` — those models
         are indexed by ``model.name`` instead, so distinct parameterizations
-        never collapse onto one row. Interval metrics
+        never collapse onto one row. Those fallback labels (and the fallback
+        for an unregistered class) name one specific parameterization, not a
+        registry entry, so :meth:`forecast` cannot resolve them — hand it the
+        winning model object, or a ``(name, params)`` spec, instead of the
+        label. Interval metrics
         (``coverage``, ``winkler``, ``pinball``, ``wis``) require ``level``
         (falling back to the constructor default) and appear under their
         emitted per-level names, e.g. a ``coverage-80`` column for

@@ -122,7 +122,23 @@ if _HAS_FASTAPI:
         agg: str | None = None
 
     class ForecastRequest(BaseModel):
-        """Body for ``POST /forecast`` — mirrors :func:`forecast_tool`."""
+        """Body for ``POST /forecast`` — mirrors :func:`forecast_tool`.
+
+        ``model_params`` is free-form constructor passthrough: it is forwarded
+        to the chosen model's constructor as-is, and the strict-number guards
+        on ``h``/``level`` do not reach inside it. Whatever the constructor
+        does not check for itself is accepted, so with the default
+        ``auto_select`` (and with ``auto_ets`` or ``theta``)
+        ``{"season_length": true}`` is read as ``1`` and
+        ``{"season_length": -3}`` is taken at face value — both answer with a
+        200. A model that validates the value itself still rejects it:
+        ``seasonal_naive`` 400s on ``-3``, ``holt_winters`` on both.
+
+        Params that are the wrong *type* still fail as
+        a 400 rather than a 500, because :func:`forecast_tool` blames
+        ``model_params`` for a ``TypeError``/``AttributeError`` out of
+        ``get_model``/``fit``/``predict`` whenever any were supplied.
+        """
 
         model_config = ConfigDict(protected_namespaces=())
 

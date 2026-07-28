@@ -150,7 +150,7 @@ def load(path: str | PathLike) -> BaseForecaster:
 #: that whole number. Levels are routinely derived arithmetically
 #: (``100 * (1 - alpha)``), and float64 error on a value in (0, 100) is bounded
 #: by ~1e-13 — ``100 * (1 - 0.34)`` is ``65.99999999999999``, which is 66. The
-#: tolerance is six orders of magnitude above that error and far below any
+#: tolerance is four orders of magnitude above that error and far below any
 #: fractional level a caller could mean, so it separates representation noise
 #: from a genuine request for 99.9.
 _LEVEL_INT_TOL = 1e-9

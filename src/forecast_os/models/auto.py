@@ -38,19 +38,24 @@ _SEASONAL_BASE_CANDIDATES = ("naive", "drift", "ses", "window_average")
 #: Rows a walk-forward training slice must have beyond the largest candidate
 #: ``min_train_size`` before cross-validation is preferred to the holdout. The
 #: margin is slack against a candidate that declares a ``min_train_size`` it
-#: cannot really be fitted at (:class:`AutoETS` used to declare 3 while its
-#: AICc screen needs ``n - k - 1 > 0``, i.e. 4). It only biases the *choice*
-#: between two scoring schemes — a CV slice inside the margin is kept anyway
-#: unless the holdout is strictly wider (see :meth:`AutoSelect.fit`), so no
-#: panel is rejected for being one row short of it.
+#: cannot really be fitted at. Every model in the built-in pool declares an
+#: honest minimum today — the historical offender was :class:`AutoETS`, which
+#: declared 3 through v0.9.0 while its AICc screen needs ``n - k - 1 > 0``,
+#: i.e. 4 — so the margin now guards only against a third-party candidate that
+#: understates its own minimum. It is deliberately kept because it only biases
+#: the *choice* between two scoring schemes: a CV slice inside the margin is
+#: kept anyway unless the holdout is strictly wider (see
+#: :meth:`AutoSelect.fit`), so no panel is rejected for being one row short of
+#: it, and panels that do fall back are scored on a strictly larger training
+#: slice.
 _CV_TRAIN_MARGIN = 1
 
 #: Signed metrics (see :mod:`forecast_os.evaluation.metrics`): their best value
 #: is ZERO, not minus infinity, so :meth:`AutoSelect.fit` ranks them by
 #: ABSOLUTE value. A plain ``idxmin`` on the raw score would select the most
 #: severely under-forecasting candidate. This mirrors the ranking rule
-#: :meth:`forecast_os.Engine.compare` already applies to the same three names.
-#: A NEW signed metric added to metrics.py must be listed here; anything not
+#: :meth:`forecast_os.ForecastEngine.compare` already applies to the same three
+#: names. A NEW signed metric added to metrics.py must be listed here; anything not
 #: listed is ranked as-is, which is correct for every lower-is-better point
 #: metric.
 _SIGNED_METRICS = frozenset({"bias", "pct_bias", "tracking_signal"})
@@ -135,9 +140,10 @@ class AutoSelect(BaseForecaster):
         forecast / an all-zero window; a candidate scoring ``nan`` is skipped,
         and a series where every candidate scores ``nan`` falls back to
         ranking on ``mae`` (as it does for any metric). The interval
-        metrics (``coverage``, ``winkler``, ``pinball``, ``wis``) are
-        rejected at construction: they cannot be scored because the
-        validation pass never requests ``lo``/``hi`` columns.
+        metrics (``coverage``, ``winkler``, ``pinball``, ``wis``, and
+        ``wis``'s pre-v0.10.0 alias ``crps``) are rejected at construction:
+        they cannot be scored because the validation pass never requests
+        ``lo``/``hi`` columns.
         MASE/RMSSE scaling follows the M4 convention: it uses only the rows
         before the first validation cutoff (or before the holdout split),
         never the full panel, with seasonality equal to the resolved ``m``.
